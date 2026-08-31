@@ -1,0 +1,25 @@
+[package]
+name = "aidev"
+version = "0.1.0"
+edition = "2021"
+description = "TUI Coding Harness with integrated and flexible per-session sandbox"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots", "system-proxy"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+similar = "3"
+tui-markdown = "0.3.9"
+unicode-width = "0.2"
+indexmap = { version = "2.14.0", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
