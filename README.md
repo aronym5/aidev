@@ -6,6 +6,14 @@ searching, reading, editing, and running code through explicit permissions.
 
 ---
 
+Install with
+
+```bash
+mkdir ~/bin && curl -sL https://github.com/aronym5/aidev/releases/download/release%2F0.1.0/aidev -o ~/bin/aidev && chmod +x ~/bin/aidev && export PATH=~/bin:$PATH
+```
+
+---
+
 ## Overview
 
 aidev is a full-screen chat harness for driving a coding model against a real project.
