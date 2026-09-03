@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>aidev — Terminal AI Coding Agent</title>
+  <meta name="description" content="aidev is a terminal-based AI coding agent (TUI) that chats with an OpenAI-compatible streaming endpoint and acts inside a per-session sandbox.">
+  <style>
+    :root {
+      --bg: #0f1117;
+      --bg-soft: #171a23;
+      --panel: #1d212d;
+      --border: #2a2f3d;
+      --text: #e6e8ef;
+      --muted: #9aa1b1;
+      --accent: #7c6cf0;
+      --accent-2: #4fd1c5;
+      --green: #4ade80;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --radius: 14px;
+      --font-mono: "SFMono-Regular", "JetBrains Mono", "Fira Code", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+
+    /* ---------- Hero ---------- */
+    header.hero {
+      padding: 96px 0 72px;
+      background:
+        radial-gradient(1200px 400px at 20% -10%, rgba(124,108,240,0.18), transparent 60%),
+        radial-gradient(900px 400px at 90% -10%, rgba(79,209,197,0.12), transparent 60%);
+      border-bottom: 1px solid var(--border);
+    }
+    .badge {
+      display: inline-block;
+      font-size: 13px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+      border: 1px solid rgba(79,209,197,0.35);
+      background: rgba(79,209,197,0.08);
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 24px;
+      font-weight: 600;
+    }
+    .hero h1 {
+      font-size: clamp(44px, 7vw, 68px);
+      line-height: 1.05;
+      letter-spacing: -0.03em;
+      font-weight: 800;
+    }
+    .hero h1 .dot { color: var(--accent); }
+    .logo { line-height: 1; }
+    .logo-svg { width: min(320px, 72vw); height: auto; display: block; }
+    .logo-svg text {
+      font-family: inherit;
+      font-size: 92px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      fill: var(--text);
+    }
+    .tagline {
+      margin-top: 20px;
+      font-size: clamp(16px, 2.4vw, 20px);
+      color: var(--muted);
+      max-width: 640px;
+    }
+    .tagline strong { color: var(--text); font-weight: 600; }
+
+    .cta-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 36px; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 26px;
+      border-radius: 12px;
+      font-weight: 600;
+      font-size: 15px;
+      text-decoration: none;
+      transition: transform .12s ease, box-shadow .2s ease, background .2s ease;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #9b8cf5);
+      color: #fff;
+      box-shadow: 0 8px 24px rgba(124,108,240,0.35);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(124,108,240,0.5); }
+    .btn-ghost {
+      border: 1px solid var(--border);
+      color: var(--text);
+      background: var(--bg-soft);
+    }
+    .btn-ghost:hover { background: var(--panel); transform: translateY(-2px); }
+
+    /* ---------- Install ---------- */
+    .install {
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      margin-top: 64px;
+      max-width: 780px;
+    }
+    .install h2 { font-size: 15px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 16px; }
+    .code-copy {
+      position: relative;
+      background: #0b0d12;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .code-copy pre {
+      padding: 16px 54px 16px 18px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 13.5px;
+      color: #c9cdd9;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
+    }
+    .code-copy pre .hl { color: var(--green); }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+      transition: color .15s ease, border-color .15s ease, background .15s ease;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--accent); background: var(--bg-soft); }
+    .copy-btn.copied { color: var(--green); border-color: var(--green); }
+    .install p.hint { margin-top: 12px; font-size: 13px; color: var(--muted); }
+
+    /* ---------- Sections ---------- */
+    section { padding: 72px 0; }
+    section + section { border-top: 1px solid var(--border); }
+    .section-label {
+      font-size: 13px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--accent-2);
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+    section h2 {
+      font-size: clamp(26px, 4vw, 36px);
+      letter-spacing: -0.02em;
+      margin-bottom: 20px;
+      font-weight: 800;
+    }
+    section h2 .dot { color: var(--accent); }
+    section p { color: var(--muted); max-width: 720px; }
+    section p strong { color: var(--text); }
+
+    .lead { font-size: 18px; }
+
+    /* ---------- Features grid ---------- */
+    .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 36px; }
+    .feature {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: border-color .2s ease, transform .2s ease;
+    }
+    .feature:hover { border-color: var(--accent); transform: translateY(-3px); }
+    .feature .icon { font-size: 22px; margin-bottom: 14px; display: block; }
+    .feature h3 { font-size: 17px; margin-bottom: 8px; }
+    .feature p { font-size: 14.5px; }
+
+    /* ---------- Core pillars ---------- */
+    .pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-top: 40px; }
+    .pillar {
+      position: relative;
+      background: linear-gradient(160deg, var(--panel), var(--bg-soft));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 26px 26px;
+      overflow: hidden;
+      transition: border-color .2s ease, transform .2s ease;
+    }
+    .pillar::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 3px;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      opacity: .85;
+    }
+    .pillar:hover { border-color: var(--accent); transform: translateY(-3px); }
+    .pillar .num {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent-2);
+      letter-spacing: .05em;
+    }
+    .pillar h3 { font-size: 19px; margin: 10px 0 8px; }
+    .pillar p { font-size: 15px; }
+
+    /* ---------- Tables ---------- */
+    .table-wrap { overflow-x: auto; margin-top: 28px; border: 1px solid var(--border); border-radius: var(--radius); }
+    table { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+    th {
+      text-align: left;
+      padding: 13px 18px;
+      background: var(--bg-soft);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+    }
+    td { padding: 13px 18px; border-bottom: 1px solid var(--border); color: var(--text); }
+    tr:last-child td { border-bottom: none; }
+    td code, .inline {
+      font-family: var(--font-mono);
+      font-size: 13px;
+      background: rgba(124,108,240,0.12);
+      color: #c3baff;
+      padding: 2px 7px;
+      border-radius: 6px;
+    }
+
+    .chip { display: inline-block; font-size: 12px; padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+    .chip.read { background: rgba(52,211,153,.14); color: #34d399; }
+    .chip.write { background: rgba(251,191,36,.14); color: var(--amber); }
+    .chip.exec  { background: rgba(248,113,113,.16); color: #f87171; }
+
+    /* channel status indicator chips */
+    .chip.ch-green { background: rgba(52,211,153,.14); color: #34d399; }
+    .chip.ch-yellow { background: rgba(251,191,36,.14); color: var(--amber); }
+    .chip.ch-red { background: rgba(248,113,113,.16); color: #f87171; }
+    .chip.ch-grey { background: rgba(154,161,177,.12); color: var(--muted); }
+
+    /* ---------- Code block ---------- */
+    .code-block {
+      background: #0b0d12;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      color: #c9cdd9;
+      overflow-x: auto;
+      margin-top: 28px;
+      line-height: 1.5;
+    }
+    .code-block .c { color: #5b6272; }
+
+    /* ---------- Footer ---------- */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 0 56px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    footer a { color: var(--accent-2); text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      header.hero { padding: 64px 0 48px; }
+      .code-copy pre { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ============ HERO ============ -->
+  <header class="hero">
+    <div class="wrap">
+      <span class="badge">LLM harness &middot; Agent &middot; Tool</span>
+
+      <h1 class="logo">
+        <svg viewBox="0 0 360 110" role="img" aria-label="aidev wordmark with accent dot on the i" class="logo-svg">
+          <!-- a -->
+          <text x="0"   y="90">a</text>
+          <!-- i -->
+          <text x="47"  y="90">i</text>
+          <circle cx="59" cy="26" r="11" fill="var(--accent)" />
+          <!-- dev -->
+          <text x="71" y="90">dev</text>
+        </svg>
+      </h1>
+      <p class="tagline">
+        A <strong>blazingly fast</strong>, <strong>static</strong> AI coding agent for your terminal —
+        written in <strong>Rust</strong>, with <strong>no library dependencies</strong> and a small
+        footprint (compiled &lt; 7 MB), so it runs on a wide range of systems.
+        It chats with an OpenAI-compatible streaming endpoint and acts inside a
+        <strong>per-session sandbox</strong>: searching, reading, editing, and running code through
+        explicit permissions.
+      </p>
+
+      <div class="cta-row">
+        <a class="btn btn-primary" href="#install">⬇ Install aidev</a>
+        <a class="btn btn-ghost" href="https://github.com/aronym5/aidev" target="_blank" rel="noopener">View on GitHub ↗</a>
+      </div>
+
+      <!-- ====== INSTALL ====== -->
+      <div class="install" id="install">
+        <h2>Install in one line</h2>
+        <div class="code-copy">
+          <pre id="install-cmd"><span class="hl">$</span> curl -sSL https://aronym5.github.io/aidev/install.sh | sh</pre>
+          <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy install command">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <span id="copy-label">Copy</span>
+          </button>
+        </div>
+        <p class="hint">Pipes the installer into <code class="inline">sh</code> — it downloads the latest release binary, installs it to <code class="inline">~/bin</code> and adds it to your <code class="inline">PATH</code>.</p>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ OVERVIEW ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Overview</div>
+      <h2>A chat harness that <span class="dot">feels</span> like an IDE</h2>
+      <p class="lead">
+        aidev is a full-screen TUI chat harness for driving a coding model against a real project.
+        Each conversation (“session”) lives in its own tab and can be bound to a
+        <strong>channel</strong> — a sandboxed working directory with a shell.
+        From that point the model can invoke tools, every call gated by the permission you grant
+        for that turn.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ FEATURES ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Why aidev</div>
+      <h2>One command center for your <span class="dot">development</span></h2>
+      <p class="lead">aidev is designed around a few core ideas that set it apart — everything else hangs off them.</p>
+
+      <div class="pillars">
+        <div class="pillar">
+          <span class="num">01 / Sessions</span>
+          <h3>Multi-session control center</h3>
+          <p>Run several conversations side by side in tabs, each with its own prompt, history, and scroll state. Drive many agents at once without losing the thread.</p>
+        </div>
+        <div class="pillar">
+          <span class="num">02 / Sandbox</span>
+          <h3>Podman sandboxing</h3>
+          <p>Every session executes inside an isolated container channel. The model can run code and touch files without ever reaching your host machine. Only your shared workfolder is visible.</p>
+        </div>
+        <div class="pillar">
+          <span class="num">03 / Git &amp; Worktrees</span>
+          <h3>Parallel branches, one project</h3>
+          <p>Develop several branches of the same project concurrently — across multiple sessions, containers, worktrees, and branches — without collisions. Duplicate any channel to get its own worktree-backed container.</p>
+        </div>
+        <div class="pillar">
+          <span class="num">04 / Access Control</span>
+          <h3>Full access control</h3>
+          <p>Choose a permission level per turn — read, write, or execute. Every tool call is gated by the permission you grant, so you always stay in control.</p>
+        </div>
+        <div class="pillar">
+          <span class="num">05 / Overview</span>
+          <h3>Zoom levels for the right view</h3>
+          <p>Zoom between detail, dialog, and full overview. Step back to see all sessions and channels, or dive into a single conversation — the right resolution for the task.</p>
+        </div>
+        <div class="pillar">
+          <span class="num">06 / Context</span>
+          <h3>Full insight into LLM context</h3>
+          <p>See exactly what the model sees and which tool calls fill its context. Full control and visibility over the context window, with manual compaction when you need to trim it.</p>
+        </div>
+      </div>
+
+      <div class="features" style="margin-top:48px">
+        <div class="feature">
+          <span class="icon">🗒️</span>
+          <h3>Markdown rendering</h3>
+          <p>Bold, inline code, lists, and fenced code with syntax highlighting.</p>
+        </div>
+        <div class="feature">
+          <span class="icon">📦</span>
+          <h3>Inline tool logs</h3>
+          <p>Tool calls and results logged inline; run/edit produce console &amp; diff boxes with live progress.</p>
+        </div>
+        <div class="feature">
+          <span class="icon">⚡</span>
+          <h3>Streaming answers</h3>
+          <p>Context-length handling and automatic retries with backoff.</p>
+        </div>
+        <div class="feature">
+          <span class="icon">🪟</span>
+          <h3>Full-screen TUI</h3>
+          <p>Status line, tab bar, channel indicator, and a zoomable overview ↔ dialog view.</p>
+        </div>
+        <div class="feature">
+          <span class="icon">✨</span>
+          <h3>Simple &amp; intuitive</h3>
+          <p>Jump in instantly — no setup, no learning curve. A picker for channels, models, and options keeps everything discoverable.</p>
+        </div>
+        <div class="feature">
+          <span class="icon">🚀</span>
+          <h3>Fast &amp; portable binary</h3>
+          <p>One static binary, compiled &lt; 7 MB, no dependencies — drop it anywhere and it runs on virtually any distribution and version.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SAFETY ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Safety &amp; Flexibility</div>
+      <h2>Power without <span class="dot">exposure</span></h2>
+      <p>
+        <strong>Every session runs in its own sandbox.</strong> A channel backs each session with an
+        isolated working copy — either a container (podman) or a host directory (local) — so the
+        model can act without touching your machine directly.
+      </p>
+      <p style="margin-top:16px">
+        <strong>Flexible bridge between dialog and code.</strong> Bound sessions let the model read
+        and write the actual codebase, run builds/tests, and show the results inline. You stay in
+        control through permissions and a picker per turn.
+      </p>
+      <p style="margin-top:16px">
+        <strong>podman + git integrated.</strong> Container channels isolate execution and
+        filesystem effects; git worktrees give you a cheap, isolated copy per session/branch. The
+        two compose — duplicate a channel to get its own worktree-backed container.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ CHANNELS ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Channels</div>
+      <h2>The <span class="dot">interface</span> to your filesystem</h2>
+      <p>
+        A channel is the interface to a filesystem and shell. Sessions without a channel are pure
+        chat; once bound, the model can act in that working directory.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Type</th><th>Description</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>podman</strong></td>
+              <td>Runs in a container. <em>Run</em> mode creates its own container (duplicateable per session); <em>attach</em> joins an existing one. Commands run as your host UID with keep-id.</td>
+            </tr>
+            <tr>
+              <td><strong>local</strong></td>
+              <td>Runs directly on the host. Practical in sandboxes/CI where rootless podman is unavailable.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="margin-top:20px">
+        The status line shows a channel indicator: <span class="chip ch-green">green = running</span>
+        <span class="chip ch-yellow">yellow = starting</span>
+        <span class="chip ch-red">red = problem</span>
+        <span class="chip ch-grey">grey = not checked</span>
+      </p>
+    </div>
+  </section>
+
+  <!-- ============ PERMISSIONS ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Permissions</div>
+      <h2>You stay in <span class="dot">control</span></h2>
+      <p>
+        Before sending a turn you choose a permission level (<code class="inline">Tab</code> cycles
+        read → write → execute). The levels build on each other.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Level</th><th>Model may use</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="chip read">read</span></td><td><code>grep</code> <code>glob</code> <code>read</code> <code>webfetch</code></td></tr>
+            <tr><td><span class="chip write">write</span></td><td>+ <code>write</code> <code>edit</code></td></tr>
+            <tr><td><span class="chip exec">execute</span></td><td>+ <code>run</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ KEY BINDINGS ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Key Bindings</div>
+      <h2>Essentials to get <span class="dot">started</span></h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Key</th><th>Action</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>Enter</code></td><td>Send message / confirm in dialog</td></tr>
+            <tr><td><code>Esc</code></td><td>Cancel running response / abort / close dialog</td></tr>
+            <tr><td><code>Ctrl+N</code></td><td>New session / tab</td></tr>
+            <tr><td><code>Ctrl+D</code> / <code>Ctrl+W</code></td><td>Close session / tab</td></tr>
+            <tr><td><code>Alt+←</code> / <code>Alt+→</code></td><td>Switch session / tab (or <code>Ctrl+1</code>…<code>Ctrl+9</code>)</td></tr>
+            <tr><td><code>Alt+C</code></td><td>Open channel picker (choose / manage / build new)</td></tr>
+            <tr><td><code>Alt+M</code></td><td>Open model picker (same as <code>/model</code> without argument)</td></tr>
+            <tr><td><code>Alt+D</code></td><td>Duplicate channel (own worktree)</td></tr>
+            <tr><td><code>Ctrl+O</code></td><td>Options dialog</td></tr>
+            <tr><td><code>Alt++</code> / <code>Alt+-</code></td><td>Zoom in / Zoom out (detail / dialog / overview)</td></tr>
+            <tr><td><code>Tab</code></td><td>Change permission (read/write/execute, needs a channel)</td></tr>
+            <tr><td><code>PgUp</code> / <code>PgDn</code></td><td>Scroll chat history</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ BUILD ============ -->
+  <section>
+    <div class="wrap">
+      <div class="section-label">Build &amp; Run</div>
+      <h2>From source in <span class="dot">seconds</span></h2>
+      <p>Requires the Rust toolchain to build; optional at runtime: an OpenAI-compatible endpoint, podman, git, and rg.</p>
+      <div class="code-block">
+        <span class="c"># binary at target/release/aidev</span><br>
+        cargo build --release<br>
+        cargo run<br>
+        cargo test&nbsp;&nbsp;<span class="c"># unit tests live next to the sources</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FOOTER ============ -->
+  <footer>
+    <div class="wrap">
+      <p>aidev is <a href="https://github.com/aronym5/aidev" target="_blank" rel="noopener">open source</a> · licensed under MIT.</p>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var btn = document.getElementById('copy-btn');
+      var pre = document.getElementById('install-cmd');
+      var label = document.getElementById('copy-label');
+      if (!btn || !pre) return;
+
+      btn.addEventListener('click', function () {
+        // Copy without the leading "$ " prompt.
+        var text = (pre.innerText || pre.textContent).replace(/^\$\s*/, '');
+        function done() {
+          btn.classList.add('copied');
+          label.textContent = 'Copied!';
+          setTimeout(function () {
+            btn.classList.remove('copied');
+            label.textContent = 'Copy';
+          }, 2000);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () { fallback(text); done(); });
+        } else {
+          fallback(text);
+          done();
+        }
+      });
+
+      function fallback(text) {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(ta);
+      }
+    })();
+  </script>
+
+</body>
+</html>
