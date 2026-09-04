@@ -362,6 +362,151 @@ fn nachtraegliche_bestaetigung_passt_usage_bar_an_neue_daten_an() {
 }
 
 #[test]
+fn kompaktierung_reset_und_shift_steuern_usage_bar_und_folgekontext() {
+    // Simulation der Sequenz des Archive-Zweigs in `build_history_cache`:
+    // Vorgeschichte bis Kontextlänge `old` → Summary (eigener Anker, nur
+    // Summary-Zusammensetzung, alle anderen Beiträge auf null) → shift =
+    // old − summary → Folge-Events mit Schätz- und Verifikations-Pfad.
+    let old = 50_000;
+    let summary = 2_000;
+    let shift = old - summary;
+
+    // „Letztes Event vor der Summary“: Kontextlänge `old`.
+    let mut ctx = ContextEstimate::base();
+    ctx.add_content(ContentKind::User, 12_000);
+    ctx.add_tool("glob", 8_000);
+    ctx.resync_to(old);
+    assert_eq!(ctx.used, old, "Kontextlänge vor der Summary");
+
+    // ── Summary (Archive): verified_prompt = eigene Token; usage-bar besteht
+    // ── nur aus der Summary in exakt dieser Länge (Rest auf null).
+    ctx.contents = [0; 5];
+    ctx.contents[ContentKind::Summary as usize] = summary;
+    ctx.tools = Vec::new();
+    ctx.block_sum = summary;
+    ctx.verified_prompt = Some(summary);
+    assert_eq!(
+        ctx.contents,
+        [summary, 0, 0, 0, 0],
+        "Zusammensetzung nur aus summary in exakt dieser Länge"
+    );
+    assert!(ctx.tools.is_empty(), "Tool-Anteile zurückgesetzt");
+    resync_after(&mut ctx); // Anker exakt auf Summary (Shift gilt noch nicht)
+    ctx.compact_shift = shift;
+    assert_eq!(ctx.used, summary, "Summary ist der neue Kontext-Anker");
+    assert_eq!(ctx.verified_prompt, None, "verified_prompt zurückgesetzt");
+
+    // ── Folge-Event 1 (Schätzung): läuft ab der Summary-Basis weiter – die
+    // ── angezeigte absolute Zahl ist damit die alte minus shift.
+    ctx.add_content(ContentKind::User, 300);
+    assert_eq!(
+        ctx.used, summary + 300,
+        "Schätzung ab neuer Basis (= alte Zahl + 300 − shift)"
+    );
+
+    // ── Folge-Event 2 mit serverbestätigter Zahl (gegen die OLD-Historie
+    // ── gemessen): verified_prompt nehmen, shift abziehen → ctx.used, Feld weg.
+    ctx.add_tool("read", 120);
+    ctx.verified_prompt = Some(52_100);
+    resync_after(&mut ctx);
+    assert_eq!(
+        ctx.used,
+        52_100 - shift,
+        "verifizierte absolute Zahl − shift"
+    );
+    assert_eq!(ctx.verified_prompt, None, "verified_prompt abgeräumt");
+    // Zusammensetzung weiterhin „Daten darüber + aktuelles Event“.
+    assert_eq!(ctx.contents, [summary, 300, 0, 0, 0]);
+    assert_eq!(ctx.tools, vec![("read".to_string(), 120)]);
+
+    // ── Ohne Kompaktierung (shift = 0) bleibt alles wie bisher.
+    let mut plain = ContextEstimate::base();
+    plain.add_tool("read", 200);
+    plain.verified_prompt = Some(1200);
+    resync_after(&mut plain);
+    assert_eq!(plain.used, 1200, "ohne Shift: Verifikation unverändert");
+}
+
+#[test]
+fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
+    let mut s = Session::new(0);
+    // Alter Turn (wird kompaktiert, bleibt aber im Chat erhalten).
+    s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
+    let a1 = s.open_assistant("gedanken alt".into(), "antwort alt".into());
+    s.chat.finalize_assistant(a1, std::time::Instant::now(), usage_zero(), 0, 0, false);
+    // Kontextlänge des letzten Events VOR der Summary (Overview-Schätzung des
+    // alten Turns: User-Prompt + Reasoning, Text ohne Usage trägt 0).
+    let old_before_summary = crate::llm::estimate_tokens("alte frage")
+        + crate::llm::estimate_tokens("gedanken alt");
+    // Summary bewusst deutlich KÜRZER als der ersetzte Kontext, damit der
+    // Kompaktierungs-Shift echt reduziert (wie im echten Einsatz).
+    let summary_tokens = 5;
+    // Kompaktierung: Summary (Archive) an der Grenze einfügen.
+    s.chat.compact(
+        2,
+        "[Compressed history - 1 earlier messages]\n\nzusammenfassung".into(),
+        summary_tokens,
+    );
+    // Neuer Turn NACH der Summary (Tail) mit serverbestätigter Usage.
+    s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
+    let a2 = s.open_assistant("gedanken neu".into(), "antwort neu".into());
+    s.chat.finalize_assistant(
+        a2,
+        std::time::Instant::now(),
+        Usage {
+            prompt_tokens: 5200,
+            completion_tokens: 40,
+            total_tokens: 5240,
+            cached_tokens: None,
+        },
+        1,
+        2,
+        false,
+    );
+    s.view = crate::app::ViewLevel::Overview;
+    let (blocks, end_ctx) = build_history_cache(&s, 120, SymbolMode::Glyph, "m", 81920);
+
+    // Summary-Zeile: eigener Anker = Tokenzahl des Summary-Events (grün, 2kT).
+    let has_green = |blk: &ChatBlock, needle: &str| {
+        blk.lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|sp| sp.style.fg == Some(SYM_OK) && sp.content.to_string().contains(needle))
+        })
+    };
+    assert!(
+        blocks.iter().any(|b| has_green(b, "2kT")),
+        "Summary-Zeile zeigt ihre eigene Tokenzahl als grünen Anker"
+    );
+
+    // shift = Kontext im letzten Event vor der Summary − Summary-Länge.
+    let shift = old_before_summary - summary_tokens;
+    assert_eq!(end_ctx.compact_shift, shift, "Shift wie spezifiziert");
+    assert!(shift > 0, "Testszenario braucht echten positiven Shift");
+
+    // usage-bar-Zusammensetzung am HISTORIE-ENDE = Daten darüber (nur die
+    // Summary als Überbleibsel der alten Historie) + aktuelles Event:
+    // Summary in exakt der Summary-Länge + Anteile des neuen Turns.
+    let s_user = crate::llm::estimate_tokens("neue frage");
+    let s_reasoning = 1; // num_tokens_reasoning des neuen Turns
+    let s_text = 2; // num_tokens_text des neuen Turns
+    assert_eq!(end_ctx.contents[0], summary_tokens, "Summary-Anteil exakt");
+    assert_eq!(end_ctx.contents[1], s_user, "neuer User-Anteil");
+    assert_eq!(end_ctx.contents[2], s_reasoning, "neuer Reasoning-Anteil");
+    assert_eq!(end_ctx.contents[3], s_text, "neuer Content-Anteil");
+    assert_eq!(end_ctx.contents[4], 0, "kein Other-Anteil");
+    assert!(end_ctx.tools.is_empty(), "keine Tool-Anteile");
+
+    // Der rundeigene verifizierte Fuß (total_tokens 5240, gegen OLD gemessen)
+    // läuft mit − shift durch die Pipeline bis zum Ende der Historie.
+    assert_eq!(
+        end_ctx.used,
+        5240 - shift,
+        "Folge-Verifikation minus shift"
+    );
+}
+
+#[test]
 fn usage_bar_verwendet_partial_bloecke_fuer_subzeichengenaue_uebergaenge() {
     // Band + genau ein Tool: der Farbwechsel fällt mitten in eine Zelle, sodass
     // ein links-füllender Partial-Block (mit fg=Band, bg=Tool) erzeugt wird
@@ -625,4 +770,74 @@ fn tool_kind_detail_baut_kompakte_kurzform_aus_strukturierten_feldern() {
         }),
         "⚙ run cargo test"
     );
+}
+
+/// Fortgesetzte Zeilen einer umgebrochenen Diff-Zelle müssen exakt `cell_w`
+/// Zellen breit sein – inkl. des Vorspanns (`num_w` Leerraum + `│` + Marker).
+/// Vorher war das Umbruchlimit für Folgezeilen `cell_w` statt `cell_w - (num_w+3)`,
+/// wodurch umgebrochene Zeilen um `num_w + 3` Zellen überliefen.
+#[test]
+fn diff_cell_folgezeilen_bleiben_unter_zellbreite() {
+    use crate::ui::blocks::{diff_cell, disp_width, CellStyle};
+    use ratatui::style::Style;
+
+    let style = CellStyle {
+        marker: ' ',
+        base: Style::default(),
+        mark: Style::default(),
+        num_style: Style::default(),
+    };
+    let num_w = 2;
+    let cell_w = 20;
+    // Zum Zellgrenzen: erster Umbruch bei ≥ first_w; ein langer Text zwingt
+    // mindestens eine weitere Zeile auf.
+    let text = "ui".repeat(50); // 100 Zeichen → garantiert mehrere Zeilen
+    let rows = diff_cell(Some(7), &text, &[], num_w, cell_w, &style);
+
+    assert!(rows.len() >= 3, "langer Text bricht mehrfach um, bekam {}", rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        let w = row.iter().map(|s| disp_width(&s.content)).sum::<usize>();
+        assert!(
+            w <= cell_w,
+            "Zeile {i} überschreitet die Zellbreite: {w} > {cell_w}"
+        );
+        // Jede Folgezeile trägt außerdem den `│`-Trenner.
+        let joined: String = row.iter().map(|s| s.content.as_ref()).collect();
+        assert!(joined.contains('│'), "Zeile {i} bringt den `│`-Trenner");
+        if i > 0 {
+            let before_pipe = &joined[..joined.find('│').unwrap()];
+            assert_eq!(
+                disp_width(before_pipe),
+                num_w,
+                "Folgezeile {}: leerer Nummern-Gutter exakt {num_w} breit",
+                i
+            );
+        }
+    }
+}
+
+/// Eine leere Zelle (Ausgleich, wenn die Gegenseite mehr Umbruchzeilen hat)
+/// muss dieselbe Gutter-Struktur wie eine Folgezeile tragen: `num_w` Leerraum +
+/// `│` + Marker – also den `│`-Trenner auch dort, wo keine Zeilennummer und kein
+/// Inhalt steht.
+#[test]
+fn empty_cell_zeigt_trenner_und_gutter_struktur() {
+    use crate::ui::blocks::{disp_width, empty_cell, CellStyle};
+    use ratatui::style::Style;
+
+    let style = CellStyle {
+        marker: '+',
+        base: Style::default(),
+        mark: Style::default(),
+        num_style: Style::default(),
+    };
+    let cell_w = 20;
+    let num_w = 2;
+    let spans = empty_cell(cell_w, num_w, &style);
+    let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+
+    assert!(joined.contains('│'), "leere Zelle trägt den `│`-Trenner");
+    let total = spans.iter().map(|s| disp_width(&s.content)).sum::<usize>();
+    assert_eq!(total, cell_w, "leere Zelle bleibt exakt `cell_w` breit");
+    assert!(joined.starts_with("  │+"), "Gutter: `num_w` Leerraum + `│` + Marker; bekam {joined:?}");
 }

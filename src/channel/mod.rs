@@ -44,13 +44,6 @@ pub(crate) enum PodmanMode {
     Run,
 }
 
-/// Eintrag eines Verzeichnisses (aus [`Channel::list`]).
-#[derive(Debug, Clone)]
-pub struct Entry {
-    pub name: String,
-    pub is_dir: bool,
-}
-
 /// Treffer der Volltextsuche (Kanal-relativer Pfad + Treffertext; die
 /// Zeilennummer steckt im Kontext-Modus im rohen Passthrough).
 #[derive(Debug, Clone)]
@@ -86,7 +79,6 @@ pub trait Channel: Send + Sync {
     fn root(&self) -> String;
     fn read(&self, rel: &Path) -> Result<String, String>;
     fn write(&self, rel: &Path, content: &str) -> Result<(), String>;
-    fn list(&self, rel: &Path) -> Result<Vec<Entry>, String>;
     /// Datei-Pattern-Suche (`glob`-Werkzeug) über `find`.
     fn glob(&self, pattern: &str, rel: &Path) -> Result<Vec<String>, String>;
     /// Volltextsuche (`grep`-Werkzeug). `include` filtert nach Glob-Muster
@@ -298,86 +290,6 @@ impl ChannelRegistry {
             Duration::from_secs(30),
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// CLI-Probe (--channel-ls / --channel-run)
-// ---------------------------------------------------------------------------
-
-fn pick_channel(
-    registry: &ChannelRegistry,
-    name: Option<&str>,
-) -> Result<(String, Arc<dyn Channel>), String> {
-    let candidate = match name {
-        Some(n) => Some(n.to_string()),
-        None => registry.default_channel_name().map(str::to_string),
-    };
-    if let Some(c) = candidate {
-        return registry.get(&c).map(|ch| (c.clone(), ch)).ok_or_else(|| {
-            let known = registry.names();
-            let hint = if known.is_empty() {
-                "none configured yet (add a `[channel.<name>]` block in config.toml)".to_owned()
-            } else {
-                known.join(", ")
-            };
-            format!("Channel \"{c}\" is not available. Configured: {hint}")
-        });
-    }
-    let names = registry.names();
-    match names.len() {
-        1 => Ok((names[0].clone(), registry.get(&names[0]).expect("geladen"))),
-        0 => {
-            Err("No channel configured – add a `[channel.<name>]` block in config.toml.".to_owned())
-        }
-        _ => Err(format!(
-            "No default_channel set, but multiple channels exist: {}",
-            names.join(", ")
-        )),
-    }
-}
-
-pub(crate) fn cli_ls(registry: &ChannelRegistry, name: Option<&str>) -> Result<String, String> {
-    let (name, ch) = pick_channel(registry, name)?;
-    let mut out = format!("Kanal „{name}“ · Wurzel: {}\n", ch.root());
-    let entries = ch.list(Path::new("."))?;
-    if entries.is_empty() {
-        out.push_str("(leer)\n");
-    }
-    for e in entries {
-        if e.is_dir {
-            out.push_str(&format!("[dir] {}/\n", e.name));
-        } else {
-            out.push_str(&format!("      {}\n", e.name));
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn cli_run(
-    registry: &ChannelRegistry,
-    name: Option<&str>,
-    cmd: &str,
-    args: &[String],
-) -> Result<String, String> {
-    let (name, ch) = pick_channel(registry, name)?;
-    let out = ch.run(cmd, args, Path::new("."))?;
-    let mut text = format!("Kanal „{name}“ · Wurzel: {}\n$ {cmd}", ch.root());
-    if !args.is_empty() {
-        text.push(' ');
-        text.push_str(&args.join(" "));
-    }
-    match out.exit_code {
-        Some(0) => {}
-        Some(code) => text.push_str(&format!("\n[exit {code}]")),
-        None => text.push_str("\n[timeout/abgebrochen]"),
-    }
-    if !out.stdout.is_empty() {
-        text.push_str(&format!("\n{}", out.stdout));
-    }
-    if !out.stderr.is_empty() {
-        text.push_str(&format!("\n{}", out.stderr));
-    }
-    Ok(text)
 }
 
 // ---------------------------------------------------------------------------

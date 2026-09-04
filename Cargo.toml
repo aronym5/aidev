@@ -1,6 +1,6 @@
 [package]
 name = "aidev"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "TUI Coding Harness with integrated and flexible per-session sandbox"
 license = "MIT"

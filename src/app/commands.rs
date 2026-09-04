@@ -717,7 +717,12 @@ impl App {
                     None => return Err("No Podman image available for the new channel.".into()),
                 };
                 let timeout = std::time::Duration::from_secs(self.config.timeout_secs.max(1));
-                let (uid, gid) = crate::channel::run::host_uid_gid().unwrap_or_default();
+                // exec-Identität nach Top-Level-Mapping: keep-id → Host,
+                // uidmap → Gast-UID/-GID (aus dem Image erfragt).
+                let (uid, gid) = crate::channel::podman::running_uid_gid(
+                    Some(&image),
+                    self.config.podman.usermapping,
+                )?;
                 let name = crate::channel::builder::run_channel_name(&image, effective_root);
                 let container = crate::channel::builder::run_container_name(
                     base_folder,
@@ -762,7 +767,7 @@ impl App {
         let id = self.sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let mut new_session = Session::new(id);
         new_session.chat = history;
-        new_session.channel = Some(new_ch);
+        new_session.set_channel(Some(new_ch));
         apply_channel_permission_default(&mut new_session);
         if let Some(info) = copy_info {
             new_session.error = Some(info);
@@ -1115,7 +1120,9 @@ impl App {
         let id = self.sessions[active].id;
         let messages = crate::chat::api_messages(&self.sessions[active].chat);
         let cancel = self.sessions[active].cancel.clone();
-        let channel = self.sessions[active].channel.clone();
+        // Live-Kanalzelle teilen: Der Worker liest daraus bei jedem Tool-Call,
+        // sodass ein Kanalwechsel (Alt+C) während des Streams unmittelbar wirkt.
+        let channel_cell = self.sessions[active].channel_cell.clone();
         llm::spawn_worker(
             self.tx.clone(),
             id,
@@ -1123,7 +1130,7 @@ impl App {
             ep,
             messages,
             cancel,
-            channel,
+            channel_cell,
             permission,
             compact,
             self.local_exec_mode,

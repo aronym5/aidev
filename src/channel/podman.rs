@@ -16,7 +16,7 @@ use super::resolve::resolve;
 use super::run::{host_uid_gid, run_with_timeout, run_with_timeout_live, sanitize};
 use super::search::search_files;
 use super::{
-    Channel, ChannelKind, ChannelStatus, Entry, Managed, PodmanMode, RunOut, SearchResult,
+    Channel, ChannelKind, ChannelStatus, Managed, PodmanMode, RunOut, SearchResult,
 };
 use crate::config::{ChannelConfig, PodmanUserMapping};
 use std::sync::atomic::AtomicBool;
@@ -25,10 +25,15 @@ use std::sync::atomic::AtomicBool;
 /// Datei-Operationen laufen über den Host-Mount (`host_root`, sofern gesetzt).
 /// Run-Container werden mit `--init` gestartet; das UID-/GID-Mapping wird über
 /// `PodmanUserMapping` gewählt (Default `keep-id`, alternativ explizite
-/// `--uidmap`/`--gidmap`), alle Befehle laufen mit `--user <hostuid>:<hostgid>` –
-/// so laufen Root- und Non-Root-Images identisch als Nicht-Root, die gemountete
-/// Arbeitskopie behält dieselben Rechte wie auf dem Host, und ein Init als PID 1
-/// sammelt verwaiste Kindprozesse sofort ein (keine liegenbleibenden Zombies).
+/// `--uidmap`/`--gidmap`).
+///
+/// Als exec-Identität (und als Anker des UID-Mappings) dient bei `keep-id` die
+/// Host-UID/-GID des Aufrufers, bei `uidmap` die im Image konfigurierte
+/// Gast-UID/-GID (beim Kanal-Aufbau per `podman run --rm <image> id` erfragt und
+/// in den Channel-Membern `uid`/`gid` gemerkt). Beide laufen per `--user <uid>:<gid>`
+/// als Nicht-Root; die gemountete Arbeitskopie behält dieselben Rechte wie auf dem
+/// Host, und ein Init als PID 1 sammelt verwaiste Kindprozesse sofort ein (keine
+/// liegenbleibenden Zombies).
 pub struct PodmanChannel {
     pub(crate) name: String,
     pub(crate) mode: PodmanMode,
@@ -37,9 +42,11 @@ pub struct PodmanChannel {
     pub(crate) host_root: Option<PathBuf>,
     pub(crate) image: Option<String>,
     pub(crate) timeout: Duration,
-    /// Host-UID des Aufrufers (Run-Modus: `--user` beim exec).
+    /// Für exec und UID-Mapping verwendete Identität (Run-Modus: `--user` beim
+    /// exec): bei `keep-id` die Host-UID des Aufrufers, bei `uidmap` die im Image
+    /// erfragte Gast-UID – im Kanal gemerkt für spätere Container- und exec-Aufrufe.
     pub(crate) uid: u32,
-    /// Host-GID des Aufrufers (Run-Modus: `--user` beim exec).
+    /// Gegenstück zu `uid` für die Gruppen-ID (GID).
     pub(crate) gid: u32,
     /// Schreibbarer `$HOME` für Werkzeug-Prozesse (Run-Modus).
     pub(crate) home: String,
@@ -69,7 +76,9 @@ pub(super) fn podman_from_config(
     let timeout = Duration::from_secs(timeout_secs.max(1));
     let host_root = cfg.host_root.as_ref().map(PathBuf::from);
     let (uid, gid) = if cfg.image.is_some() {
-        host_uid_gid()? // Run-Modus: exec als Host-Identität (keep-id).
+        // Run-Modus: exec-Identität nach Top-Level-Mapping – `keep-id` → Host,
+        // `uidmap` → Gast-UID/-GID (beim Kanal-Aufbau aus dem Image erfragt).
+        running_uid_gid(cfg.image.as_deref(), usermapping)?
     } else {
         (0, 0)
     };
@@ -128,6 +137,94 @@ pub(super) fn podman_from_config(
         channel = channel.with_worktree(wt);
     }
     Ok(channel)
+}
+
+/// Für exec-`--user` und UID-Mapping zu verwendende Identität:
+/// - `KeepId`: Host-UID/-GID des Aufrufers (bisheriges Verhalten),
+/// - `Uidmap`: die im Image konfigurierte Standard-UID/-GID (Gast), die beim
+///   Kanal-Aufbau per `podman run --rm <image> id` erfragt wird; das Ergebnis
+///   wird als `uid`/`gid` im Channel-Member für spätere Nutzung gemerkt.
+pub(crate) fn running_uid_gid(
+    image: Option<&str>,
+    usermapping: PodmanUserMapping,
+) -> Result<(u32, u32), String> {
+    match usermapping {
+        PodmanUserMapping::KeepId => host_uid_gid(),
+        PodmanUserMapping::Uidmap => {
+            let img = image.ok_or("uidmap needs an image (run mode)")?;
+            image_default_uid_gid(img)
+        }
+    }
+}
+
+/// Ermittelt die Default-UID/-GID des Image-Users über
+/// `podman run --rm <image> id` und wertet `uid=`/`gid=` aus.
+fn image_default_uid_gid(image: &str) -> Result<(u32, u32), String> {
+    let st = run_with_timeout(
+        "podman",
+        &[
+            "run".into(),
+            "--rm".into(),
+            image.into(),
+            "id".into(),
+        ],
+        Path::new("."),
+        Duration::from_secs(120),
+    )?;
+    if st.exit_code != Some(0) {
+        return Err(format!(
+            "podman run --rm {image} id failed:\n{}\n{}",
+            st.stderr, st.stdout
+        ));
+    }
+    parse_uid_gid_fields(&st.stdout).ok_or_else(|| {
+        format!(
+            "keine uid=/gid= in der Ausgabe von \"{image} id\": {}",
+            st.stdout.trim()
+        )
+    })
+}
+
+/// Liest `uid=`/`gid=` aus der Ausgabe von `id` (z. B. `uid=1000(node) gid=…`).
+pub(super) fn parse_uid_gid_fields(out: &str) -> Option<(u32, u32)> {
+    fn num(field: &str, out: &str) -> Option<u32> {
+        let key = format!("{field}=");
+        let start = out.find(&key)? + key.len();
+        let digits: String = out[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.is_empty() {
+            None
+        } else {
+            digits.parse().ok()
+        }
+    }
+    Some((num("uid", out)?, num("gid", out)?))
+}
+
+/// Explizite `--uidmap`/`--gidmap`-Flags für die Gast-Identität `(u, g)`: die
+/// Gast-UID/-GID wird auf den Host-User gemappt (rootless: „Host 0“), der Rest
+/// identisch aufgefüllt (gesamter 16-Bit-UID-Raum). Für `u == 0` (Root-Image)
+/// entfällt der vordere Verschiebe-Teilbereich.
+pub(super) fn uidmap_args(u: u32, g: u32) -> Vec<String> {
+    fn uid_args(v: u32, flag: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        if v > 0 {
+            args.push(format!("{flag}=0:1:{v}"));
+        }
+        args.push(format!("{flag}={v}:0:1"));
+        args.push(format!(
+            "{flag}={}:{}:{}",
+            v.wrapping_add(1),
+            v.wrapping_add(1),
+            65535u32.saturating_sub(v)
+        ));
+        args
+    }
+    let mut args = uid_args(u, "--uidmap");
+    args.extend(uid_args(g, "--gidmap"));
+    args
 }
 
 impl PodmanChannel {
@@ -225,23 +322,18 @@ impl PodmanChannel {
             "--name".into(),
             container.into(),
         ];
-        // UID/GID-Mapping nach Top-Level-Config. `guest_uid`/`guest_gid` sind
-        // die Host-Identität (`self.uid`/`self.gid`), die via `--user` ausgeführt wird.
+        // UID/GID-Mapping nach Top-Level-Config. `self.uid`/`self.gid` sind die
+        // exec-Identität (`--user`), die zugleich den Anker des Mappings bildet:
+        // `keep-id` → Host-Identität, `uidmap` → Gast-UID/-GID aus dem Image.
         match self.usermapping {
             PodmanUserMapping::KeepId => {
                 args.push("--userns".into());
                 args.push("keep-id".into());
             }
             PodmanUserMapping::Uidmap => {
-                let u = self.uid;
-                let g = self.gid;
-                let (u1, g1) = (u + 1, g + 1);
-                args.push(format!("--uidmap=0:1:{u}"));
-                args.push(format!("--uidmap={u}:0:1"));
-                args.push(format!("--uidmap={u1}:{u1}:64535"));
-                args.push(format!("--gidmap=0:1:{g}"));
-                args.push(format!("--gidmap={g}:0:1"));
-                args.push(format!("--gidmap={g1}:{g1}:64535"));
+                // Explizite Ranges: Gast-UID/-GID auf den Host-User mappen,
+                // Rest identisch auffüllen (16-Bit-Raum).
+                args.extend(uidmap_args(self.uid, self.gid));
             }
         }
         args.push("-v".into());
@@ -328,10 +420,6 @@ impl Channel for PodmanChannel {
 
     fn write(&self, rel: &Path, content: &str) -> Result<(), String> {
         fsops::write_at(&self.file_path(rel)?, content)
-    }
-
-    fn list(&self, rel: &Path) -> Result<Vec<Entry>, String> {
-        fsops::list_at(&self.file_path(rel)?)
     }
 
     fn grep(
@@ -607,11 +695,12 @@ impl Channel for PodmanChannel {
 
 impl PodmanChannel {
     /// Baut die `podman exec`-argv. Im Run-Modus wird immer als genau die
-    /// Host-Identität (`--user <uid>:<gid>`, passend zum gewählten
-    /// UID-Mapping – `keep-id` oder `uidmap` – mit dem der Container
-    /// erzeugt wurde) und mit schreibbarem `$HOME` gearbeitet – damit
-    /// laufen Root- und Non-Root-Images identisch als Nicht-Root. Im
-    /// Attach-Modus gilt der Default-User des bestehenden Containers.
+    /// gemerkte Identität gearbeitet (`--user <uid>:<gid>` = `self.uid`/`self.gid`;
+    /// bei `keep-id` die Host-, bei `uidmap` die Gast-Identität aus dem Image –
+    /// passend zum Mapping, mit dem der Container erzeugt wurde) und mit
+    /// schreibbarem `$HOME` – damit laufen Root- und Non-Root-Images identisch
+    /// als Nicht-Root. Im Attach-Modus gilt der Default-User des bestehenden
+    /// Containers.
     pub(crate) fn exec_argv(&self, wd: &str, cmd: &str, args: &[String]) -> Vec<String> {
         let mut argv = vec!["exec".to_string(), "--workdir".to_string(), wd.to_string()];
         if self.mode == PodmanMode::Run {

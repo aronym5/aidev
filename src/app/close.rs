@@ -112,7 +112,7 @@ impl App {
             for s in &mut self.sessions {
                 if let Some(ch) = &s.channel {
                     if Arc::ptr_eq(ch, &target) {
-                        s.channel = None;
+                        s.set_channel(None);
                     }
                 }
             }

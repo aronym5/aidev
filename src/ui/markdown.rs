@@ -1063,14 +1063,29 @@ pub(super) fn is_wide_emoji(c: char) -> bool {
 }
 
 pub(super) fn char_w(c: char) -> usize {
+    if c.is_control() {
+        // Steuerzeichen (außer Tab, das zuvor via `expand_tabs` zu Leerzeichen
+        // expandiert wird: z. B. \r, ESC, …) rendert Ratatui NIE in eine Zelle:
+        // `Buffer::set_stringn` filtert sie mit `char::is_control` komplett
+        // heraus, sie belegen also 0 Zellen. Würden wir sie hier als 1 zählen,
+        // überschätzen wir die tatsächlich gerenderte Breite – die usage-bar
+        // (und der rechte Rand „│“ der Konsolen-Box) rutschten dann nach links.
+        // 0 hält Messung und Rendering exakt in Übereinstimmung.
+        return 0;
+    }
     if is_wide_emoji(c) {
         2
+    } else if c == '\u{FF9E}' || c == '\u{FF9F}' {
+        // Halbbreite Katakana-Dakuten/Handakuten (ﾞ/ﾟ): Ratatui (`cell_width`)
+        // kompensiert diese fürs Terminal auf 1 Zelle, obwohl unicode-width sie
+        // als 0 (Grapheme_Extend) meldet. Messung muss dem Rendering folgen.
+        1
     } else {
         // `unwrap_or(1)`: Zeichen, deren Breite unicode-width NICHT kennt
-        // (Steuer-/unbekannte Zeichen), bekommen sicher 1 Zelle, damit das
-        // Layout nicht zusammenklappt. Bekannte Breite-0-Zeichen (Combining-
-        // Marks, ZWJ, Variation-Selectors) bleiben dagegen bei 0 – sie werden
-        // vom Terminal unsichtbar/mitgeführt gerendert und dürfen bei der
+        // (unbelegte Codepoints), bekommen sicher 1 Zelle, damit das Layout
+        // nicht zusammenklappt. Bekannte Breite-0-Zeichen (Combining-Marks,
+        // ZWJ, Variation-Selectors) bleiben dagegen bei 0 – sie werden vom
+        // Terminal unsichtbar/mitgeführt gerendert und dürfen bei der
         // Vermessung (rechtsbündiger Balken, „…“-Kürzung) nicht als 1 Zelle
         // zählen, sonst rutschen Balken und Token-Zahlen nach links.
         UnicodeWidthChar::width(c).unwrap_or(1)

@@ -263,25 +263,42 @@ pub(crate) fn build_history_cache(
                 num_tokens,
                 ..
             } => {
-                // Kompaktierung setzt die Block-Summe zurück: `block_sum`
-                // besteht ab hier nur noch aus der Summary selbst (Tokenzahl
-                // aus dem Kompaktierungs-Aufruf, Fallback: Schätzung); die
-                // zuvor aufsummierten Block-Token werden verworfen. Erst ab
-                // dem nächsten Event wird wieder normal addiert.
-                ctx.block_sum = *num_tokens;
-                // Summary als eigene Inhalts-Kategorie (nur für die Farb-
-                // aufteilung – `used` wird durch den Resync der Kompaktierung
-                // bereits auf den bestätigten Stand gesetzt, die Summary-
-                // Token fließen dort NICHT ein, um keine Doppelzählung zu
-                // erzeugen).
-                ctx.contents[ContentKind::Summary as usize] += *num_tokens;
+                // Kompaktierung: Die Summary wird zum neuen Kontext-Anker.
+                // - `verified_prompt` = Tokenzahl des Summary-Events selbst
+                //   (eigener, exakt verifizierter Anker statt der sonst üblichen
+                //   Verifikation durch die Folgerunde):
+                // - usage-bar-Zusammensetzung = NUR Summary in exakt dieser
+                //   Länge; alle bisherigen Beiträge (User/Reasoning/Content,
+                //   Tools) werden auf null zurückgesetzt – der ersetzte Teil
+                //   der Historie ist aus dem Kontext.
+                // - `shift` = Kontextlänge im letzten Event VOR der Summary
+                //   (`ctx.used`) minus der Länge der Summary. Ab hier gemessene
+                //   serverbestätigte absolute Zahlen beziehen sich auf die ALTE
+                //   Historie und werden in `resync_to` um diesen Betrag
+                //   reduziert; der Schätz-Pfad läuft auf der Summary-Basis
+                //   weiter (ergibt rechnerisch „alte absolute Zahl − shift“).
+                let summary_tokens = *num_tokens;
+                let shift = ctx.used.saturating_sub(summary_tokens);
+                ctx.contents = [0; 5];
+                ctx.contents[ContentKind::Summary as usize] = summary_tokens;
+                ctx.tools = Vec::new();
+                ctx.block_sum = summary_tokens;
+                ctx.verified_prompt = Some(summary_tokens);
                 if view.is_overview() {
-                    ctx.verified_prompt = verified_before.get(id).copied();
-                    blocks.push(overview_summary_line(summary, width, &ctx, window, *num_tokens));
-                    resync_after(&mut ctx);
+                    blocks.push(overview_summary_line(
+                        summary,
+                        width,
+                        &ctx,
+                        window,
+                        summary_tokens,
+                    ));
                 } else {
                     blocks.push(summary_block(summary, width, mode));
                 }
+                // Anker exakt auf die Summary-Länge setzen (Shift gilt erst
+                // für die NACHFOLGENDEN Events, sonst würde er doppelt wirken).
+                resync_after(&mut ctx);
+                ctx.compact_shift = shift;
             }
             EventKind::Abort => {
                 // Markierung eines abgebrochenen Turns (wird nicht als Inhalt
@@ -893,32 +910,91 @@ impl ContentKind {
     pub(crate) fn color(self) -> Color {
         match self {
             ContentKind::Summary => Color::Rgb(198, 146, 108),
-            ContentKind::User => Color::Black,
+            ContentKind::User => Color::White,
             ContentKind::Reasoning => MUTED,
-            ContentKind::Content => Color::White,
+            ContentKind::Content => Color::Black,
             ContentKind::Other => Color::Rgb(90, 100, 120),
         }
     }
+}
+
+/// Tab-Breite beim Ersetzen fürs Rendering (wie Terminal-Tab-Stops). Ratatui
+/// verwirft Steuerzeichen (inkl. Tab) beim Rendern komplett – ohne Expansion
+/// wären Tabs in Tool-Labels, Konsolen- und Code-Output unsichtbar. Tabs
+/// werden durch so viele Leerzeichen ersetzt, dass die nächste Tab-Stop-Spalte
+/// erreicht wird (vgl. echtes Terminal). Messung (`char_w(' ') == 1`) und
+/// Rendering stimmen dadurch exakt überein – die Zeichenzählung wird nicht
+/// durcheinandergebracht, weil die Expansion stets VOR der Messung erfolgt.
+pub(crate) const TAB_WIDTH: usize = 8;
+
+/// Spielt eine einzelne Zeile ab und ersetzt jeden Tab durch Leerzeichen bis
+/// zur nächsten Tab-Stop-Spalte, ausgehend von Spalte `col` (innerhalb der
+/// Zeile). Gibt die expandierte Zeile und die neue Spaltenposition zurück.
+///
+/// `col` zählt dabei über die tatsächlich gerenderten Zellen (expandierte
+/// Leerzeichen eingerechnet). `pad_to` und `wrap_preformatted` expandieren Tabs
+/// aus eigener Kraft (sie müssen das mit Umbruch/`\r`-Semantik verzahnen);
+/// `fit_label` nutzt diese Funktion als gemeinsame, konsistente Basis.
+fn expand_line_tabs(line: &str, mut col: usize) -> (String, usize) {
+    if !line.contains('\t') {
+        return (line.to_string(), col + display_units(line));
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for c in line.chars() {
+        if c == '\t' {
+            let n = TAB_WIDTH - (col % TAB_WIDTH);
+            for _ in 0..n {
+                out.push(' ');
+            }
+            col += n;
+        } else {
+            let cw = char_w(c);
+            out.push(c);
+            col += cw;
+        }
+    }
+    (out, col)
+}
+
+/// Anzeige-Breite eines Strings in Zellen (Messriemen).
+fn display_units(s: &str) -> usize {
+    s.chars().map(char_w).sum()
 }
 
 /// Kürzt einen Einzeiler auf `max` Zellen (Breite) und hängt „…“ an, wenn
 /// abgeschnitten – so bleibt in der Übersicht jeder Werkzeug-Aufruf auf einer
 /// Zeile (nie umbrechen).
 pub(crate) fn fit_label(s: &str, max: usize) -> String {
-    let total: usize = s.chars().map(char_w).sum();
+    // Tabs zuerst Tab-Stop-bewusst expandieren (→ Leerzeichen), damit sie
+    // sichtbar gerendert und korrekt vermessen werden statt von Ratatui
+    // verworfen zu werden. Die Expansion läuft VOR der Vermessung, daher
+    // stimmen Messung und Rendering (jeweils über die expandierte Breite).
+    let (expanded, total) = expand_line_tabs(s, 0);
     if total <= max {
-        return s.to_string();
+        return expanded;
     }
+    // Zu lang: expandiert truncaten, dabei `used` über die Zellen führen.
     let budget = max.saturating_sub(1);
     let mut out = String::new();
     let mut used = 0usize;
     for c in s.chars() {
-        let cw = char_w(c);
-        if used + cw > budget {
-            break;
+        if c == '\t' {
+            let n = TAB_WIDTH - (used % TAB_WIDTH);
+            for _ in 0..n {
+                if used >= budget {
+                    break;
+                }
+                out.push(' ');
+                used += 1;
+            }
+        } else {
+            let cw = char_w(c);
+            if used + cw > budget {
+                break;
+            }
+            out.push(c);
+            used += cw;
         }
-        out.push(c);
-        used += cw;
     }
     out.push('…');
     out
@@ -1026,9 +1102,10 @@ pub(crate) struct ContextEstimate {
     /// seitdem“.
     pub(crate) used: u64,
     /// Kumulierte Token je Inhalts-Kategorie (Summary/User/Reasoning/Content/Other).
-    contents: [u64; 5],
+    /// Eine Kompaktierung setzt die Zusammensetzung auf „nur Summary“ zurück.
+    pub(crate) contents: [u64; 5],
     /// Je Tool-Kategorie die kumulierten Token (falls dort etwas anfiel).
-    tools: Vec<(String, u64)>,
+    pub(crate) tools: Vec<(String, u64)>,
     /// Vom Server bestätigte Gesamt-`total_tokens` DES GERADE RENDERTEN Turns
     /// (der abgeschlossenen Abschluss-Zeile mit Usage). Wird nur transitär an
     /// der Antwort-Zeile dieses Turns gesetzt und danach sofort wieder `None`
@@ -1041,6 +1118,13 @@ pub(crate) struct ContextEstimate {
     /// (Kompaktierung) setzt sie auf die Summary-Schätzung zurück – danach
     /// summiert erst das nächste Event wieder normal auf.
     pub(crate) block_sum: u64,
+    /// Verschiebung durch die letzte Kompaktierung: Kontextlänge im letzten
+    /// Event VOR der Summary minus der Länge der Summary. Nachfolgende
+    /// serverbestätigte absolute Zahlen (Verifikationen) sind gegen die ALTE
+    /// (vorkompaktierte) Historie gemessen und werden in `resync_to` um genau
+    /// diesen Betrag reduziert; die Estimator-Basis läuft ab der Summary auf
+    /// dem verbleibenden Kontext. Vor einer Kompaktierung ist der Wert 0.
+    pub(crate) compact_shift: u64,
 }
 
 impl ContextEstimate {
@@ -1053,6 +1137,7 @@ impl ContextEstimate {
             tools: Vec::new(),
             verified_prompt: None,
             block_sum: 0,
+            compact_shift: 0,
         }
     }
     /// Bucht Token auf eine Inhalts-Kategorie (und erhöht die Gesamt-`used`).
@@ -1072,8 +1157,13 @@ impl ContextEstimate {
     /// Schätzwerte der nachfolgenden Events weiteraddieren („letzte reportete
     /// total_tokens darüber + Schätzungen seitdem“). `contents`/`tools` bleiben
     /// unverändert – sie dienen nur der proportionalen Balken-Aufteilung.
+    ///
+    /// Nach einer Kompaktierung (`compact_shift > 0`) ist die bestätigte Zahl
+    /// gegen die ALTE (vorkompaktierte) Historie gemessen; `used` wird um den
+    /// Shift reduziert, damit die Anzeige dem neuen, kürzeren Kontext folgt.
+    /// Vor einer Kompaktierung (Shift 0) verhält sich die Funktion unverändert.
     pub(crate) fn resync_to(&mut self, total: u64) {
-        self.used = total;
+        self.used = total.saturating_sub(self.compact_shift);
     }
 }
 
@@ -1447,7 +1537,9 @@ pub(crate) fn overview_user_line(
 /// kursiver Text links, rechts der Context-Balken. Die `block_sum` wurde bereits
 /// auf die Summary-Tokenzahl gesetzt – die „letzte Zahl“ hinter dem Balken zeigt
 /// dadurch exakt diesen (neuen) Wert. `tokens` wird zusätzlich als Annotation
-/// direkt vor dem Balken angezeigt (analog zu anderen Nachrichten).
+/// direkt vor dem Balken angezeigt (analog zu anderen Nachrichten). `ctx`
+/// trägt zu diesem Zeitpunkt `verified_prompt = tokens` (eigener Anker) und
+/// eine Zusammensetzung aus NUR der Summary.
 fn overview_summary_line(
     text: &str,
     width: usize,
@@ -1568,15 +1660,30 @@ pub(crate) fn disp_width(s: &str) -> usize {
 /// Text auf genau `width` Zellen bringen: Vordere Zeichen übernehmen (führende
 /// Whitespaces bleiben erhalten), hinten auffüllen bzw. hart abschneiden.
 pub(crate) fn pad_to(text: &str, width: usize) -> String {
+    // Defensiv Tabs Tab-Stop-bewusst expandieren (Aufrufer liefern i. d. R.
+    // bereits expandierten Text aus `wrap_preformatted`), damit sie sichtbar
+    // gerendert und korrekt vermessen werden statt von Ratatui verworfen zu
+    // werden. Expansion läuft VOR der Messung → Mess- und Renderbreite stimmen.
     let mut out = String::new();
     let mut w = 0usize;
     for c in text.chars() {
-        let cw = char_w(c);
-        if w + cw > width {
-            break;
+        if c == '\t' {
+            let n = TAB_WIDTH - (w % TAB_WIDTH);
+            for _ in 0..n {
+                if w >= width {
+                    break;
+                }
+                out.push(' ');
+                w += 1;
+            }
+        } else {
+            let cw = char_w(c);
+            if w + cw > width {
+                break;
+            }
+            out.push(c);
+            w += cw;
         }
-        out.push(c);
-        w += cw;
     }
     while w < width {
         out.push(' ');
@@ -1599,12 +1706,23 @@ pub(crate) fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
     }
     let mut out = Vec::new();
     for line in text.lines() {
-        // Terminal-Semantik für `\r`: Spalte 0, danach überschreiben.
+        // Terminal-Semantik: `\r` setzt Spalte 0, dann überschreiben; `\t`
+        // springt auf die nächste Tab-Stop-Spalte (sichtbar, als Leerzeichen).
         let mut cells: Vec<char> = Vec::new();
         let mut col = 0usize;
         for c in line.chars() {
             if c == '\r' {
                 col = 0;
+            } else if c == '\t' {
+                let n = TAB_WIDTH - (col % TAB_WIDTH);
+                for _ in 0..n {
+                    if col < cells.len() {
+                        cells[col] = ' ';
+                    } else {
+                        cells.push(' ');
+                    }
+                    col += 1;
+                }
             } else if col < cells.len() {
                 cells[col] = c;
                 col += 1;
@@ -1872,11 +1990,11 @@ pub(crate) fn diff_row_lines(
             let l = l_rows
                 .get(i)
                 .cloned()
-                .unwrap_or_else(|| empty_cell(left_w, l_style));
+                .unwrap_or_else(|| empty_cell(left_w, num_w, l_style));
             let r = r_rows
                 .get(i)
                 .cloned()
-                .unwrap_or_else(|| empty_cell(right_w, r_style));
+                .unwrap_or_else(|| empty_cell(right_w, num_w, r_style));
             out.push(make_line(vec![(l, left_w), (r, right_w)]));
         }
     } else {
@@ -1927,10 +2045,22 @@ pub(crate) fn diff_row_lines(
     out
 }
 
-/// Eine leere Diff-Zelle (nur `cell_w` Zellen breit, gleicher Hintergrund) für
-/// den Ausgleich, wenn eine Seite weniger Umbruchzeilen hat als die andere.
-pub(crate) fn empty_cell(cell_w: usize, style: &CellStyle) -> Vec<Span<'static>> {
-    vec![Span::styled(" ".repeat(cell_w), style.base)]
+/// Eine leere Diff-Zelle zum Ausgleich, wenn eine Seite weniger Umbruchzeilen
+/// hat als die andere. Zeichnet dieselbe Gutter-Struktur wie eine Folgezeile
+/// von [`diff_cell`] (`num_w` Leerraum + `│` + Marker + leere Füllung), damit
+/// die Spalten auch an leeren Positionen optisch verbunden bleiben – mit
+/// `│`-Trenner zwischen (leerer) Zeilennummer und (leerem) Inhalt.
+pub(crate) fn empty_cell(cell_w: usize, num_w: usize, style: &CellStyle) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    spans.push(Span::styled(" ".repeat(num_w), style.num_style));
+    spans.push(Span::styled("│", style.num_style));
+    spans.push(Span::styled(format!("{} ", style.marker), style.base));
+    let used = num_w + 3;
+    spans.push(Span::styled(
+        " ".repeat(cell_w.saturating_sub(used)),
+        style.base,
+    ));
+    spans
 }
 
 /// Eine Zelle einer Diff-Zeile: Nummerngutter (`<nr>│`), `-`/`+`/` `-Marker und
@@ -1946,8 +2076,12 @@ pub(crate) fn diff_cell(
     cell_w: usize,
     style: &CellStyle,
 ) -> Vec<Vec<Span<'static>>> {
+    // Der Vorspann (`num_w` Leerraum + `│` + Marker = `num_w + 3` Zellen) gilt
+    // auf der ersten UND auf jeder Folgezeile. Das Umbruchlimit für den Inhalt
+    // ist also auf allen Zeilen gleich `cell_w - (num_w + 3)` – sonst liefe eine
+    // Folgezeile samt Vorspann um `num_w + 3` Zellen über die Zellbreite hinaus.
     let first_w = cell_w.saturating_sub(num_w + 3);
-    let lines = marked_wrapped(text, marks, first_w, cell_w);
+    let lines = marked_wrapped(text, marks, first_w, first_w);
     let mut rows: Vec<Vec<Span<'static>>> = Vec::with_capacity(lines.len());
     for (idx, segs) in lines.into_iter().enumerate() {
         let mut spans: Vec<Span<'static>> = Vec::new();

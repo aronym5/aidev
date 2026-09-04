@@ -18,13 +18,14 @@ use crossterm::event::{
 use crossterm::execute;
 
 fn main() -> io::Result<()> {
-    let config = config::Config::load();
-
-    // Kanal-Probe ohne TUI: --channel-ls / --channel-run beenden direkt.
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = probe_channel_cli(&args, &config) {
+
+    // Help/version need no config (and take precedence over everything else).
+    if let Some(code) = probe_cli(&args) {
         std::process::exit(code);
     }
+
+    let config = config::Config::load();
 
     crossterm::terminal::enable_raw_mode()?;
     let guard = TerminalGuard;
@@ -55,6 +56,35 @@ fn main() -> io::Result<()> {
     result
 }
 
+/// Handles the standard `--help` / `--version` flags. Returns `Some(exit_code)`
+/// when one of them was given; `None` otherwise (i.e. the TUI should start).
+fn probe_cli(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        Some("-V" | "--version") => {
+            print!("aidev {}\n", config::VERSION);
+            Some(0)
+        }
+        Some("-h" | "--help") => {
+            print!(
+                "\
+aidev {} – terminal AI coding agent with a per-session sandbox
+
+USAGE: aidev [OPTIONS]
+
+OPTIONS:
+  -h, --help       Print this help message
+  -V, --version    Print version information
+
+With no arguments, the interactive TUI starts.
+",
+                config::VERSION
+            );
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
 /// Deaktiviert Raw-Mode & Alt-Screen beim Verlassen (auch bei `?`-Fehlern).
 struct TerminalGuard;
 
@@ -66,51 +96,5 @@ impl Drop for TerminalGuard {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-/// Verarbeitet `--channel-ls` / `--channel-run`: Ergebnis ausgeben und Exit-Code
-/// 0/1 liefern; `None`, wenn die Argumente zur TUI gehören (oder leer sind).
-fn probe_channel_cli(args: &[String], cfg: &config::Config) -> Option<i32> {
-    let flag = args.first()?;
-    let registry = channel::ChannelRegistry::new(cfg);
-    let out = match flag.as_str() {
-        "--channel-ls" => channel::cli_ls(&registry, args.get(1).map(String::as_str)),
-        "--channel-run" => {
-            // Optionaler Kanalname direkt vor dem Befehl (nur wenn er existiert).
-            let named = args.get(1).is_some_and(|t| registry.get(t).is_some());
-            let start = if named { 2 } else { 1 };
-            match args.get(start) {
-                Some(cmd) => channel::cli_run(
-                    &registry,
-                    (named).then(|| args[1].as_str()),
-                    cmd,
-                    &args[start + 1..],
-                ),
-                None => {
-                    Err("Nutzung: aidev --channel-run [<kanal>] <befehl> [argumente…]".to_owned())
-                }
-            }
-        }
-        "-h" | "--help" => {
-            print!(
-                "Nutzung: aidev [--channel-ls [<kanal>]] [--channel-run [<kanal>] <befehl> <arg>…]\n\n\
-                 --channel-ls    listet die Wurzel eines Kanals\n\
-                 --channel-run   führt ein Kommando im Kanal aus\n\
-                 (ohne Argumente startet die TUI)\n"
-            );
-            return Some(0);
-        }
-        _ => return None,
-    };
-    match out {
-        Ok(text) => {
-            print!("{text}");
-            Some(0)
-        }
-        Err(err) => {
-            eprintln!("[aidev] {err}");
-            Some(1)
-        }
     }
 }

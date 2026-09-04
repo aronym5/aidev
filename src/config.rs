@@ -19,7 +19,10 @@ pub enum PodmanUserMapping {
     /// Bisheriges Verhalten: `--userns=keep-id`.
     #[default]
     KeepId,
-    /// Explizite `--uidmap`/`--gidmap` statt `--userns=keep-id`.
+    /// Explizite `--uidmap`/`--gidmap` statt `--userns=keep-id`. Die
+    /// Gast-UID/-GID stammt aus dem Image (beim Kanal-Aufbau per
+    /// `podman run --rm <image> id` erfragt) und wird für Container-Start
+    /// und exec (`--user`) verwendet.
     Uidmap,
 }
 

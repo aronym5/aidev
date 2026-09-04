@@ -1,15 +1,33 @@
 # aidev
 
-A terminal-based **AI coding agent** (TUI, built on [ratatui] + [crossterm]) that chats
-with an OpenAI-compatible streaming endpoint — and acts inside a **per-session sandbox**:
-searching, reading, editing, and running code through explicit permissions.
+A **blazingly fast**, **static** AI coding agent for your terminal — written in **Rust**, with
+**no library dependencies** and a small footprint (compiled &lt; 7 MB), so it runs on a wide
+range of distributions and versions. It chats with an [OpenAI-compatible streaming
+endpoint](#configuration) and acts inside a **per-session sandbox**: searching, reading, editing,
+and running code through explicit permissions.
+
+## Highlights
+
+- **Multi-session command center** — run several conversations side by side, each with its own
+  prompt, history, and scroll state.
+- **Podman sandboxing** — every session executes inside an isolated container channel; the model
+  never touches your host machine directly.
+- **Git & worktrees** — develop several branches of the same project concurrently across multiple
+  sessions, containers, worktrees, and branches, without collisions.
+- **Full access control** — choose read, write, or execute per turn; every tool call is gated by
+  the permission you grant.
+- **Zoom levels** — step between detail, dialog, and full overview for the right view at the
+  right resolution.
+- **Full context insight** — see exactly what the model sees and compact the context window when
+  you need to.
+- **Zero dependencies** — one static, portable binary around 7 MB; drop it anywhere and it runs.
 
 ---
 
 Install with
 
-```bash
-mkdir ~/bin && curl -sL https://github.com/aronym5/aidev/releases/download/release%2F0.1.0/aidev -o ~/bin/aidev && chmod +x ~/bin/aidev && export PATH=~/bin:$PATH
+```sh
+curl -sSL https://aronym5.github.io/aidev/install.sh | sh
 ```
 
 ---
@@ -22,14 +40,12 @@ sandboxed working directory with a shell. From that point the model can invoke t
 (`grep`, `glob`, `read`, `webfetch`, `edit`, `write`, `run`), every call gated by the
 permission you grant for that turn.
 
-- Markdown rendering — bold, inline code, lists, and fenced code with syntax
-  highlighting.
-- Multiple parallel conversations with independent history, input, and scroll position.
-- Tool calls and their results are logged inline; `run`/`edit` produce console/diff boxes
-  with live progress.
+- Markdown rendering — bold, inline code, lists, and fenced code with syntax highlighting.
+- Tool calls and their results are logged inline; `run`/`edit` produce console/diff boxes with
+  live progress.
 - Streaming answers, context-length handling, and automatic retries with backoff.
-- Full-screen TUI: status line, tab bar, channel indicator, and a zoomable
-  overview ↔ dialog view.
+- Full-screen TUI: status line, tab bar, channel indicator, and a zoomable overview ↔ dialog
+  view.
 
 ### Safety & flexibility
 
@@ -135,13 +151,13 @@ with the arrow keys.
 
 | Command            | Effect                                                        |
 |--------------------|---------------------------------------------------------------|
-| `/run <expr>`      | Run a shell expression directly through the channel, no LLM  |
-| `/compact`         | Manually compact the context history                         |
-| `/model [alias]`   | Switch the model (no argument opens the picker)              |
-| `/channel`         | Open channel picker (same as `Alt+C`)                        |
-| `/options`         | Open options dialog (same as `Ctrl+O`)                       |
-| `/branch <name>`   | Create a new worktree + channel + session                    |
-| `/commit <msg>`    | Commit the current worktree's changes                        |
+| `/run <expr>`      | Run a shell expression directly through the channel, no LLM   |
+| `/compact`         | Manually compact the context history                          |
+| `/model [alias]`   | Switch the model (no argument opens the picker)               |
+| `/channel`         | Open channel picker (same as `Alt+C`)                         |
+| `/options`         | Open options dialog (same as `Ctrl+O`)                        |
+| `/branch <name>`   | Create a new worktree + channel + session                     |
+| `/commit <msg>`    | Commit the current worktree's changes                         |
 
 ---
 
@@ -149,7 +165,7 @@ with the arrow keys.
 
 ```
 src/
-├── main.rs     entry point: raw mode, alt-screen, CLI probes
+├── main.rs     entry point: raw mode, alt-screen
 ├── app/        app state, event loop, sessions, dialogs
 ├── ui/         rendering (markdown chat, input, status bar, pickers)
 ├── editor.rs   reusable multi-line input field
@@ -202,19 +218,23 @@ image = "alpine"
 
 ## Requirements, build & run
 
-- To build:
-  - Rust toolchain
-- To run (all optional, but the app will refuse to work in some areas if not available):
-  - an OpenAI-compatible endpoint
-  - **podman** for container channels.
-  - **git** for worktree-based duplicates and `/branch` / `/commit`
-  - **rg** for fast search, falls back to `grep` if absent.
+The released binary has **no external library dependencies** — it is statically compiled
+(&lt; 7 MB) and portable, so the install step above needs nothing but `curl` and `sh`.
+
+To build from source:
 
 ```sh
 cargo build --release     # binary at target/release/aidev
 cargo run
 cargo test                # unit tests live next to the sources
 ```
+
+To run (all optional, but the app will refuse to work in some areas if not available):
+
+- an OpenAI-compatible endpoint
+- **podman** for container channels.
+- **git** for worktree-based duplicates and `/branch` / `/commit`
+- **rg** for fast search, falls back to `grep` if absent.
 
 ## License
 

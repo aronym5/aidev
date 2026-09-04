@@ -144,7 +144,6 @@ fn local_dateioperationen_weist_symlink_escape_ab() {
     assert!(ch.read(Path::new("leak.txt")).is_err());
     assert!(ch.read(Path::new("evil/geheim.txt")).is_err());
     assert!(ch.write(Path::new("leak.txt"), "überschreiben").is_err());
-    assert!(ch.list(Path::new("evil")).is_err());
     assert!(ch.grep("geheim", Path::new("evil"), None, 0).is_err());
     ch.write(Path::new("intern.txt"), "ok\n").unwrap();
     assert_eq!(ch.read(Path::new("intern.txt")).unwrap(), "ok\n");
@@ -153,16 +152,13 @@ fn local_dateioperationen_weist_symlink_escape_ab() {
 }
 
 #[test]
-fn local_read_write_list_run() {
+fn local_read_write_run() {
     let dir = std::env::temp_dir().join(format!("aidev-local-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let ch = Local::new(dir.clone());
     ch.write(Path::new("src/hello.txt"), "hallo welt\n")
         .unwrap();
     assert_eq!(ch.read(Path::new("src/hello.txt")).unwrap(), "hallo welt\n");
-    let entries = ch.list(Path::new("src")).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "hello.txt");
     let out = ch
         .run(
             "echo",
@@ -205,45 +201,6 @@ fn local_shell_erkennt_bash_fallback_sh_und_wertet_aus() {
         "{}",
         chain.stdout
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn cli_ls_und_cli_run_mit_local_kanal() {
-    let dir = std::env::temp_dir().join(format!("aidev-cli-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let (registry, ch) = test_registry("repo", dir.clone(), Some("repo"));
-    ch.write(Path::new("src/lib.rs"), "pub fn hallo() {}\n")
-        .unwrap();
-    ch.write(Path::new("README.md"), "# demo\n").unwrap();
-    let listing = cli_ls(&registry, None).unwrap();
-    assert!(
-        listing.contains("Kanal \u{201E}repo\u{201C}"),
-        "Default-Kanal gewählt: {listing}"
-    );
-    assert!(
-        listing.contains("Wurzel: Local:"),
-        "Wurzel sichtbar: {listing}"
-    );
-    assert!(
-        listing.contains("[dir] src/"),
-        "Verzeichnis markiert: {listing}"
-    );
-    assert!(listing.contains("README.md"), "Datei gelistet: {listing}");
-    assert_eq!(listing, cli_ls(&registry, Some("repo")).unwrap());
-    let out = cli_run(&registry, None, "echo", &["hallo".into(), "channel".into()]).unwrap();
-    assert!(out.contains("$ echo hallo channel"));
-    assert!(
-        out.trim_end().ends_with("hallo channel"),
-        "Kommando wird nicht doppelt übergeben: {out:?}"
-    );
-    assert!(cli_ls(&registry, Some("fremd")).is_err());
-    let leer = ChannelRegistry {
-        default: None,
-        map: Default::default(),
-        managed: Arc::new(Mutex::new(Vec::new())),
-    };
-    assert!(cli_ls(&leer, None).is_err(), "ohne Kanal kein Listing");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -303,64 +260,6 @@ fn local_config_fehlerfaelle() {
         home: None,
     };
     assert!(channel_from_config("x", &fremd, 60, managed, None, crate::config::PodmanUserMapping::KeepId).is_err());
-}
-
-#[test]
-fn cli_ls_und_cli_run_mit_config_basiertem_local() {
-    let dir = std::env::temp_dir().join(format!("aidev-cfgcli-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn sagt().\n").unwrap();
-    let mut channels = HashMap::new();
-    channels.insert(
-        "sandbox".to_string(),
-        ChannelConfig {
-            kind: "local".into(),
-            image: None,
-            container: None,
-            run_container: None,
-            workdir: "/app".into(),
-            host_root: Some(dir.display().to_string()),
-            home: None,
-        },
-    );
-    let cfg = crate::config::Config {
-        model: "test/m".into(),
-        provider: {
-            let mut m = std::collections::HashMap::new();
-            m.insert(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    base_url: "x".into(),
-                    api_key: Some("x".into()),
-                    user_agent: None,
-                },
-            );
-            m
-        },
-        max_tool_rounds: 16,
-        default_channel: Some("sandbox".into()),
-        channels,
-        symbols: crate::config::SymbolMode::Glyph,
-        context_window: 200_000,
-        compact_at: 0.8,
-        compact_keep_turns: 3,
-        compact_summary_tokens: 4_000,
-        compact_auto: true,
-        mouse: false,
-        paths: Default::default(),
-        ..crate::config::Config::default()
-    };
-    let registry = ChannelRegistry::new(&cfg);
-    let listing = cli_ls(&registry, None).unwrap();
-    assert!(
-        listing.contains("Kanal \u{201E}sandbox\u{201C}"),
-        "{listing}"
-    );
-    assert!(listing.contains("[dir] src/"), "{listing}");
-    let out = cli_run(&registry, None, "echo", &["hallo".into()]).unwrap();
-    assert!(out.contains("hallo"), "{out}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -599,6 +498,98 @@ fn run_from_config_loest_host_identitaet_auf() {
     assert_eq!(ch.uid, uid, "UID == Host");
     assert_eq!(ch.gid, gid, "GID == Host");
     assert_eq!(ch.home, "/tmp", "Default-Home");
+}
+
+#[test]
+fn uidmap_args_verankert_gast_identitaet() {
+    // Non-Root-Gast (z. B. node: 1000): identisch zum bisherigen Flag-Muster.
+    assert_eq!(
+        podman::uidmap_args(1000, 1000),
+        [
+            "--uidmap=0:1:1000",
+            "--uidmap=1000:0:1",
+            "--uidmap=1001:1001:64535",
+            "--gidmap=0:1:1000",
+            "--gidmap=1000:0:1",
+            "--gidmap=1001:1001:64535",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>(),
+        "Gast-1000 mappt wie vorher auf den Host-User"
+    );
+    // Root-Gast (UID 0, z. B. distroless): Root direkt auf Host-User, Rest
+    // identisch auffüllen (kein leerer `0:1:0`-Range).
+    assert_eq!(
+        podman::uidmap_args(0, 0),
+        [
+            "--uidmap=0:0:1",
+            "--uidmap=1:1:65535",
+            "--gidmap=0:0:1",
+            "--gidmap=1:1:65535",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>(),
+        "Root-Gast mappt Root auf den Host-User"
+    );
+}
+
+#[test]
+fn parse_uid_gid_fields_liest_uid_und_gid() {
+    assert_eq!(
+        podman::parse_uid_gid_fields("uid=1000(node) gid=1000(node) groups=1000(node)\n"),
+        Some((1000, 1000))
+    );
+    assert_eq!(
+        podman::parse_uid_gid_fields("uid=0(root) gid=0(root) groups=0(root)\n"),
+        Some((0, 0))
+    );
+    assert_eq!(podman::parse_uid_gid_fields("keine ids"), None);
+}
+
+#[test]
+fn uidmap_exec_argv_nutzt_die_gemerkte_gast_identitaet() {
+    // uidmap-Kanal trägt die beim Aufbau erfragte Gast-UID/-GID (hier z. B. 33/33
+    // eines HTTPD-Images) und exec arbeitet genau damit.
+    let ch = PodmanChannel {
+        name: "web".into(),
+        mode: PodmanMode::Run,
+        container: "aidev-web".into(),
+        workdir: "/var/www".into(),
+        host_root: Some(PathBuf::from("/tmp/x")),
+        image: Some("httpd:2.4".into()),
+        timeout: Duration::from_secs(60),
+        uid: 33,
+        gid: 33,
+        home: "/tmp".into(),
+        usermapping: crate::config::PodmanUserMapping::Uidmap,
+        seq: AtomicUsize::new(1),
+        status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
+        worktree: None,
+        managed: Arc::new(Mutex::new(Vec::new())),
+        shell: Mutex::new(None),
+    };
+    let argv = ch.exec_argv("/var/www", "make", &["test".into()]);
+    let user_pos = argv
+        .iter()
+        .position(|a| a == "--user")
+        .expect("--user gesetzt");
+    assert_eq!(argv[user_pos + 1], "33:33", "Gast-Identität beim exec");
+}
+
+#[test]
+fn running_uid_gid_uidmap_braucht_image() {
+    // Ohne Image kann die Gast-Identität nicht erfragt werden.
+    assert!(
+        podman::running_uid_gid(None, crate::config::PodmanUserMapping::Uidmap).is_err(),
+        "uidmap ohne Image → Fehler"
+    );
+    // keep-id liefert weiterhin die Host-Identität.
+    let (uid, gid) = podman::running_uid_gid(Some("node:22"), crate::config::PodmanUserMapping::KeepId)
+        .expect("Host-Identität");
+    let (huid, hgid) = run::host_uid_gid().unwrap();
+    assert_eq!((uid, gid), (huid, hgid));
 }
 
 #[test]

@@ -7,8 +7,18 @@ use crate::editor::Editor;
 use crate::llm;
 use crate::perm::Permission;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Geteilte, zwischen UI- und Worker-Thread veränderbare Kanalzelle.
+///
+/// Enthält den zum jeweiligen Zeitpunkt gültigen Kanal. Die Session hält die
+/// Zelle als Besitzer; die Stream-Worker erhalten beim Absenden eine `Arc`-
+/// Kopie und lesen sie bei jedem Tool-Call frisch aus, damit ein Kanalwechsel
+/// (Alt+C) während eines laufenden Streams ab dem **nächsten** Tool-Call den
+/// neuen Kanal nutzt. Ein bereits gestarteter Befehl läuft unverändert im
+/// Anfangskanal zu Ende.
+pub(crate) type LiveChannel = Arc<Mutex<Option<Arc<dyn Channel>>>>;
 
 /// Scroll-Anker der manuellen Chat-Position: ein Block des Inhalts-Stapels
 /// (ab dem ersten Inhaltsblock nach dem Logo) plus Zeilen-Offset innerhalb
@@ -170,6 +180,16 @@ pub struct Session {
     pub view: ViewLevel,
     /// Gebundener Kanal (Schnittstelle zum Dateisystem/der Shell) – optional.
     pub channel: Option<Arc<dyn Channel>>,
+    /// Geteilte, **live-veränderbare** Kanalzelle für laufende Streams.
+    ///
+    /// Beim Absenden wird sie mit dem aktuellen Kanal initialisiert und dem
+    /// Worker als `Arc`-Kopie mitgegeben. Ein Kanalwechsel (Alt+C) während
+    /// eines laufenden Streams schreibt hier hinein, sodass der Worker für
+    /// die **folgenden** Tool-Calls dieses Streams den **neuen** Kanal nutzt —
+    /// die zum Absendezeitpunkt gewählte Berechtigung bleibt davon unberührt.
+    /// `channel` (oben) bleibt die Anzeige-/Ziel-Referenz; beide werden über
+    /// [`Session::set_channel`] gemeinsam gesetzt.
+    pub(crate) channel_cell: LiveChannel,
     /// Aktuell gewählte Berechtigung der Eingabe – gilt für den nächsten
     /// Absende-Turn und bleibt als Default für die Folge-Nachricht bestehen.
     pub permission: Permission,
@@ -223,6 +243,7 @@ impl Session {
             history_cache: None,
             view: ViewLevel::default(),
             channel: None,
+            channel_cell: Arc::new(Mutex::new(None)),
             permission: Permission::default(),
             permission_touched: false,
             compacting: false,
@@ -230,6 +251,15 @@ impl Session {
             active_model: None,
             sent_at: None,
         }
+    }
+
+    /// Setzt den gebundenen Kanal – hält Anzeige-Referenz (`channel`) und die
+    /// **Live-Zelle** (`channel_cell`) synchron. Letztere wird von laufenden
+    /// Stream-Workern live gelesen, damit ein Kanalwechsel (Alt+C) noch im
+    /// selben Stream wirkt und nachfolgende Tool-Calls den neuen Kanal nutzen.
+    pub(crate) fn set_channel(&mut self, ch: Option<Arc<dyn Channel>>) {
+        self.channel = ch;
+        *self.channel_cell.lock().expect("channel cell lock") = self.channel.clone();
     }
 
     /// Hängt eine vom User stammende Nachricht an den Verlauf an und erhöht
@@ -624,7 +654,7 @@ pub(crate) fn tool_kind_from_activity(
 pub(crate) fn apply_default_channel(channels: &ChannelRegistry, session: &mut Session) {
     if let Some(name) = channels.default_channel_name().map(str::to_string) {
         if let Some(ch) = channels.get(&name) {
-            session.channel = Some(ch);
+            session.set_channel(Some(ch));
         }
     }
     apply_channel_permission_default(session);

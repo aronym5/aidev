@@ -75,7 +75,7 @@ impl App {
         };
         if picker.cursor == 0 {
             let s = self.active_mut();
-            s.channel = None;
+            s.set_channel(None);
             apply_channel_permission_default(s);
             return;
         }
@@ -111,7 +111,7 @@ impl App {
         ch: Arc<dyn crate::channel::Channel>,
     ) {
         let s = self.active_mut();
-        s.channel = Some(ch);
+        s.set_channel(Some(ch));
         s.error = None;
         s.error_debug = None;
         apply_channel_permission_default(s);

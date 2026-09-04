@@ -422,7 +422,7 @@ impl App {
             Some(wt) => wt.path.clone(),
             None => match worktree {
                 Some(wt) if wt.has_worktree && !wt.path.as_os_str().is_empty() => wt.path.clone(),
-                _ => host_root,
+                _ => host_root.clone(),
             },
         };
 
@@ -455,8 +455,11 @@ impl App {
                 .clone()
                 .unwrap();
         } else if kind == "podman" {
-            // Kein existierender Container → WorkingDir + Projektname als Subdir
-            let project = effective_root
+            // Kein existierender Container → WorkingDir + Reponame als Subdir:
+            // Basename des Repo-Hauptpfads (`host_root`), unabhängig vom
+            // gemounteten Worktree-Ordnernamen – so bleibt der Gast-Pfad über
+            // verschiedene Worktrees hinweg stabil ("/<wd>/<repo>").
+            let project = host_root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "app".to_string());
@@ -494,7 +497,7 @@ impl App {
                 // Bereits vorhandenen Kanal (am selben Container) wiederverwenden.
                 Self::warmup_channel(&ch);
                 let s = self.active_mut();
-                s.channel = Some(ch);
+                s.set_channel(Some(ch));
                 s.error = None;
                 s.error_debug = None;
                 apply_channel_permission_default(s);

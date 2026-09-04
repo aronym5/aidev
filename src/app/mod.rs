@@ -20,6 +20,7 @@ pub use types::*;
 mod session;
 pub(crate) use session::{
     apply_channel_permission_default, apply_default_channel, prompt_chars, should_compact,
+    LiveChannel,
 };
 pub use session::{ChatAnchor, Session, ViewLevel};
 

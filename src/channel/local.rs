@@ -9,7 +9,7 @@ use super::glob;
 use super::resolve::resolve;
 use super::run::run_with_timeout_live;
 use super::search::search_files;
-use super::{Channel, ChannelKind, ChannelStatus, Entry, RunOut, SearchResult};
+use super::{Channel, ChannelKind, ChannelStatus, RunOut, SearchResult};
 
 /// Läuft direkt auf dem Host. Zugleich Reference-Implementierung des
 /// [`Channel`]-Traits und realer Kanal (`type = "local"` in der Config).
@@ -56,10 +56,6 @@ impl Channel for Local {
 
     fn write(&self, rel: &Path, content: &str) -> Result<(), String> {
         fsops::write_at(&resolve(&self.root, rel)?, content)
-    }
-
-    fn list(&self, rel: &Path) -> Result<Vec<Entry>, String> {
-        fsops::list_at(&resolve(&self.root, rel)?)
     }
 
     fn grep(

@@ -13,6 +13,7 @@ use super::tools_def::{Step, ToolInvocation};
 use super::tools_exec::{run_command_display, run_tool_live, tool_activity, tool_label, ToolOut};
 use super::wire::WireMessage;
 use super::{ExecConfirmReply, WorkerEvent};
+use crate::app::LiveChannel;
 use crate::app::LocalExecMode;
 use crate::channel::{Channel, ChannelKind};
 use crate::config::{Config, ResolvedEndpoint};
@@ -35,7 +36,7 @@ pub fn spawn_worker(
     ep: ResolvedEndpoint,
     messages: Vec<WireMessage>,
     cancel: Arc<AtomicBool>,
-    channel: Option<Arc<dyn Channel>>,
+    channel_cell: LiveChannel,
     permission: Permission,
     compact: bool,
     local_exec_mode: LocalExecMode,
@@ -46,7 +47,11 @@ pub fn spawn_worker(
 
         // Wire-Format ist bereits die Chat-Projektion (`api_messages(&chat)`).
         let mut msgs = messages;
-        let mut with_tools = channel.is_some();
+        // Tools sind verfügbar, wenn beim Absenden ein Kanal gebunden war.
+        // Ob der Satz an toten Werkzeugen der Tool-Loop live den (ggf. neu
+        // gebundenen) Kanal nutzt, entscheidet `live_channel()` unten – der
+        // Startwert bleibt hier für die Tool-Definitionen maßgeblich.
+        let mut with_tools = channel_cell.lock().expect("channel cell lock").is_some();
         // Reaktive Kompaktierung (bei context_length-Fehler) nur EINMAL pro Turn.
         let mut reactive_compacted = false;
 
@@ -146,6 +151,12 @@ pub fn spawn_worker(
                             arguments: t.arguments.clone(),
                             label: label.clone(),
                         });
+                        // Live-Kanal zum Zeitpunkt dieses Tool-Calls: Ein
+                        // Kanalwechsel (Alt+C) während des Streams wirkt damit
+                        // unmittelbar auf die folgenden Tool-Calls – die beim
+                        // Absenden gesperrte Berechtigung bleibt unberührt.
+                        let live_ch: Option<Arc<dyn Channel>> =
+                            channel_cell.lock().expect("channel cell lock").clone();
                         // Berechtigungsprüfung VOR der Auswertung: ein über die
                         // gefilterten Definitionen hinaus aufgerufenes Werkzeug
                         // wird abgewiesen, ohne den Kanal zu berühren.
@@ -155,7 +166,7 @@ pub fn spawn_worker(
                         // blockiert, bis die UI über den Reply-Kanal antwortet
                         // (oder der Sender weggefallen ist → ablehnen).
                         let confirmed = if allowed {
-                            match channel.as_deref() {
+                            match live_ch.as_deref() {
                                 Some(ch)
                                     if t.name == "run"
                                         && ch.kind() == ChannelKind::Local
@@ -197,7 +208,7 @@ pub fn spawn_worker(
                                 ..Default::default()
                             }
                         } else {
-                            match channel.as_deref() {
+                            match live_ch.as_deref() {
                                 Some(ch) => {
                                     let mut sink = LiveSink::new(tx.clone(), session);
                                     let out = run_tool_live(
