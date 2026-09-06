@@ -35,9 +35,33 @@ echo "==> Installing ${APP} to ${BIN_DIR}"
 mkdir -p "${BIN_DIR}"
 
 echo "==> Downloading latest release: ${URL}"
-curl -fsSL "${URL}" -o "${BIN_DIR}/${APP}"
 
-chmod +x "${BIN_DIR}/${APP}"
+# Install atomically: in-place writes to a *running* binary fail with
+# ETXTBSY ("Text file busy"), so download to a temp file in the same
+# directory and rename it over the target. This works even while aidev
+# is currently running; the old version stays in memory for the running
+# instance until it is restarted.
+TMP="${BIN_DIR}/.${APP}.$$"
+if ! curl -fsSL "${URL}" -o "${TMP}"; then
+  rm -f "${TMP}"
+  echo "==> ERROR: download failed; existing ${BIN_DIR}/${APP} was left untouched." >&2
+  exit 1
+fi
+
+chmod +x "${TMP}"
+
+if [ -d "${BIN_DIR}/${APP}" ]; then
+  rm -f "${TMP}"
+  echo "==> ERROR: ${BIN_DIR}/${APP} is a directory, not a file." >&2
+  exit 1
+fi
+
+mv -f "${TMP}" "${BIN_DIR}/${APP}"
+
+if [ ! -x "${BIN_DIR}/${APP}" ]; then
+  echo "==> ERROR: downloaded file is not a runnable binary." >&2
+  exit 1
+fi
 
 echo "==> Installed ${BIN_DIR}/${APP}"
 
@@ -66,3 +90,4 @@ fi
 
 echo
 echo "Done! Run '${APP}' to start (restart your shell if '${APP}' is not found)."
+echo "Note: an already running ${APP} keeps using the previous version until you restart it."
