@@ -149,7 +149,7 @@ fn retry_backoff_waechst_und_jitter_bleibt_in_grenzen() {
 // ── Kompaktierungs-Grenzen (compact) ──────────────────────────────────────
 
 #[test]
-fn wire_compact_boundary_behaelt_tool_runden() {
+fn wire_compact_boundary_zaehlt_turns_an_user_nachrichten() {
     let w = |role: &str| WireMessage {
         role: role.into(),
         content: Some("x".into()),
@@ -157,7 +157,7 @@ fn wire_compact_boundary_behaelt_tool_runden() {
         tool_calls: None,
         tool_call_id: None,
     };
-    // tool-Runde: user → assistant(tool_calls) → tool → assistant(final) → user → assistant(final)
+    // Turn 1 mit Werkzeug-Runde: user → assistant(tool_calls) → tool → tool
     let mut tool = w("assistant");
     tool.tool_calls = Some(vec![WireToolCall {
         id: "c".into(),
@@ -171,13 +171,20 @@ fn wire_compact_boundary_behaelt_tool_runden() {
         w("user"),
         tool,
         w("tool"),
-        w("assistant"),
+        w("tool"),
         w("user"),
         w("assistant"),
+        w("user"),
     ];
-    // keep=1 → nur der letzte Turn (user+assistant) bleibt; die tool-Runde davor
-    // wird mit archiviert (boundary = 4, archiviert Indizes 0..4).
+    // Die Zählung läuft über `user`-Nachrichten (identisch zu
+    // `compact_boundary` auf der Session-Seite): eine mehrteilige Tool-Runde
+    // ist Teil ihres Turns und wird komplett mit archiviert.
+    // keep=1 → es bleiben die letzten 2 User (turn2 + Pending user3) übrig;
+    // Turn 1 (Indizes 0..4, samt Werkzeug-Runde) wird archiviert.
     assert_eq!(wire_compact_boundary(&msgs, 1), 4);
+    // keep=2 → auch der vorletzte Turn würde gebraucht; mit nur 3 Usern gibt
+    // es nichts hinter der Grenze zu archivieren.
+    assert_eq!(wire_compact_boundary(&msgs, 2), 0);
     // keep größer als die Turn-Zahl → nichts zu archivieren.
     assert_eq!(wire_compact_boundary(&msgs, 9), 0);
 }
@@ -203,7 +210,7 @@ fn kompaktierung_zu_kurze_historie_meldet_abbruch() {
         tool_calls: None,
         tool_call_id: None,
     }];
-    let err = compact_chat_messages(client, &cfg, &ep, &msgs, &cancel).unwrap_err();
+    let err = compact_chat_messages(0, client, &cfg, &ep, &msgs, &cancel).unwrap_err();
     assert!(!err.is_empty());
 }
 

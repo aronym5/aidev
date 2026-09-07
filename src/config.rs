@@ -108,6 +108,26 @@ pub(crate) fn effective_user_agent(provider: &ProviderConfig, provider_name: &st
     }
 }
 
+/// True, wenn die Request-Ziel-URL (Provider `base_url`) auf `opencode.ai`
+/// zeigt (Host oder Subdomain, optional mit Port). Dort werden zusätzlich
+/// `x-opencode-client: cli` und `x-opencode:project: global` erwartet – für
+/// Chat (`request_once`) UND Summary (`request_summary`), damit beide Pfade
+/// dieselbe Bedingung teilen.
+pub(crate) fn is_opencode_base(base_url: &str) -> bool {
+    // `<scheme>://<host>[:<port>][/…]` → Host (ohne Scheme, ohne Port) herauspulen.
+    let host = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
+}
+
 /// Ein benanntes Modell in `[models.<alias>]`. Die Modell-ID enthält immer
 /// den Provider-Prefix (`"openai/gpt-4o"`).
 #[derive(Debug, Clone, Deserialize)]

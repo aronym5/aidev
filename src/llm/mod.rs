@@ -173,9 +173,11 @@ pub struct CompletionParts {
     pub tool_calls: Vec<u64>,
 }
 
+mod api;
 mod compact;
 mod helpers;
 mod http;
+mod ident;
 mod tools_def;
 mod tools_exec;
 mod webfetch;
@@ -196,7 +198,9 @@ pub(crate) use helpers::{
     civil_from_days, reasoning_contract_hint, server_error_summary, truncate, with_debug,
 };
 #[cfg(test)]
-pub(crate) use http::{distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator};
+pub(crate) use http::{
+    accumulate_sse_event, distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator,
+};
 #[cfg(test)]
 pub(crate) use tools_def::{apply_tool_delta, sanitize_arguments, tool_definitions, ToolCallAcc};
 #[cfg(test)]

@@ -1,3 +1,5 @@
+[Website](https://aronym5.github.io/aidev/)
+
 # aidev
 
 A **blazingly fast**, **static** AI coding agent for your terminal — written in **Rust**, with

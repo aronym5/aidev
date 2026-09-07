@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::compact::{compact_chat_messages, compact_wire_messages, looks_like_context_error};
+use super::compact::{compact_chat_messages, looks_like_context_error};
 use super::http::{request_once, shared_client};
 use super::tools_def::{Step, ToolInvocation};
 use super::tools_exec::{run_command_display, run_tool_live, tool_activity, tool_label, ToolOut};
@@ -61,7 +61,7 @@ pub fn spawn_worker(
         // Original-Historie gesendet – kein harter Abbruch.
         if compact {
             let _ = tx.send(WorkerEvent::Compacting(session));
-            match compact_chat_messages(client, &config, &ep, &msgs, &cancel) {
+            match compact_chat_messages(session, client, &config, &ep, &msgs, &cancel) {
                 Ok((repl, content, tokens)) => {
                     let _ = tx.send(WorkerEvent::Compacted(session, content, tokens));
                     msgs = repl;
@@ -101,15 +101,28 @@ pub fn spawn_worker(
                 }
                 Step::Err(err) => {
                     // Kontextfenster überlaufen? Einmalig komprimieren und die
-                    // Anfrage erneut versuchen (reaktive Kompaktierung).
+                    // Anfrage erneut versuchen (reaktive Kompaktierung). Anders
+                    // als früher wird die Summary NICHT nur in die flüchtige
+                    // Wire-Anfrage eingebaut: Über denselben Pfad wie die
+                    // proaktive Kompaktierung (`Compacting`/`Compacted` →
+                    // `apply_compaction`) wandert sie als `Archive`-Event in
+                    // die Session-Historie, und `repl` wird zur neuen
+                    // Nachrichtenliste der folgenden Runden – Historie und
+                    // gesendete Anfrage bleiben so im Turn konsistent.
                     if !reactive_compacted && config.compact_auto && looks_like_context_error(&err)
                     {
-                        if let Ok(new_msgs) =
-                            compact_wire_messages(client, &config, &ep, &msgs, &cancel)
-                        {
-                            msgs = new_msgs;
-                            reactive_compacted = true;
-                            continue;
+                        let _ = tx.send(WorkerEvent::Compacting(session));
+                        match compact_chat_messages(session, client, &config, &ep, &msgs, &cancel) {
+                            Ok((repl, content, tokens)) => {
+                                let _ = tx.send(WorkerEvent::Compacted(session, content, tokens));
+                                msgs = repl;
+                                reactive_compacted = true;
+                                continue;
+                            }
+                            Err(_) => {
+                                // Ohne Kompaktierung weitermachen; die
+                                // Fehlerbehandlung unten beendet den Turn.
+                            }
                         }
                     }
                     let _ = tx.send(WorkerEvent::Error(session, err));

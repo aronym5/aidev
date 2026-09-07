@@ -49,6 +49,25 @@ pub(crate) fn run_tool_live(
         serde_json::from_str(args).unwrap_or_else(|_| Value::Object(Map::new()))
     };
 
+    // Leeres Argument-Objekt: KEIN Tool hat einen optionalen Satz, der zu `{}`
+    // führen dürfte (alle haben ≥ 1 Pflicht-Argument). Ein leeres Objekt heißt
+    // fast immer, dass die gestreamten `function.arguments` abgeschnitten oder
+    // durch einen Provider-Streaming-Glitch korrupt ankamen (→ `sanitize` →
+    // `{}`). Statt des irreführenden „Argument \"path\" missing“ dem Modell eine
+    // klare, retry-fähige Rückmeldung geben.
+    if v.as_object().is_some_and(Map::is_empty) {
+        return ToolOut {
+            text: format!(
+                "ERROR: The \"{name}\" tool received an empty argument object \
+                 (its required arguments were missing). This usually means the \
+                 streamed tool arguments were truncated or corrupted in transit \
+                 (a provider streaming glitch). Re-issue the identical {name} \
+                 call with the exact same parameters."
+            ),
+            ..Default::default()
+        };
+    }
+
     let result: Result<ToolOut, String> = (|| match name {
         "grep" => {
             let pattern = arg_str(&v, "pattern")?;
