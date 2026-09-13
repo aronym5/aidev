@@ -252,6 +252,13 @@ pub fn spawn_worker(
                             tool_call_id: Some(t.id),
                         });
                     }
+                    // Alle Werkzeuge dieser Runde sind beendet – der Worker kennt
+                    // das Rundenende explizit (er kennt `tools.len()`). Die UI
+                    // schließt damit die offene Assistant-Runde sofort ab, statt
+                    // bis zum ersten Chunk der Folgerunde zu warten – die
+                    // serverbestätigte Usage steht dadurch schon während der
+                    // Folge-Anfrage als `reported_usage` auf dem Event.
+                    let _ = tx.send(WorkerEvent::RoundEnd(session));
                     msgs.extend(round);
                 }
             }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::llm::WorkerEvent;
+use std::time::Instant;
 
 impl App {
     pub(crate) fn drain_events(&mut self) -> bool {
@@ -67,6 +68,35 @@ impl App {
                         s.last_http_headers = Some(headers);
                     }
                 }
+                WorkerEvent::RoundStart(id, at) => {
+                    // Eine neue HTTP-Runde der Antwort wird abgesendet: Die
+                    // Streaming-Metrik-Felder zurücksetzen, damit die Statusleiste
+                    // wieder „thinking…“ hochzählt (bis FirstToken eintrifft).
+                    if let Some(s) = self.session_mut(id) {
+                        s.reset_stream_metrics(at);
+                    }
+                }
+                WorkerEvent::FirstToken(id, ttft_ms) => {
+                    // Erstes Inhalt-Byte (Reasoning/Tool-Call/Content) da: gemessene
+                    // TTFT übernehmen und den TPS-Nenner (UI-Uhr) starten.
+                    if let Some(s) = self.session_mut(id) {
+                        s.ttft_ms = Some(ttft_ms);
+                        s.first_token_at = Some(Instant::now());
+                    }
+                }
+                WorkerEvent::StreamProgress(id, tokens, _stream_ms) => {
+                    // Live-Tokenstand der laufenden Runde für die TPS-Anzeige.
+                    if let Some(s) = self.session_mut(id) {
+                        s.stream_tokens = tokens;
+                    }
+                }
+                WorkerEvent::RoundMetrics(id, metrics) => {
+                    // Abgeschlossene Runde: Metriken parken, bis die Runde über
+                    // `finish_assistant` finalisiert wird (dann ans Event).
+                    if let Some(s) = self.session_mut(id) {
+                        s.pending_metrics = Some(metrics);
+                    }
+                }
                 WorkerEvent::ToolStart {
                     session,
                     tool_call_id,
@@ -124,9 +154,24 @@ impl App {
                         // ToolEnd würde die Runde vorschnell schließen – die
                         // restlichen Tools hingen dann an einer frischen, falschen
                         // Sub-Runde und verlören ihre gemessenen Tokens. Die Runde
-                        // wird stattdessen geschlossen, sobald die NÄCHSTE Runde
-                        // beginnt (`Chunk`/`Reasoning`/`Usage`) bzw. bei
-                        // `Done`/`Cancelled`.
+                        // wird stattdessen per `RoundEnd` (explizit vom Worker
+                        // nach dem letzten Tool) geschlossen; die Lazy-Abschlüsse
+                        // bei `Chunk`/`Reasoning`/`Usage`/`Done`/`Cancelled`
+                        // bleiben nur als Fallback.
+                    }
+                }
+                WorkerEvent::RoundEnd(id) => {
+                    // Explizites Rundenende vom Worker (er kennt `tools.len()`):
+                    // alle Tools der Runde sind beendet, die geparkte
+                    // `pending_usage` gehört genau zu dieser Runde. Sofort
+                    // abschließen, damit `reported_usage` schon während der
+                    // Folge-Anfrage auf dem Event steht – statt erst beim
+                    // ersten Chunk danach. Ohne offene Tool-Runde ein No-Op
+                    // (idempotent, z. B. nach Cancel/Error doppelt).
+                    if let Some(s) = self.session_mut(id) {
+                        if s.is_open_tool_round_done() {
+                            s.finish_assistant(false, None);
+                        }
                     }
                 }
                 WorkerEvent::ExecConfirm(id, label, command, reply) => {
@@ -141,7 +186,7 @@ impl App {
                         self.exec_confirm = Some(ExecConfirm {
                             label,
                             command,
-                            cursor: 0,
+                            nav: ListNav::new(2), // „Yes, run" | „No, decline"
                             reply: reply.0,
                         });
                     } else {
@@ -214,7 +259,7 @@ impl App {
                         first_image_load = !b.images_loaded;
                         // Images in Tunnel-Liste einfügen (local bleibt auf Index 0)
                         for (img, wd) in images_with_wd {
-                            if !b.tunnels.iter().any(|t| {
+                            if !b.tunnels.items.iter().any(|t| {
                                 t.image_name().is_some_and(|n| {
                                     crate::channel::builder::image_names_equal(n, &img)
                                 })
@@ -227,8 +272,8 @@ impl App {
                         }
                         b.container_info = container_info;
                         // Worktrees nur übernehmen, wenn noch kein eigener Inhalt
-                        if b.worktrees.is_empty() && !worktrees.is_empty() {
-                            b.worktrees = worktrees;
+                        if b.worktrees.items.is_empty() && !worktrees.is_empty() {
+                            b.worktrees = Selection::wrap_at(worktrees, 0);
                         }
                         b.images_loaded = true;
                     }
@@ -253,27 +298,14 @@ impl App {
                     let added = self.model_registry.len().saturating_sub(before);
 
                     // Picker-Liste aktualisieren (wenn offen).
+                    // Komplette Liste aus der Registry neu aufbauen, um
+                    // Reihenfolge und Display konsistent zu halten – vor dem
+                    // mutablen Borrow auf `model_picker` bauen.
+                    let list = self.model_pick_list();
                     if let Some(p) = &mut self.model_picker {
-                        // Komplette Liste aus der Registry neu aufbauen,
-                        // um Reihenfolge und Display konsistent zu halten.
-                        p.items.clear();
-                        for entry in self.model_registry.all() {
-                            p.items.push((entry.key(), entry.display_full()));
-                        }
-                        let default_id = self.config.model.clone();
-                        let default_key = self
-                            .model_registry
-                            .find_by_model_id(&default_id)
-                            .map(|e| e.key())
-                            .unwrap_or(default_id);
-                        p.show_default = !p.items.iter().any(|(k, _)| *k == default_key);
-                        // Cursor sichern (nicht über Listenende hinaus).
-                        let max = if p.show_default {
-                            p.items.len()
-                        } else {
-                            p.items.len().saturating_sub(1)
-                        };
-                        p.cursor = p.cursor.min(max);
+                        // `set_items` erhält den Cursor und klemmt ihn auf die
+                        // neue Länge (bzw. auf „(Standard)", falls nötig).
+                        p.items.set_items(list);
                         p.loading = false;
                     }
 

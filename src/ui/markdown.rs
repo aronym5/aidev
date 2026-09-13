@@ -1,18 +1,13 @@
-//! Markdown-Weiterverarbeitung für den Chat: Symbol-Dekoration,
-//! wortweiser Umbruch und Tabellen-Layout. Die Funktionen bauen auf den
-//! von `tui-markdown` gelieferten `Line`s auf und formen sie zu
-//! bildschirmbreiten Zeilen.
+//! Markdown-Weiterverarbeitung für den Chat: wortweiser Umbruch und
+//! Tabellen-Layout. Die Funktionen bauen auf den von `tui-markdown`
+//! gelieferten `Line`s auf und formen sie zu bildschirmbreiten Zeilen.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use tui_markdown::{from_str_with_options, Options, StyleSheet};
 use unicode_width::UnicodeWidthChar;
 
-use super::{
-    ACCENT, BASE_BG, BOX_BORDER, CODE_BG, CODE_FG, MUTED, PAD_R, SYM_ERR, SYM_MUTED, SYM_OK,
-    SYM_WARN,
-};
-use crate::config::SymbolMode;
+use super::{theme, CANVAS_BG, PAD_R};
 
 /// Stylesheet des Chat-Markdown-Renderings.
 ///
@@ -23,10 +18,10 @@ struct ChatSheet;
 impl StyleSheet for ChatSheet {
     fn heading(&self, level: u8) -> Style {
         match level {
-            1 => Style::new().fg(ACCENT).bold().underlined(),
-            2 => Style::new().fg(ACCENT).bold(),
-            3 => Style::new().fg(ACCENT).bold().italic(),
-            _ => Style::new().fg(ACCENT).italic(),
+            1 => Style::new().fg(theme().accent).bold().underlined(),
+            2 => Style::new().fg(theme().accent).bold(),
+            3 => Style::new().fg(theme().accent).bold().italic(),
+            _ => Style::new().fg(theme().accent).italic(),
         }
     }
 
@@ -35,11 +30,11 @@ impl StyleSheet for ChatSheet {
     }
 
     fn link(&self) -> Style {
-        Style::new().fg(ACCENT).underlined()
+        Style::new().fg(theme().accent).underlined()
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(Color::Rgb(129, 201, 149)).bg(CODE_BG) // Grün wie SYM_OK
+        Style::new().fg(Color::Rgb(129, 201, 149)).bg(theme().surface_bg) // Grün wie theme().ok
     }
 }
 
@@ -56,83 +51,8 @@ pub(super) fn logical_lines<'a>(src: &'a str) -> Vec<Line<'a>> {
     out
 }
 
-/// Ersatzzeichen + semantische Farbe für Status-Emoji im Glyph-Modus.
-///
-/// `ℹ️` (U+2139) fehlt bewusst – das „i“ wird überall gut angezeigt und bleibt
-/// unangetastet. Die Ersatzglyphen sind Breite 1 und in praktisch jeder
-/// Terminal-Schriftart vorhanden, sodass Tabelle/Code konsistent layouten.
-pub(super) fn symbol_replacement(c: char) -> Option<(String, Color)> {
-    let colored = |glyph: &str, color: Color| Some((glyph.to_string(), color));
-    match c {
-        '\u{2705}' => colored("✓", SYM_OK),    // ✅
-        '\u{2714}' => colored("✓", SYM_OK),    // ✔
-        '\u{2611}' => colored("☑", SYM_OK),    // ☑️
-        '\u{274C}' => colored("✗", SYM_ERR),   // ❌
-        '\u{274E}' => colored("✗", SYM_ERR),   // ❎
-        '\u{2B1C}' => colored("□", SYM_MUTED), // ⬜
-        '\u{1F534}' => colored("●", SYM_ERR),  // 🔴
-        '\u{1F7E2}' => colored("●", SYM_OK),   // 🟢
-        '\u{1F7E1}' => colored("●", SYM_WARN), // 🟡
-        '\u{26A0}' => colored("⚠", SYM_WARN),  // ⚠️
-        '\u{2757}' => colored("!", SYM_ERR),   // ❗
-        '\u{1F44D}' => colored("✓", SYM_OK),   // 👍
-        '\u{1F44E}' => colored("✗", SYM_ERR),  // 👎
-        '\u{2753}' => colored("?", SYM_WARN),  // ❓
-        '\u{1F6A8}' => colored("▲", SYM_ERR),  // 🚨
-        '\u{1F197}' => colored("OK", SYM_OK),  // 🆗
-        '\u{1F4A1}' => colored("★", SYM_WARN), // 💡
-        _ => None,
-    }
-}
-
-/// Status-Emoji in den logischen Zeilen einfärben bzw. ersetzen – vor dem
-/// Umbruch, damit Tabellen-/Code-Layout konsistente Breiten sieht.
-/// Ein ggf. folgender Variationsselektor (U+FE0F) wird beim Ersetzen mit
-/// entsorgt; vorhandene Modifier (bold/italic) bleiben erhalten.
-pub(super) fn decorate_symbols<'a>(lines: Vec<Line<'a>>, mode: SymbolMode) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .map(|line| decorate_line(line, mode))
-        .collect()
-}
-
-pub(super) fn decorate_line<'a>(line: Line<'a>, mode: SymbolMode) -> Line<'static> {
-    let mut out: Vec<Span<'static>> = Vec::new();
-    for span in line.spans {
-        let style = span.style;
-        let chars: Vec<char> = span.content.chars().collect();
-        let mut run = String::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            match symbol_replacement(c) {
-                Some((repl, color)) => {
-                    if !run.is_empty() {
-                        out.push(Span::styled(std::mem::take(&mut run), style));
-                    }
-                    if chars.get(i + 1).copied() == Some('\u{FE0F}') {
-                        i += 1; // Variationsselektor mitfressen
-                    }
-                    let text = if mode == SymbolMode::Emoji {
-                        c.to_string()
-                    } else {
-                        repl
-                    };
-                    out.push(Span::styled(text, style.fg(color)));
-                }
-                None => run.push(c),
-            }
-            i += 1;
-        }
-        if !run.is_empty() {
-            out.push(Span::styled(run, style));
-        }
-    }
-    Line::from(out)
-}
-
 /// Orange Farbe für fetten/kursiven Text (Hervorhebung).
-const HIGHLIGHT_FG: Color = Color::Rgb(238, 198, 93); // Orange wie SYM_WARN
+const HIGHLIGHT_FG: Color = Color::Rgb(238, 198, 93); // Orange wie theme().warn
 
 /// Fett- und kursiven Text in den logischen Zeilen zusätzlich orange einfärben.
 pub(super) fn decorate_emphasis(lines: Vec<Line<'_>>) -> Vec<Line<'static>> {
@@ -196,7 +116,7 @@ pub(super) fn wrap_markdown<'a>(
         }
         if in_code {
             for l in code_content_line(line, budget) {
-                out.push(fill_band(l, text_w, indent, CODE_BG));
+                out.push(fill_band(l, text_w, indent, theme().surface_bg));
             }
             i += 1;
             continue;
@@ -234,7 +154,7 @@ pub(super) fn hr_line(width: usize, indent: usize) -> Line<'static> {
     let budget = width.saturating_sub(indent).max(1);
     let dashes: String = "─".repeat(budget);
     let mut spans = vec![Span::raw(" ".repeat(indent))];
-    spans.push(Span::styled(dashes, Style::default().fg(MUTED)));
+    spans.push(Span::styled(dashes, Style::default().fg(theme().muted)));
     Line::from(spans)
 }
 
@@ -495,7 +415,7 @@ pub(super) fn render_table<'a>(
     indent: usize,
 ) -> Vec<Line<'static>> {
     let budget = width.saturating_sub(indent).max(1);
-    let border = Style::default().fg(BOX_BORDER);
+    let border = Style::default().fg(theme().surface_border);
     let Some(top_idx) = block.iter().position(|l| starts_with_char(l, '┌')) else {
         // Kein Rahmen ersichtlich: notfalls unangetastet übernehmen.
         return block
@@ -586,16 +506,16 @@ pub(super) fn wrap_hard<'a>(line: &Line<'a>, width: usize) -> Vec<Line<'static>>
 }
 
 /// Inhalt einer Codeblock-Zeile: Code-Band; ohne Syntax-Farben bleibt
-/// `CODE_FG`, vorhandene Farben (z. B. rust) bleiben stehen.
+/// `theme().surface_fg`, vorhandene Farben (z. B. rust) bleiben stehen.
 pub(super) fn code_content_line<'a>(line: &Line<'a>, budget: usize) -> Vec<Line<'static>> {
     let mut styled = Line::default();
     for s in &line.spans {
         let mut st = s.style;
         if st.bg.is_none() {
-            st.bg = Some(CODE_BG);
+            st.bg = Some(theme().surface_bg);
         }
         if st.fg.is_none() {
-            st.fg = Some(CODE_FG);
+            st.fg = Some(theme().surface_fg);
         }
         styled.spans.push(Span::styled(s.content.clone(), st));
     }
@@ -608,7 +528,7 @@ pub(super) fn fill_band<'a>(line: Line<'a>, width: usize, indent: usize, bg: Col
     let rest = width.saturating_sub(indent + line.width());
     let mut spans = vec![Span::styled(
         " ".repeat(indent),
-        Style::default().bg(BASE_BG),
+        Style::default().bg(CANVAS_BG),
     )];
     spans.extend(line.spans);
     spans.push(Span::styled(" ".repeat(rest), Style::default().bg(bg)));
@@ -1059,6 +979,7 @@ pub(super) fn is_wide_emoji(c: char) -> bool {
             | '\u{1F6A8}' // 🚨
             | '\u{1F197}' // 🆗
             | '\u{1F4A1}' // 💡
+            | '\u{1F4AD}' // 💭
     )
 }
 

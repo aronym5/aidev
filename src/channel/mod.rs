@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{ChannelConfig, PodmanUserMapping};
@@ -118,6 +118,20 @@ pub trait Channel: Send + Sync {
     fn owned_worktree(&self) -> Option<&crate::repo::WorktreeInfo> {
         None
     }
+    /// Startet dieser Kanal selbst einen Run-Container (den aidev beim Beenden
+    /// wieder stoppt)? Nur beim Erzeugen des Kanals gesetzt, bleibt über die
+    /// Lebensdauer unverändert. Podman-Run: `true`; Attach/Local: `false`.
+    fn managed_container(&self) -> bool {
+        false
+    }
+    /// Verwaltet dieser Kanal einen von aidev angelegten Git-Worktree, der beim
+    /// Schließen wieder aufgeräumt werden soll? In der Regel `false` – nur wenn
+    /// der Channel durch den Picker (Branch ohne Worktree), `/branch` oder
+    /// `Alt+D` erzeugt wurde. Nur beim Erzeugen des Kanals gesetzt, bleibt über
+    /// die Lebensdauer unverändert.
+    fn managed_worktree(&self) -> bool {
+        false
+    }
     fn status(&self) -> ChannelStatus {
         ChannelStatus::Unknown
     }
@@ -155,22 +169,17 @@ pub enum ChannelStatus {
     Problem,
 }
 
-/// Geteilter Zustand für verwaltete Container.
-type Managed = Arc<Mutex<Vec<String>>>;
-
 /// Zentrale Verwaltung der konfigurierten Kanäle.
 pub struct ChannelRegistry {
     pub(crate) default: Option<String>,
     pub(crate) map: HashMap<String, Arc<dyn Channel>>,
-    pub(crate) managed: Managed,
 }
 
 impl ChannelRegistry {
     pub fn new(cfg: &crate::config::Config) -> Self {
-        let managed: Managed = Arc::new(Mutex::new(Vec::new()));
         let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         for (name, cc) in &cfg.channels {
-            match channel_from_config(name, cc, cfg.timeout_secs, managed.clone(), None, cfg.podman.usermapping) {
+            match channel_from_config(name, cc, cfg.timeout_secs, None, cfg.podman.usermapping) {
                 Ok(ch) => {
                     map.insert(name.clone(), ch);
                 }
@@ -186,7 +195,6 @@ impl ChannelRegistry {
         ChannelRegistry {
             default,
             map,
-            managed,
         }
     }
 
@@ -250,12 +258,16 @@ impl ChannelRegistry {
         self.map.remove(name);
     }
 
+    /// Stoppt am Programmende alle von aidev selbst gestarteten Container:
+    /// gesammelt über die Kanäle in der Registry, deren `managed_container`
+    /// gesetzt ist (Podman-Run-Modus).
     pub fn stop_managed(&self) {
         let names: std::collections::HashSet<String> = self
-            .managed
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default();
+            .map
+            .values()
+            .filter(|ch| ch.managed_container())
+            .filter_map(|ch| ch.container_name())
+            .collect();
         let handles: Vec<_> = names
             .into_iter()
             .map(|name| {
@@ -274,15 +286,11 @@ impl ChannelRegistry {
         }
     }
 
-    /// Stoppt einen einzelnen, selbst verwalteten Container sofort: Name aus
-    /// der `managed`-Liste entfernen und `podman stop -t 0` ausführen. Wird
-    /// beim expliziten Schließen eines Kanals genutzt (`finalize_close_channel`);
-    /// `stop_managed` räumt am Programmende den Rest auf.
+    /// Stoppt einen einzelnen, selbst verwalteten Container sofort (`podman stop
+    /// -t 0`). Wird beim expliziten Schließen eines Kanals genutzt
+    /// (`finalize_close_channel`); `stop_managed` räumt am Programmende den Rest
+    /// auf.
     pub fn stop_one(&self, name: &str) {
-        {
-            let mut g = self.managed.lock().unwrap_or_else(|p| p.into_inner());
-            g.retain(|n| n != name);
-        }
         let _ = run::run_with_timeout(
             "podman",
             &["stop".into(), "-t".into(), "0".into(), name.to_string()],
@@ -300,7 +308,6 @@ pub fn channel_from_config(
     name: &str,
     cfg: &ChannelConfig,
     timeout_secs: u64,
-    managed: Managed,
     worktree: Option<crate::repo::WorktreeInfo>,
     usermapping: PodmanUserMapping,
 ) -> Result<Arc<dyn Channel>, String> {
@@ -309,7 +316,6 @@ pub fn channel_from_config(
             name,
             cfg,
             timeout_secs,
-            managed,
             worktree,
             usermapping,
         )?)),
@@ -334,6 +340,8 @@ pub fn local_from_config(
     let timeout = Duration::from_secs(timeout_secs.max(1));
     let mut ch = Local::new(PathBuf::from(root)).with_timeout(timeout);
     if let Some(wt) = worktree {
+        // Ein übergebener Worktree wurde von aidev angelegt (Picker-Branch ohne
+        // Worktree bzw. /branch) → von aidev verwaltet.
         ch = ch.with_worktree(wt);
     }
     Ok(Arc::new(ch))
@@ -351,7 +359,6 @@ pub(crate) fn test_registry(
     let registry = ChannelRegistry {
         default: default.map(str::to_string),
         map,
-        managed: Arc::new(Mutex::new(Vec::new())),
     };
     (registry, ch)
 }

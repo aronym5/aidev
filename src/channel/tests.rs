@@ -1,7 +1,7 @@
 use super::*;
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -217,7 +217,7 @@ fn local_kanal_aus_config_via_channel_from_config() {
         host_root: Some(dir.display().to_string()),
         home: None,
     };
-    let ch = channel_from_config("sandbox", &cc, 60, Arc::new(Mutex::new(Vec::new())), None, crate::config::PodmanUserMapping::KeepId)
+    let ch = channel_from_config("sandbox", &cc, 60, None, crate::config::PodmanUserMapping::KeepId)
         .expect("local-Kanal aus Config bauen");
     assert_eq!(ch.kind(), ChannelKind::Local);
     assert!(ch.root().starts_with("Local:"));
@@ -229,7 +229,6 @@ fn local_kanal_aus_config_via_channel_from_config() {
 
 #[test]
 fn local_config_fehlerfaelle() {
-    let managed = Arc::new(Mutex::new(Vec::new()));
     let ohne = ChannelConfig {
         kind: "local".into(),
         image: None,
@@ -239,7 +238,7 @@ fn local_config_fehlerfaelle() {
         host_root: None,
         home: None,
     };
-    assert!(channel_from_config("x", &ohne, 60, managed.clone(), None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config("x", &ohne, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
     let mit_img = ChannelConfig {
         kind: "local".into(),
         image: Some("node:22".into()),
@@ -249,7 +248,7 @@ fn local_config_fehlerfaelle() {
         host_root: Some("/tmp".into()),
         home: None,
     };
-    assert!(channel_from_config("x", &mit_img, 60, managed.clone(), None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config("x", &mit_img, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
     let fremd = ChannelConfig {
         kind: "docker".into(),
         image: None,
@@ -259,7 +258,115 @@ fn local_config_fehlerfaelle() {
         host_root: Some("/tmp".into()),
         home: None,
     };
-    assert!(channel_from_config("x", &fremd, 60, managed, None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config("x", &fremd, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
+}
+
+#[test]
+fn managed_flags_werden_beim_erzeugen_gesetzt() {
+    // Run-Kanal aus Config: aidev startet und stoppt den eigenen Container,
+    // verwaltet aber keinen Worktree.
+    let run_cfg = ChannelConfig {
+        kind: "podman".into(),
+        image: Some("alpine".into()),
+        container: None,
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: Some("/tmp/x".into()),
+        home: None,
+    };
+    let run = podman::podman_from_config("run", &run_cfg, 60, None, crate::config::PodmanUserMapping::KeepId)
+        .expect("Run-Kanal bauen");
+    assert!(run.managed_container(), "Run-Container gehört aidev");
+    assert!(!run.managed_worktree(), "kein Worktree angelegt");
+
+    // Attach-Kanal: geteilter Fremd-Container, nichts von aidev verwaltet.
+    let attach_cfg = ChannelConfig {
+        kind: "podman".into(),
+        image: None,
+        container: Some("fremd".into()),
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: Some("/tmp/x".into()),
+        home: None,
+    };
+    let attach = podman::podman_from_config("attach", &attach_cfg, 60, None, crate::config::PodmanUserMapping::KeepId)
+        .expect("Attach-Kanal bauen");
+    assert!(!attach.managed_container(), "Attach-Container gehört nicht aidev");
+    assert!(!attach.managed_worktree());
+
+    // Local-Kanal ohne Worktree verwaltet nichts.
+    let local = Local::new(PathBuf::from("/tmp/x"));
+    assert!(!local.managed_worktree(), "plain local → kein verwalteter Worktree");
+}
+
+#[test]
+fn managed_worktree_gesetzt_wenn_worktree_gebunden() {
+    // Ein übergebenes WorktreeInfo (Picker-Branch ohne Worktree, /branch)
+    // markiert den Kanal als verwaltenden Worktree – hier über den Config-Pfad.
+    let wt = crate::repo::WorktreeInfo {
+        name: "aidev-feature".into(),
+        branch: "feature".into(),
+        path: PathBuf::from("/tmp/x/.aidev/worktrees/aidev-feature"),
+    };
+    let cfg = ChannelConfig {
+        kind: "local".into(),
+        image: None,
+        container: None,
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: Some("/tmp/x".into()),
+        home: None,
+    };
+    let ch = channel_from_config("feat", &cfg, 60, Some(wt.clone()), crate::config::PodmanUserMapping::KeepId)
+        .expect("local-Kanal mit Worktree bauen");
+    assert!(ch.managed_worktree(), "gebundener Worktree ist verwaltet");
+    assert_eq!(ch.owned_worktree().map(|w| w.name.as_str()), Some("aidev-feature"));
+
+    // Dasselbe gilt für Podman-Run-Kanäle (Picker-/branch-Pfad).
+    let pod_cfg = ChannelConfig {
+        kind: "podman".into(),
+        image: Some("alpine".into()),
+        container: None,
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: Some("/tmp/aidev-proj".into()),
+        home: None,
+    };
+    let pod = channel_from_config("feat", &pod_cfg, 60, Some(wt), crate::config::PodmanUserMapping::KeepId)
+        .expect("podman-Kanal mit Worktree bauen");
+    assert!(pod.managed_container(), "Run-Container verwaltet");
+    assert!(pod.managed_worktree(), "gebundener Worktree verwaltet");
+
+    // Lokales Duplikat (Alt+D): es wurde KEIN neuer Worktree angelegt (gleicher
+    // Ordner) → das Duplikat übernimmt die Verwaltung nicht, sonst würde das
+    // Schließen des Duplikats den Worktree des Originals aufräumen.
+    let dup = ch.dup().expect("dup");
+    assert!(!dup.managed_worktree(), "Local-Duplikat verwaltet keinen eigenen Worktree");
+}
+
+#[test]
+fn change_notes_nur_bei_verwaltetem_worktree_auch_arbeitskopie() {
+    let layer = Some("Container filesystem changes: /etc/app.conf".to_string());
+    let worktree = Some("2 uncommitted changes in the working copy".to_string());
+
+    // managed_worktree = false: nur der Container-Diff, KEIN Arbeitskopie-Hinweis
+    // (typischer Fall: normaler Host-Ordner, der zufällig ein Git-Checkout ist).
+    let nur_container = podman::change_notes(false, layer.clone(), worktree.clone());
+    assert_eq!(nur_container, vec![layer.clone().unwrap()], "kein working-copy-Hinweis");
+
+    // managed_worktree = true: Container-Diff UND Arbeitskopie-Hinweis.
+    let mit_worktree = podman::change_notes(true, layer.clone(), worktree.clone());
+    assert_eq!(mit_worktree.len(), 2, "{mit_worktree:?}");
+    assert!(mit_worktree[0].contains("Container filesystem changes"));
+    assert!(mit_worktree[1].contains("uncommitted changes in the working copy"));
+
+    // Nur Arbeitskopie-Hinweis (kein Container-Diff) bei verwaltetem Worktree.
+    let nur_worktree = podman::change_notes(true, None, worktree.clone());
+    assert_eq!(nur_worktree, vec![worktree.unwrap()]);
+
+    // Beides leer → leere Liste, unbeeinflusst vom Flag.
+    assert!(podman::change_notes(true, None, None).is_empty());
+    assert!(podman::change_notes(false, None, None).is_empty());
 }
 
 #[test]
@@ -434,7 +541,8 @@ fn run_modus_exec_argv_als_host_identitaet() {
         seq: AtomicUsize::new(1),
         status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
         worktree: None,
-        managed: Arc::new(Mutex::new(Vec::new())),
+        managed_container: true,
+        managed_worktree: false,
         shell: Mutex::new(None),
     };
     let argv = ch.exec_argv("/app", "cargo", &["build".into(), "-j2".into()]);
@@ -467,7 +575,8 @@ fn attach_modus_exec_argv_ohne_user() {
         seq: AtomicUsize::new(1),
         status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
         worktree: None,
-        managed: Arc::new(Mutex::new(Vec::new())),
+        managed_container: false,
+        managed_worktree: false,
         shell: Mutex::new(None),
     };
     let argv = ch.exec_argv("/app", "ls", &[]);
@@ -483,7 +592,6 @@ fn attach_modus_exec_argv_ohne_user() {
 
 #[test]
 fn run_from_config_loest_host_identitaet_auf() {
-    let managed = Arc::new(Mutex::new(Vec::new()));
     let cc = ChannelConfig {
         kind: "podman".into(),
         image: Some("node:22".into()),
@@ -493,7 +601,7 @@ fn run_from_config_loest_host_identitaet_auf() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let ch = podman::podman_from_config("node", &cc, 60, managed, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
+    let ch = podman::podman_from_config("node", &cc, 60, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
     let (uid, gid) = run::host_uid_gid().unwrap();
     assert_eq!(ch.uid, uid, "UID == Host");
     assert_eq!(ch.gid, gid, "GID == Host");
@@ -567,7 +675,8 @@ fn uidmap_exec_argv_nutzt_die_gemerkte_gast_identitaet() {
         seq: AtomicUsize::new(1),
         status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
         worktree: None,
-        managed: Arc::new(Mutex::new(Vec::new())),
+        managed_container: true,
+        managed_worktree: false,
         shell: Mutex::new(None),
     };
     let argv = ch.exec_argv("/var/www", "make", &["test".into()]);
@@ -665,7 +774,6 @@ fn local_kanal_status_ist_running() {
 
 #[test]
 fn podman_kanal_start_unknown() {
-    let managed = Arc::new(Mutex::new(Vec::new()));
     let cc = ChannelConfig {
         kind: "podman".into(),
         image: Some("node:22".into()),
@@ -675,7 +783,7 @@ fn podman_kanal_start_unknown() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let ch = podman::podman_from_config("node", &cc, 60, managed, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
+    let ch = podman::podman_from_config("node", &cc, 60, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
     assert_eq!(ch.status(), ChannelStatus::Unknown);
 }
 
@@ -780,11 +888,9 @@ fn register_fuegt_kanal_zur_auswahl_hinzu() {
 
 #[test]
 fn find_by_container_findet_passenden_run_kanal() {
-    let managed = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ChannelRegistry {
         default: None,
         map: std::collections::HashMap::new(),
-        managed: managed.clone(),
     };
     // Run-Kanal mit explizitem Container-Namen erzeugen.
     let cfg = crate::config::ChannelConfig {
@@ -796,7 +902,7 @@ fn find_by_container_findet_passenden_run_kanal() {
         host_root: Some("/tmp/aidev-proj".into()),
         home: None,
     };
-    let ch = channel_from_config("alpine /tmp/aidev-proj", &cfg, 60, managed, None, crate::config::PodmanUserMapping::KeepId).unwrap();
+    let ch = channel_from_config("alpine /tmp/aidev-proj", &cfg, 60, None, crate::config::PodmanUserMapping::KeepId).unwrap();
     let name = registry.register("alpine /tmp/aidev-proj".into(), ch);
     // Über den Containernamen eines Run-Kanals wiederfinden (wie es der
     // Channel Builder beim Wiederverwenden tut).
@@ -824,7 +930,8 @@ fn label_podman_name_default_root_local() {
         seq: AtomicUsize::new(1),
         status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
         worktree: None,
-        managed: Arc::new(Mutex::new(Vec::new())),
+        managed_container: true,
+        managed_worktree: false,
         shell: Mutex::new(None),
     };
     assert_eq!(ch.label(), "node");
@@ -852,7 +959,8 @@ fn local_und_attach_warmup_ist_ein_kein_op() {
         seq: AtomicUsize::new(1),
         status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
         worktree: None,
-        managed: Arc::new(Mutex::new(Vec::new())),
+        managed_container: false,
+        managed_worktree: false,
         shell: Mutex::new(None),
     };
     attach.warmup();

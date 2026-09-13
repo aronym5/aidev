@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::llm::{CompletionParts, Usage, WireMessage};
+use crate::llm::{CompletionParts, RoundMetrics, Usage, WireMessage};
 use crate::perm::Permission;
 
 use crate::llm::{estimate_tokens, WireFunction, WireToolCall};
@@ -70,6 +70,16 @@ impl Chat {
     ) -> EventId {
         let id = self.next_id;
         self.next_id += 1;
+        // Sofortige Basis: bisherige Kontextlänge + Schätzung dieses Prompts;
+        // wird von `settle_context_tail` überschrieben, sobald die Folge-Runde
+        // bestätigt ist.
+        let base = self
+            .order
+            .last()
+            .and_then(|&pid| self.events.get(&pid))
+            .and_then(|ev| ev.context_len)
+            .unwrap_or(0);
+        let estimate = base + estimate_tokens(&text);
         let ev = ChatEvent {
             previous_id: self.order.last().copied(),
             parent_id: None,
@@ -81,6 +91,7 @@ impl Chat {
                 model,
                 num_tokens,
             },
+            context_len: Some(estimate),
         };
         self.events.insert(id, ev);
         self.order.push(id);
@@ -117,7 +128,9 @@ impl Chat {
                     cached_tokens: None,
                 },
                 completion_parts: None,
+                metrics: None,
             },
+            context_len: None,
         };
         self.events.insert(id, ev);
         self.order.push(id);
@@ -160,6 +173,7 @@ impl Chat {
                 num_tokens_input: 0,
                 num_tokens_output: 0,
             },
+            context_len: None,
         };
         self.events.insert(id, ev);
         self.order.push(id);
@@ -169,6 +183,11 @@ impl Chat {
     /// Liest ein Event (primär für Tests & Projektion).
     pub fn event(&self, id: EventId) -> Option<&ChatEvent> {
         self.events.get(&id)
+    }
+
+    /// Mutiert ein Event (z. B. Kompaktierungs-Shift auf `context_len`).
+    pub(crate) fn event_mut(&mut self, id: EventId) -> Option<&mut ChatEvent> {
+        self.events.get_mut(&id)
     }
 
     /// Alle Event-IDs in chronologischer Reihenfolge.
@@ -300,6 +319,15 @@ impl Chat {
         if closed && aborted {
             push_control(self, EventKind::Abort, time_end);
         }
+        // context_len des abgeschlossenen Turns begleichen (idempotent; läuft
+        // sonst auch über `finish_assistant`): ab dem zugehörigen User-Prompt.
+        if closed {
+            let parent = self.events.get(&id).and_then(|e| e.parent_id);
+            let start = parent
+                .and_then(|pid| self.order.iter().position(|&i| i == pid))
+                .unwrap_or(0);
+            self.settle_context_tail(start);
+        }
     }
 
     /// Schreibt die beim Streaming gemessenen Completion-Token je Bereich auf
@@ -313,6 +341,17 @@ impl Chat {
             } = &mut ev.kind
             {
                 *cp = parts;
+            }
+        }
+    }
+
+    /// Schreibt die beim Streaming gemessenen Metriken (TTFT, Stream-Zeit,
+    /// Tokens) auf eine (abgeschlossene) Assistant-Runde – Quelle für die
+    /// akkumulierte TTFT und die durchschnittliche TPS der Antwort-Fußzeile.
+    pub fn set_round_metrics(&mut self, id: EventId, metrics: Option<RoundMetrics>) {
+        if let Some(ev) = self.events.get_mut(&id) {
+            if let EventKind::Assistant { metrics: m, .. } = &mut ev.kind {
+                *m = metrics;
             }
         }
     }
@@ -352,6 +391,8 @@ impl Chat {
                 num_tokens,
                 archived_events: arch,
             },
+            // Die Summary ist der neue Projektions-Anker: ihre eigene Länge.
+            context_len: Some(num_tokens),
         };
         self.events.insert(id, ev);
         self.order.insert(arch, id);
@@ -518,13 +559,45 @@ impl Chat {
             let measured = completion_parts.as_ref().filter(|p| {
                 p.reasoning + p.content + p.tool_calls.iter().copied().sum::<u64>() > 0
             });
-            let (nr, nt, tool_in): (u64, u64, Vec<u64>) = match measured {
-                Some(p) => {
+            // Gab es eine MESSUNG der Tool-Call-Anteile (Summe > 0)? Nur dann
+            // ist die gemessene Aufschlüsselung für die Tool-Spalte belastbar.
+            let measured_tools = measured
+                .map(|p| p.tool_calls.iter().copied().sum::<u64>())
+                .is_some_and(|s| s > 0);
+            let (nr, nt, tool_in): (u64, u64, Vec<u64>) = match (measured, measured_tools) {
+                // Gemessene Tool-Calls → exakte Aufschlüsselung.
+                (Some(p), true) => {
                     let mut ti: Vec<u64> = p.tool_calls.to_vec();
                     ti.resize(tools.len(), 0);
                     (p.reasoning, p.content, ti)
                 }
-                None => (shares[0], shares[1], shares[2..].to_vec()),
+                // reasoning/content gemessen, aber die Tool-Call-Anteile sind 0
+                // (z. B. Responses-Stream, dessen Tool-Argument-Bytes nicht in
+                // die usage-Inkremente einfließen). Damit die Runde EXAKT auf
+                // die gemeldete Completion summiert (jedes reportete Token
+                // genau einmal – kein Doppelzählen durch einen zweiten,
+                // proportionalen Tool-Anteil), ist der Tool-Anteil der REST der
+                // Completion nach den gemessenen reasoning/content-Tokens.
+                // Die Antworten der Tool-Zeile (call+result) bleiben dabei
+                // verzerrungsfrei nach Call-Bytes verteilt.
+                (Some(p), false) => {
+                    let used = p.reasoning + p.content;
+                    let rem = completion.saturating_sub(used);
+                    let tool_w: Vec<u64> = tools.iter().map(|&t| call_len(self, t)).collect();
+                    let sum_w: u64 = tool_w.iter().sum();
+                    let ti: Vec<u64> = if rem > 0 && sum_w > 0 {
+                        let mut s: Vec<u64> = tool_w.iter().map(|w| rem * w / sum_w).collect();
+                        let used_w: u64 = s.iter().sum();
+                        if let Some(i) = tool_w.iter().rposition(|w| *w > 0) {
+                            s[i] += rem - used_w;
+                        }
+                        s
+                    } else {
+                        vec![0; tools.len()]
+                    };
+                    (p.reasoning, p.content, ti)
+                }
+                (None, _) => (shares[0], shares[1], shares[2..].to_vec()),
             };
             assistant_updates.push((round, nr, nt));
 
@@ -566,6 +639,194 @@ impl Chat {
         }
         for (id, ni, no) in tool_updates {
             self.set_tool_tokens(id, ni, no);
+        }
+    }
+
+    // ── context_len (kumulative Kontextlänge je Event) ────────────────────
+
+    /// Bestätigte (servergemessene) Kontextlänge eines Assistant-Events –
+    /// die zentrale Quelle für bestätigte Anker (Renderer + Kompaktierung).
+    /// `None`, wenn keine bestätigte Usage vorliegt.
+    pub(crate) fn confirmed_context_len(&self, id: EventId) -> Option<u64> {
+        let ev = self.events.get(&id)?;
+        let EventKind::Assistant {
+            reported_usage,
+            tool_event_ids,
+            completion_parts,
+            ..
+        } = &ev.kind
+        else {
+            return None;
+        };
+        if reported_usage.total_tokens == 0 {
+            return None;
+        }
+        // Gemessene Aufschlüsselung (exakt aus den usage-Inkrementen).
+        if let Some(p) = completion_parts {
+            if !p.tool_calls.is_empty() {
+                return Some(reported_usage.prompt_tokens + p.reasoning + p.content);
+            }
+            return Some(reported_usage.total_tokens);
+        }
+        // Keine parts: Tool-Call-Länge aus den angehängten Tool-Events ableiten.
+        let tool_len: u64 = tool_event_ids
+            .iter()
+            .filter_map(|&t| match self.events.get(&t).map(|e| &e.kind) {
+                Some(EventKind::Tool {
+                    num_tokens_input, ..
+                }) => Some(*num_tokens_input),
+                _ => None,
+            })
+            .sum();
+        if tool_len > 0 {
+            return Some(reported_usage.total_tokens.saturating_sub(tool_len));
+        }
+        Some(reported_usage.total_tokens)
+    }
+
+    /// Bestätigte Kontextlänge eines Nicht-Assistant-Events: die `prompt_tokens`
+    /// der DIRECT NACH diesem Event folgenden, abgeschlossenen Assistant-Runde
+    /// (Kontext beim Start dieser Antwort – inkl. dieses Events).
+    pub(crate) fn verified_context_len(&self, id: EventId) -> Option<u64> {
+        let pos = self.order.iter().position(|&i| i == id)?;
+        for &nid in &self.order[pos + 1..] {
+            let ev = self.events.get(&nid)?;
+            if let EventKind::Assistant { reported_usage, .. } = &ev.kind {
+                if ev.time_end.is_some() && reported_usage.prompt_tokens > 0 {
+                    return Some(reported_usage.prompt_tokens);
+                }
+            }
+        }
+        None
+    }
+
+    /// Ist die gespeicherte `context_len` dieses Events noch die aktuell
+    /// ableitbare bestätigte Zahl? Grün ⇔ `context_len == bestätigter Wert`.
+    /// Nach einer Kompaktierung ist sie verschoben und weicht ab → grau.
+    pub(crate) fn context_is_green(&self, id: EventId) -> bool {
+        let Some(ev) = self.events.get(&id) else {
+            return false;
+        };
+        let Some(cl) = ev.context_len else {
+            return false;
+        };
+        let confirmed = match &ev.kind {
+            EventKind::Assistant { .. } => self.confirmed_context_len(id),
+            // Manual-/Run-Tools ohne Assistant davor? Die Folge-Runde zählt
+            // ohnehin – `verified_context_len` deckt User, Tool und Archive ab.
+            _ => self.verified_context_len(id),
+        };
+        confirmed == Some(cl)
+    }
+
+    /// Geschätzter Token-Beitrag eines finalisierten Events zur laufenden
+    /// Kontextlänge: nutzt abgeleitete Werte (`num_tokens`, `num_tokens_*`),
+    /// sonst Zeichen-Schätzung. Der Output von Tool-Kindern zählt beim
+    /// Parent-Assistant (dort gebündelt), das Tool selbst trägt nichts bei.
+    /// Auch für OFFENE Events nutzbar (aktueller Streaming-Stand).
+    pub(crate) fn estimate_contribution(&self, id: EventId) -> u64 {
+        let Some(ev) = self.events.get(&id) else {
+            return 0;
+        };
+        match &ev.kind {
+            EventKind::UserPrompt {
+                text, num_tokens, ..
+            } => {
+                if *num_tokens > 0 {
+                    *num_tokens
+                } else {
+                    estimate_tokens(text)
+                }
+            }
+            EventKind::Assistant {
+                reasoning,
+                text,
+                num_tokens_reasoning,
+                num_tokens_text,
+                tool_event_ids,
+                ..
+            } => {
+                // Leere Bereiche tragen 0 bei (analog zum Renderer, der sie
+                // über `!is_empty()`-Gates überspringt – `estimate_tokens("")`
+                // wäre sonst fälschlich 1).
+                let r = if reasoning.is_empty() {
+                    0
+                } else if *num_tokens_reasoning > 0 {
+                    *num_tokens_reasoning
+                } else {
+                    estimate_tokens(reasoning)
+                };
+                let t = if text.is_empty() {
+                    0
+                } else if *num_tokens_text > 0 {
+                    *num_tokens_text
+                } else {
+                    estimate_tokens(text)
+                };
+                let tools_add: u64 = tool_event_ids
+                    .iter()
+                    .filter_map(|&tid| match self.events.get(&tid).map(|e| &e.kind) {
+                        Some(EventKind::Tool {
+                            output,
+                            num_tokens_output,
+                            ..
+                        }) => Some(if *num_tokens_output > 0 {
+                            *num_tokens_output
+                        } else {
+                            estimate_tokens(output)
+                        }),
+                        _ => None,
+                    })
+                    .sum();
+                r + t + tools_add
+            }
+            EventKind::Tool { .. } => 0,
+            EventKind::Archive { num_tokens, .. } => *num_tokens,
+            _ => 0,
+        }
+    }
+
+    /// „Begleicht“ die `context_len` aller finalisierten Events ab `start_index`
+    /// (Chronologie): bestätigter Wert, wo vorhanden (Assistant: eigene
+    /// gemessene Zahl; User/Tool: `prompt_tokens` der Folge-Runde), sonst
+    /// geschätzte kumulative Kontextlänge. Läuft nach Turn-Abschluss; ältere
+    /// Events (inkl. durch Kompaktierung verschobener) bleiben unberührt,
+    /// offene (streaming) Events behalten `None`.
+    pub(crate) fn settle_context_tail(&mut self, start_index: usize) {
+        let order = self.order.clone();
+        // Laufende Basis: context_len des Events unmittelbar vor `start_index`.
+        let mut running: u64 = if start_index > 0 {
+            self.events
+                .get(&order[start_index - 1])
+                .and_then(|ev| ev.context_len)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let mut updates: Vec<(EventId, u64)> = Vec::new();
+        for &id in &order[start_index..] {
+            let Some(ev) = self.events.get(&id) else {
+                continue;
+            };
+            if ev.time_end.is_none() {
+                continue; // offen → None lassen
+            }
+            let confirmed = match &ev.kind {
+                EventKind::Assistant { .. } => self.confirmed_context_len(id),
+                _ => self.verified_context_len(id),
+            };
+            if let Some(c) = confirmed {
+                updates.push((id, c));
+                running = c;
+            } else {
+                running += self.estimate_contribution(id);
+                updates.push((id, running));
+            }
+        }
+        for (id, v) in updates {
+            if let Some(ev) = self.events.get_mut(&id) {
+                ev.context_len = Some(v);
+            }
         }
     }
 }
@@ -632,6 +893,7 @@ fn push_control(chat: &mut Chat, kind: EventKind, when: Instant) {
             time_begin: Some(when),
             time_end: Some(when),
             kind,
+            context_len: None,
         },
     );
     chat.order.push(id);
@@ -652,6 +914,13 @@ pub struct ChatEvent {
     /// `None` = OFFEN/live (mutierbar pro Frame, wird neu gerendert).
     pub time_end: Option<Instant>,
     pub kind: EventKind,
+    /// Kumulative Kontextlänge (Tokens) NACH diesem Event.
+    /// `None` solange das Event offen (streaming) ist; wird beim
+    /// Finalisieren auf die geschätzte Kontextlänge gesetzt und beim
+    /// Eintreffen eines bestätigten Wertes (reported_usage) überschrieben.
+    /// Bei Kompaktierung werden alle Werte nach der Summary um den Shift
+    /// reduziert (einmaliges Update, kein Reactivate).
+    pub context_len: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -689,6 +958,11 @@ pub enum EventKind {
         /// gemessen → `derive_last_turn_tokens` fällt auf die proportionale
         /// Aufteilung bzw. Schätzung zurück.
         completion_parts: Option<CompletionParts>,
+        /// Beim Streaming gemessene Metriken dieser Runde (TTFT, Stream-Zeit,
+        /// Tokens aus den usage-Inkrementen). `None` = keine Tokens empfangen
+        /// bzw. Runde läuft noch nicht zu Ende. Grundlage der akkumulierten
+        /// TTFT/der durchschnittlichen TPS in der Antwort-Fußzeile.
+        metrics: Option<RoundMetrics>,
     },
 
     // ── Werkzeug-Ebene ──
@@ -1020,6 +1294,103 @@ mod tests {
             } => assert_eq!(*num_tokens_input, 20),
             other => panic!("unerwartet: {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_ohne_gemessene_parts_haelt_anteil_statt_null() {
+        // Responses-Stream (bzw. beliebiger Stream, dessen Tool-Argument-Bytes
+        // nicht in die usage-Inkremente einfließen): `completion_parts` misst
+        // reasoning/content, aber die Tool-Call-Anteile stehen auf 0. Der
+        // Tool-Call darf dann NICHT mit 0 gebucht werden (sonst kollabiert die
+        // Tool-Zeile auf einen einzelnen Token-Wert), sondern fällt auf die
+        // proportionale/geschätzte Verteilung zurück.
+        let mut chat = Chat::new();
+        let uid = chat.push_user_prompt(
+            "frage".into(),
+            Permission::Read,
+            "m".into(),
+            0,
+            Instant::now(),
+        );
+        let aid = chat.open_assistant(Some(uid), "gedanke".into(), String::new(), Instant::now());
+        let tid = chat.open_tool(
+            Some(aid),
+            "call_1".into(),
+            "read".into(),
+            r#"{"path":"x"}"#.into(),
+            String::new(),
+            ToolKind::Read {
+                path: "x".into(),
+                range: String::new(),
+            },
+            Instant::now(),
+        );
+        chat.set_tool_final(
+            tid,
+            "inhalt".into(),
+            ToolKind::Read {
+                path: "x".into(),
+                range: String::new(),
+            },
+            0,
+            0,
+            Instant::now(),
+        );
+        chat.finalize_assistant(
+            aid,
+            Instant::now(),
+            Usage {
+                prompt_tokens: 100,
+                completion_tokens: 60,
+                total_tokens: 160,
+                cached_tokens: None,
+            },
+            0,
+            0,
+            false,
+        );
+        // gemessene Parts mit NUR reasoning/content – Tool-Calls ungemessen (0).
+        chat.set_completion_parts(
+            aid,
+            Some(crate::llm::CompletionParts {
+                reasoning: 30,
+                content: 10,
+                tool_calls: vec![0],
+            }),
+        );
+
+        chat.derive_last_turn_tokens();
+
+        let tool = chat.event(tid).expect("Tool").kind.clone();
+        match &tool {
+            EventKind::Tool {
+                num_tokens_input, ..
+            } => {
+                // Kein harter 0-Wert mehr: Tool-Anteil = Rest der Completion
+                // nach den gemessenen reasoning/content-Tokens (60 − 30 − 10).
+                assert_eq!(
+                    *num_tokens_input, 20,
+                    "Tool-Anteil = Completion-Rest (60 − 30 − 10)"
+                );
+            }
+            other => panic!("unerwartet: {other:?}"),
+        }
+        // Konsistenz: reasoning + content + tool = gemeldete completion EXAKT
+        // (jedes reportete Token genau einmal zugeordnet).
+        let assistant = chat.event(aid).expect("Runde").kind.clone();
+        let EventKind::Assistant {
+            num_tokens_reasoning,
+            num_tokens_text,
+            ..
+        } = &assistant
+        else {
+            panic!("unerwartet: {assistant:?}");
+        };
+        assert_eq!(
+            *num_tokens_reasoning + *num_tokens_text + 20,
+            60,
+            "Runde summiert exakt auf die gemeldete completion"
+        );
     }
 
     #[test]

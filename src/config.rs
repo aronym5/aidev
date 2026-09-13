@@ -213,18 +213,6 @@ fn default_timeout_secs() -> u64 {
     500
 }
 
-/// Darstellung von Status-Emoji (✅, ❌, ⚠️ …) in der Konsole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SymbolMode {
-    /// Ersetzen durch universell verfügbare Breite-1-Symbole (✓, ✗, ● …) mit
-    /// semantischer Farbe – konsistent unabhängig von der Terminal-Schriftart.
-    #[default]
-    Glyph,
-    /// Original-Emoji behalten (Terminal muss die Glyphen mitbringen).
-    Emoji,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Default-Modell (immer `"provider/name"`).
@@ -252,9 +240,6 @@ pub struct Config {
     /// Reihenfolge entspricht der config.toml.
     #[serde(default)]
     pub models: IndexMap<String, ModelConfig>,
-    /// Darstellung der Status-Emoji: `"glyph"` (Standard) oder `"emoji"`.
-    #[serde(default)]
-    pub symbols: SymbolMode,
     /// Größe des Modell-Kontextfensters in Tokens – dient nur als Schwelle
     /// für die automatische Kompaktierung, nicht als hartes Limit.
     #[serde(default = "default_context_window")]
@@ -290,6 +275,24 @@ pub struct Config {
     /// Podman-einstellungen (Top-Level, z. B. UID-Mapping beim Container-Start).
     #[serde(default)]
     pub podman: PodmanConfig,
+    /// `theme = "dark" | "light" | "auto"` (Default `auto`). Bei `auto` werden
+    /// die Terminal-Defaultfarben per OSC-11-Abfrage (Fallback `COLORFGBG`)
+    /// erkannt und passend hell/dunkel gewählt.
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "auto".to_string()
+}
+
+/// Normalisiert den `theme`-Configwert: leer/unbekannt → `auto`.
+fn normalize_theme(s: &str) -> String {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "dark" => "dark".to_string(),
+        "light" => "light".to_string(),
+        _ => "auto".to_string(),
+    }
 }
 
 fn default_model() -> String {
@@ -352,7 +355,6 @@ impl Default for Config {
             default_channel: None,
             channels: HashMap::new(),
             models: default_models(),
-            symbols: SymbolMode::Glyph,
             context_window: default_context_window(),
             compact_at: default_compact_at(),
             compact_keep_turns: default_compact_keep_turns(),
@@ -361,6 +363,7 @@ impl Default for Config {
             mouse: false,
             paths: HashMap::new(),
             podman: PodmanConfig::default(),
+            theme: default_theme(),
         }
     }
 }
@@ -472,7 +475,6 @@ impl Config {
             default_channel: self.default_channel.filter(|c| !c.trim().is_empty()),
             channels: self.channels,
             models: self.models,
-            symbols: self.symbols,
             context_window: if self.context_window == 0 {
                 d.context_window
             } else {
@@ -497,6 +499,7 @@ impl Config {
             mouse: self.mouse,
             paths: self.paths,
             podman: self.podman,
+            theme: normalize_theme(&self.theme),
         }
     }
 }
@@ -557,6 +560,30 @@ mod tests {
     }
 
     #[test]
+    fn theme_aus_toml_geparst_und_normalisiert() {
+        // Default: auto.
+        let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
+        assert_eq!(cfg.theme, "auto", "Default theme=auto");
+        let d = cfg.with_defaults();
+        assert_eq!(d.theme, "auto");
+
+        // Explizite Werte (Groß-/Kleinschreibung egal), Roundtrip über with_defaults.
+        for (raw, want) in [("dark", "dark"), ("light", "light"), ("auto", "auto")] {
+            let c: Config = toml::from_str(&format!("theme = \"{raw}\"")).expect("TOML lesbar");
+            assert_eq!(c.theme, raw);
+            assert_eq!(c.with_defaults().theme, want);
+        }
+        let up: Config = toml::from_str("theme = \"LIGHT\"").expect("TOML lesbar");
+        assert_eq!(up.with_defaults().theme, "light");
+
+        // Unbekannt/leer → auto.
+        let bogus: Config = toml::from_str("theme = \"neon\"").expect("TOML lesbar");
+        assert_eq!(bogus.with_defaults().theme, "auto");
+        let blank: Config = toml::from_str("theme = \"  \"").expect("TOML lesbar");
+        assert_eq!(blank.with_defaults().theme, "auto");
+    }
+
+    #[test]
     fn max_tool_runden_hat_default_und_lasst_sich_setzen() {
         let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
         assert_eq!(cfg.max_tool_rounds, 100, "Default");
@@ -596,21 +623,6 @@ mod tests {
         assert!(ci.image.is_none());
         assert_eq!(ci.workdir, "/app");
         assert_eq!(cfg.timeout_secs, 500, "globaler Default");
-    }
-
-    #[test]
-    fn symbol_modus_laesst_sich_konfigurieren() {
-        let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
-        assert_eq!(cfg.symbols, SymbolMode::Glyph, "Default: Glyph");
-
-        let glyph: Config = toml::from_str("symbols = \"glyph\"").expect("TOML lesbar");
-        assert_eq!(glyph.symbols, SymbolMode::Glyph);
-
-        let emoji: Config = toml::from_str("symbols = \"emoji\"").expect("TOML lesbar");
-        assert_eq!(emoji.symbols, SymbolMode::Emoji);
-
-        assert!(toml::from_str::<Config>("symbols = \"moji\"").is_err());
-        assert!(toml::from_str::<Config>("symbols = 7").is_err());
     }
 
     #[test]

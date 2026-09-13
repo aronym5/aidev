@@ -526,6 +526,28 @@ pub fn is_repo_root(path: &Path) -> bool {
     true
 }
 
+/// Basisname für Gast-Pfad und Container-Name eines Kanals.
+///
+/// Ist der gewählte Pfad selbst die Wurzel eines Git-Repos (Haupt-Repo
+/// **oder** Worktree, siehe [`is_repo_root`]), wird der Ordnername des
+/// Git-Haupt-Repos verwendet ([`crate::repo::git_toplevel`] löst das auch aus
+/// einem Worktree heraus korrekt auf) – so bleibt der Name über verschiedene
+/// Worktrees desselben Repos stabil. Zeigt der Pfad dagegen auf ein bloßes
+/// Unterverzeichnis eines Repos oder auf einen repo-freien Ordner, wird der
+/// Ordnername des Pfads selbst genommen. Ohne Dateinamen (z. B. `/`) → `"app"`.
+pub fn base_name_for(path: &Path) -> String {
+    if is_repo_root(path) {
+        if let Ok(toplevel) = crate::repo::git_toplevel(path) {
+            if let Some(name) = toplevel.file_name() {
+                return name.to_string_lossy().to_string();
+            }
+        }
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "app".to_string())
+}
+
 /// Liefert das laut Config für `path` konfigurierte Default-Image.
 ///
 /// Zusätzlich zur exakten Pfad-Übereinstimmung (bisheriges Verhalten) greift
@@ -885,6 +907,65 @@ mod tests {
 
         // Außerhalb eines Repos (nicht-git Pfad) ohne exakte Config → keins.
         assert_eq!(default_image_for_path(&config, Path::new("/tmp")), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn base_name_for_arbeitet_mit_repo_worktree_und_plain() {
+        // Plain-Ordner ohne git: immer der eigene Ordnername (kein git nötig).
+        assert_eq!(base_name_for(Path::new("/home/me/projekt")), "projekt");
+        // Ohne Dateinamen → "app".
+        assert_eq!(base_name_for(Path::new("/")), "app");
+
+        // Nur sinnvoll wenn git verfügbar ist.
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!("aidev-bn-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let top = base.join("repo");
+        std::fs::create_dir_all(&top).unwrap();
+
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} fehlgeschlagen: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let top_s = top.to_str().unwrap();
+        run(&["-C", top_s, "init"]);
+        run(&["-C", top_s, "config", "user.email", "t@t.de"]);
+        run(&["-C", top_s, "config", "user.name", "T"]);
+        std::fs::write(top.join("README.md"), "x").unwrap();
+        run(&["-C", top_s, "add", "."]);
+        run(&["-C", top_s, "commit", "-m", "init"]);
+        run(&["-C", top_s, "branch", "feature"]);
+
+        // Repo-Wurzel → Repo-Ordnername.
+        assert_eq!(base_name_for(&top), "repo");
+        // Worktree-Wurzel (anderer Ordnername als das Haupt-Repo) → ebenfalls
+        // der Ordnername des Git-Haupt-Repos.
+        let wt = base.join("wt");
+        run(&["-C", top_s, "worktree", "add", wt.to_str().unwrap(), "feature"]);
+        assert_eq!(base_name_for(&wt), "repo");
+        // Unterverzeichnis eines Repos → weiterhin der eigene Ordnername.
+        let src = top.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        assert_eq!(base_name_for(&src), "src");
 
         let _ = std::fs::remove_dir_all(&base);
     }

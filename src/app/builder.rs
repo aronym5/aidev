@@ -48,18 +48,16 @@ impl App {
 
         // Skeleton-State sofort anzeigen
         let state = ChannelBuilderState {
-            tunnels,
-            host_paths,
-            worktrees,
+            tunnels: Selection::wrap_at(tunnels, start_tunnel_idx),
+            host_paths: Selection::wrap_at(host_paths, start_host_idx),
+            worktrees: Selection::wrap_at(worktrees, 0),
             col: 1,
-            tunnel_idx: start_tunnel_idx,
-            host_idx: start_host_idx,
-            worktree_idx: 0,
             container_info: None,
             images_loaded: false, // <-- noch nicht geladen
             current_is_git: is_git,
             argv_path: None,
-            host_path_edit: None,
+            edit: None,
+            edit_error: None,
         };
         self.channel_builder = Some(state);
 
@@ -88,15 +86,16 @@ impl App {
     fn update_builder_for_host(&mut self) {
         use crate::channel::builder::*;
 
-        // Host-Index und Pfad zuerst extrahieren (kein mutable Borrow)
+        // Host-Cursor und Pfad zuerst extrahieren (kein mutabler Borrow).
         let host_idx = match self.channel_builder.as_ref() {
-            Some(b) => b.host_idx,
+            Some(b) => b.host_paths.nav.cursor(),
             None => return,
         };
         let path = self
             .channel_builder
             .as_ref()
-            .and_then(|b| b.host_paths.get(host_idx).map(|hp| hp.path.clone()));
+            .and_then(|b| b.host_paths.items.get(host_idx))
+            .map(|hp| hp.path.clone());
 
         // Worktrees laden (git ist schnell). Nur wenn der Pfad DIREKT eine
         // Repo-Wurzel/Worktree ist; Unterverzeichnisse gelten als
@@ -114,8 +113,7 @@ impl App {
         // Synchrones Update: Worktrees + Default-Image (schnell)
         if let Some(builder) = &mut self.channel_builder {
             builder.current_is_git = is_repo;
-            builder.worktrees = worktrees;
-            builder.worktree_idx = worktree_idx;
+            builder.worktrees = Selection::wrap_at(worktrees, worktree_idx);
             builder.container_info = None; // wird async geladen
                                            // Stand der Cursor in der (jetzt entfallenen) Worktree-Spalte?
                                            // Zurück auf die Host-Spalte.
@@ -133,7 +131,7 @@ impl App {
         let default_img = self
             .channel_builder
             .as_ref()
-            .and_then(|b| b.host_paths.get(b.host_idx))
+            .and_then(|b| b.host_paths.selected())
             .and_then(|hp| crate::channel::builder::default_image_for_path(&self.config, &hp.path));
         let Some(img) = default_img else {
             return false;
@@ -141,12 +139,12 @@ impl App {
         let Some(builder) = self.channel_builder.as_mut() else {
             return false;
         };
-        match builder.tunnels.iter().position(|t| {
+        match builder.tunnels.items.iter().position(|t| {
             t.image_name()
                 .is_some_and(|n| crate::channel::builder::image_names_equal(n, &img))
         }) {
-            Some(idx) if idx != builder.tunnel_idx => {
-                builder.tunnel_idx = idx;
+            Some(idx) if idx != builder.tunnels.nav.cursor() => {
+                builder.tunnels.set_cursor(idx);
                 true
             }
             _ => false,
@@ -158,7 +156,7 @@ impl App {
 
         let (bg_path, current_image) = match self.channel_builder.as_ref() {
             Some(b) => {
-                let tunnel = match b.tunnels.get(b.tunnel_idx) {
+                let tunnel = match b.tunnels.selected() {
                     Some(t) => t,
                     None => return,
                 };
@@ -168,10 +166,10 @@ impl App {
                     None => return, // Local → kein Container-Check
                 };
                 // Effektiven Pfad bestimmen (Worktree bevorzugen)
-                let host_path = b.host_paths.get(b.host_idx).map(|hp| hp.path.clone());
+                let host_path = b.host_paths.selected().map(|hp| hp.path.clone());
                 let wt_path = if b.current_is_git {
                     b.worktrees
-                        .get(b.worktree_idx)
+                        .selected()
                         .filter(|w| w.has_worktree && !w.path.as_os_str().is_empty())
                         .map(|w| w.path.clone())
                 } else {
@@ -198,22 +196,36 @@ impl App {
         if self
             .channel_builder
             .as_ref()
-            .is_some_and(|b| b.host_path_edit.is_some())
+            .is_some_and(|b| b.edit.is_some())
         {
             match key.code {
                 KeyCode::Esc => {
                     if let Some(b) = &mut self.channel_builder {
-                        b.host_path_edit = None;
+                        b.edit = None;
+                        b.edit_error = None;
                     }
                 }
                 KeyCode::Enter => {
-                    self.builder_confirm_host_path();
+                    let is_branch = self
+                        .channel_builder
+                        .as_ref()
+                        .is_some_and(|b| matches!(b.edit, Some(BuilderEdit::Branch(_))));
+                    if is_branch {
+                        self.builder_confirm_new_branch();
+                    } else {
+                        self.builder_confirm_host_path();
+                    }
                 }
                 _ => {
                     if let Some(b) = &mut self.channel_builder {
-                        if let Some(editor) = &mut b.host_path_edit {
+                        if let Some(ed) = &mut b.edit {
+                            let editor = match ed {
+                                BuilderEdit::HostPath(e) | BuilderEdit::Branch(e) => e,
+                            };
                             Self::handle_editor_key_static(editor, key);
                         }
+                        // Beim Weiter-Tippen verschwindet die Fehlermeldung.
+                        b.edit_error = None;
                     }
                 }
             }
@@ -235,90 +247,50 @@ impl App {
             KeyCode::Char('a') => {
                 self.builder_open_host_path_input();
             }
-            _ if down => {
-                let mut needs_container_update = false;
-                if let Some(b) = &mut self.channel_builder {
-                    match b.col {
-                        0 => {
-                            let max = b.tunnels.len();
-                            if max > 0 {
-                                b.tunnel_idx = (b.tunnel_idx + 1) % max;
-                                needs_container_update = true;
-                            }
-                        }
-                        1 => {
-                            let max = b.host_paths.len();
-                            if max > 0 {
-                                let old_idx = b.host_idx;
-                                b.host_idx = (b.host_idx + 1) % max;
-                                if old_idx != b.host_idx {
-                                    let _ = b;
-                                    self.update_builder_for_host();
-                                    return;
-                                }
-                            }
-                        }
-                        2 => {
-                            let max = b.worktrees.len();
-                            if max > 0 {
-                                b.worktree_idx = (b.worktree_idx + 1) % max;
-                                needs_container_update = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if needs_container_update {
-                    self.update_builder_container();
-                }
+            // Neuer Branch: nur in der Worktree-Spalte (drei Spalten sichtbar).
+            KeyCode::Char('b') => {
+                self.builder_open_branch_input();
             }
-            _ if up => {
-                let mut needs_container_update = false;
+            _ if down || up => {
+                // In der aktiven Spalte mit Umlauf bewegen (ListNav `with_wrap`,
+                // wie bisher `(idx + 1) % max` bzw. `idx - 1`).
+                let col = match self.channel_builder.as_ref() {
+                    Some(b) => b.col,
+                    None => return,
+                };
+                let mut moved = false;
+                let mut changed = false;
                 if let Some(b) = &mut self.channel_builder {
-                    match b.col {
-                        0 => {
-                            let max = b.tunnels.len();
-                            if max > 0 {
-                                if b.tunnel_idx == 0 {
-                                    b.tunnel_idx = max - 1;
-                                } else {
-                                    b.tunnel_idx -= 1;
-                                }
-                                needs_container_update = true;
-                            }
+                    match col {
+                        // Spalten mit Umlauf bewegen (ListNav `with_wrap`).
+                        0 if !b.tunnels.nav.is_empty() => {
+                            b.tunnels.handle_move(&key, b.tunnels.nav.len() as u16);
+                            moved = true;
                         }
-                        1 => {
-                            let max = b.host_paths.len();
-                            if max > 0 {
-                                let old_idx = b.host_idx;
-                                if b.host_idx == 0 {
-                                    b.host_idx = max - 1;
-                                } else {
-                                    b.host_idx -= 1;
-                                }
-                                if old_idx != b.host_idx {
-                                    let _ = b;
-                                    self.update_builder_for_host();
-                                    return;
-                                }
-                            }
+                        1 if !b.host_paths.nav.is_empty() => {
+                            let old = b.host_paths.nav.cursor();
+                            b.host_paths.handle_move(&key, b.host_paths.nav.len() as u16);
+                            moved = true;
+                            changed = old != b.host_paths.nav.cursor();
                         }
-                        2 => {
-                            let max = b.worktrees.len();
-                            if max > 0 {
-                                if b.worktree_idx == 0 {
-                                    b.worktree_idx = max - 1;
-                                } else {
-                                    b.worktree_idx -= 1;
-                                }
-                                needs_container_update = true;
-                            }
+                        2 if !b.worktrees.nav.is_empty() => {
+                            b.worktrees.handle_move(&key, b.worktrees.nav.len() as u16);
+                            moved = true;
                         }
                         _ => {}
                     }
                 }
-                if needs_container_update {
-                    self.update_builder_container();
+                // Nebeneffekte: Host-Wechsel lädt Worktrees/Default-Image und
+                // dann den Container-Status; Tunnel-/Worktree-Wechsel
+                // aktualisiert nur den Container-Status.
+                match col {
+                    1 if changed => {
+                        self.update_builder_for_host();
+                    }
+                    _ if moved && col != 1 => {
+                        self.update_builder_container();
+                    }
+                    _ => {}
                 }
             }
             _ if left => {
@@ -352,10 +324,10 @@ impl App {
             None => return,
         };
 
-        let tunnel = builder.tunnels.get(builder.tunnel_idx);
-        let host_path = builder.host_paths.get(builder.host_idx);
+        let tunnel = builder.tunnels.selected();
+        let host_path = builder.host_paths.selected();
         let worktree = if builder.current_is_git {
-            builder.worktrees.get(builder.worktree_idx)
+            builder.worktrees.selected()
         } else {
             None
         };
@@ -410,13 +382,11 @@ impl App {
                 None
             };
 
-        // Ordnernamen der Basis: bei Repos das Repo-Basisverzeichnis
-        // (host_root), bei Nicht-Repos entsprechend der Ordner des
-        // gemounteten Host-Verzeichnisses (effective_root == host_root).
-        let base_folder = host_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "app".to_string());
+        // Ordnernamen der Basis: ist der gewählte Host-Pfad selbst eine
+        // Repo-Wurzel (Haupt-Repo oder Worktree), der Ordnername des
+        // Git-Haupt-Repos; nur bei Nicht-Repos/Unterverzeichnissen der
+        // Ordnername des gewählten Pfads selbst.
+        let base_folder = crate::channel::builder::base_name_for(&host_root);
 
         let effective_root = match &created_worktree {
             Some(wt) => wt.path.clone(),
@@ -456,13 +426,11 @@ impl App {
                 .unwrap();
         } else if kind == "podman" {
             // Kein existierender Container → WorkingDir + Reponame als Subdir:
-            // Basename des Repo-Hauptpfads (`host_root`), unabhängig vom
-            // gemounteten Worktree-Ordnernamen – so bleibt der Gast-Pfad über
-            // verschiedene Worktrees hinweg stabil ("/<wd>/<repo>").
-            let project = host_root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "app".to_string());
+            // bei Worktree-/Repo-Wurzel der Ordnername des Git-Haupt-Repos,
+            // sonst der Ordnername des gewählten Pfads – so bleibt der
+            // Gast-Pfad über verschiedene Worktrees hinweg stabil
+            // ("/<wd>/<repo>").
+            let project = crate::channel::builder::base_name_for(&host_root);
             workdir = format!("{}/{}", workdir.trim_end_matches('/'), project);
         }
 
@@ -548,7 +516,6 @@ impl App {
             &name,
             &cfg,
             self.config.timeout_secs,
-            self.channels.managed.clone(),
             created_worktree,
             self.config.podman.usermapping,
         ) {
@@ -588,7 +555,7 @@ impl App {
         }
     }
 
-    // --- Pfad-Input (A-Taste im Host-Spalte) ---
+    // --- Inline-Eingabefelder (A-Taste Host-Pfad, B-Taste Branch-Name) ---
 
     /// Öffnet das Pfad-Editor-Feld mit dem aktuell gewählten Host-Pfad als
     /// Ausgangswert. Der User kann den Pfad frei anpassen (z.B. in einen
@@ -603,53 +570,204 @@ impl App {
         }
         let current_path = b
             .host_paths
-            .get(b.host_idx)
+            .selected()
             .map(|hp| hp.path.display().to_string())
             .unwrap_or_default();
         let mut editor = crate::editor::Editor::new(60);
         editor.set_text(&current_path);
-        b.host_path_edit = Some(editor);
+        b.edit = Some(BuilderEdit::HostPath(editor));
+        b.edit_error = None;
     }
 
     /// Bestätigt den eingegebenen Pfad: normalisiert, fügt ihn zur Liste hinzu
-    /// (falls nicht schon vorhanden) und wählt ihn aus.
+    /// (falls nicht schon vorhanden) und wählt ihn aus. Existiert der Zielpfad
+    /// nicht, wird erst per Dialog gefragt, ob er angelegt werden soll
+    /// (Enter = anlegen mit `mkdir -p`, Esc = zurück zur Eingabe).
     fn builder_confirm_host_path(&mut self) {
-        let Some(b) = &mut self.channel_builder else {
-            return;
-        };
-        let text = match &b.host_path_edit {
-            Some(editor) => editor.text_string(),
-            None => return,
-        };
-        b.host_path_edit = None;
+        let path = {
+            let Some(b) = &mut self.channel_builder else {
+                return;
+            };
+            let text = match &b.edit {
+                Some(BuilderEdit::HostPath(editor)) => editor.text_string(),
+                _ => return,
+            };
+            b.edit = None;
+            b.edit_error = None;
 
-        let trimmed = text.trim().to_string();
-        if trimmed.is_empty() {
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            std::path::PathBuf::from(&trimmed)
+        };
+
+        // Zielpfad existiert nicht → erst per Dialog bestätigen lassen, bevor
+        // er in die Liste aufgenommen wird (Enter = `mkdir -p`, Esc = zurück).
+        if !path.exists() {
+            self.path_confirm = Some(PathConfirm { path });
             return;
         }
 
-        let path = std::path::PathBuf::from(&trimmed);
+        self.builder_add_host_path(path);
+    }
 
-        // Prüfen ob der Pfad bereits in der Liste ist
-        let existing_idx = b.host_paths.iter().position(|hp| hp.path == path);
+    /// Fügt `path` zur Host-Pfad-Liste hinzu (falls nicht schon vorhanden),
+    /// wählt ihn aus und aktualisiert Worktrees/Container-Status. Gemeinsamer
+    /// Abschluss für direkt bestätigte, existierende Pfade UND für per Dialog
+    /// angelegte Verzeichnisse.
+    fn builder_add_host_path(&mut self, path: std::path::PathBuf) {
+        {
+            let Some(b) = &mut self.channel_builder else {
+                return;
+            };
+            let existing_idx = b
+                .host_paths
+                .items
+                .iter()
+                .position(|hp| hp.path == path);
+            let new_idx = if let Some(idx) = existing_idx {
+                // Bereits vorhanden → direkt auswählen
+                idx
+            } else {
+                // Neu: an die Liste anhängen und auswählen (`push` hält die
+                // Navigationslänge synchron).
+                let idx = b.host_paths.items.len();
+                b.host_paths
+                    .push(crate::channel::builder::HostPath { path });
+                idx
+            };
+            b.host_paths.set_cursor(new_idx);
+        }
+        // Worktrees/Container-Status für den neuen Pfad aktualisieren
+        // (Borrow-Konflikt über den äußeren Scope hinweg gelöst).
+        self.update_builder_for_host();
+    }
 
-        let new_idx = if let Some(idx) = existing_idx {
-            // Bereits vorhanden → direkt auswählen
-            idx
-        } else {
-            // Neu: an die Liste anhängen und auswählen
-            let idx = b.host_paths.len();
-            b.host_paths
-                .push(crate::channel::builder::HostPath { path });
-            idx
+    /// Öffnet das Pfad-Eingabefeld erneut (zur Korrektur) – z. B. nach
+    /// Abbrechen oder Scheitern der Anlage eines nicht existierenden Pfads.
+    fn builder_reopen_host_path_input(&mut self, text: String, error: Option<String>) {
+        if let Some(b) = &mut self.channel_builder {
+            if b.col != 1 {
+                b.col = 1;
+            }
+            let mut editor = crate::editor::Editor::new(60);
+            editor.set_text(&text);
+            b.edit = Some(BuilderEdit::HostPath(editor));
+            b.edit_error = error;
+        }
+    }
+
+    /// Tastatur-Input des „Pfad existiert nicht“-Dialogs:
+    /// Enter = anlegen (`mkdir -p`) und zurück zum Builder; Esc = abbrechen
+    /// und zurück zur Pfad-Eingabe (Korrekturmöglichkeit).
+    pub(crate) fn handle_path_confirm_key(&mut self, key: event::KeyEvent) {
+        let Some(d) = self.path_confirm.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                // Abbrechen → zurück zur Eingabemaske.
+                self.builder_reopen_host_path_input(d.path.to_string_lossy().to_string(), None);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => match std::fs::create_dir_all(&d.path) {
+                Ok(()) => {
+                    // Angelegt und zurück zum Builder (Pfad auswählen/registrieren).
+                    self.builder_add_host_path(d.path);
+                }
+                Err(err) => {
+                    // Anlage gescheitert → zurück zur Eingabe mit Fehlermeldung.
+                    self.builder_reopen_host_path_input(
+                        d.path.to_string_lossy().to_string(),
+                        Some(format!("Could not create directory: {err}")),
+                    );
+                }
+            },
+            _ => {
+                // Fremde Tasten verschlucken (modaler Dialog).
+                self.path_confirm = Some(d);
+            }
+        }
+    }
+
+    /// Öffnet das Branch-Namen-Feld (nur in der Worktree-Spalte, drei Spalten
+    /// sichtbar) – vorbelegt mit dem Namen des aktuell gewählten Branchs.
+    fn builder_open_branch_input(&mut self) {
+        let Some(b) = &mut self.channel_builder else {
+            return;
+        };
+        // Nur in der Worktree-Spalte (bei Repo) sinnvoll.
+        if b.col != 2 {
+            return;
+        }
+        let suggestion = b
+            .worktrees
+            .selected()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default();
+        let mut editor = crate::editor::Editor::new(60);
+        if !suggestion.is_empty() {
+            editor.set_text(&suggestion);
+        }
+        b.edit = Some(BuilderEdit::Branch(editor));
+        b.edit_error = None;
+    }
+
+    /// Bestätigt den Branch-Namen: legt `git branch <name> <Quell-Branch>` an
+    /// (derselbe Commit wie der aktuell markierte Branch), lädt die Liste neu
+    /// und setzt den Cursor auf den neuen Branch. Bei Fehler bleibt das
+    /// Eingabefeld offen und die Meldung wird rot angezeigt.
+    fn builder_confirm_new_branch(&mut self) {
+        let (name, source, repo) = {
+            let Some(b) = &mut self.channel_builder else {
+                return;
+            };
+            let name = match &b.edit {
+                Some(BuilderEdit::Branch(editor)) => editor.text_string().trim().to_string(),
+                _ => return,
+            };
+            if name.is_empty() {
+                b.edit_error = Some("Enter a branch name".into());
+                return;
+            }
+            // Quelle: der aktuell markierte Branch der Worktree-Spalte.
+            let source = b
+                .worktrees
+                .selected()
+                .map(|w| w.branch.clone())
+                .filter(|s| !s.is_empty());
+            let repo = match b.host_paths.selected() {
+                Some(hp) => hp.path.clone(),
+                None => return,
+            };
+            (name, source, repo)
         };
 
-        b.host_idx = new_idx;
-
-        // Worktrees/Container-Status für den neuen Pfad aktualisieren
-        // (über den Borrow-Konflikt hinweg)
-        let _ = b;
-        self.update_builder_for_host();
+        // `git branch <name> [<quelle>]` – ohne Quelle startet vom HEAD.
+        let mut args: Vec<&str> = vec!["branch", &name];
+        if let Some(ref src) = source {
+            args.push(src);
+        }
+        match crate::repo::git(&repo, &args) {
+            Ok(_) => {
+                // Liste neu laden, Cursor auf den neuen Branch setzen.
+                if let Some(b) = &mut self.channel_builder {
+                    b.edit = None;
+                    b.edit_error = None;
+                    let wt =
+                        crate::channel::builder::git_list_worktrees_and_branches(&repo);
+                    let idx = wt.iter().position(|w| w.branch == name).unwrap_or(0);
+                    b.worktrees = Selection::wrap_at(wt, idx);
+                }
+                // Container-Status für die neue Auswahl auffrischen.
+                self.update_builder_container();
+            }
+            Err(err) => {
+                if let Some(b) = &mut self.channel_builder {
+                    b.edit_error = Some(format!("Could not create branch: {err}"));
+                }
+            }
+        }
     }
 
     /// Leitet Tastatureingaben an den pfadspezifischen Editor weiter –

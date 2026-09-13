@@ -8,15 +8,12 @@ impl App {
         let mut names: Vec<String> = self.channels.names();
         names.sort();
 
-        let mut items = vec!["(kein Kanal)".to_string()];
-        let mut keys: Vec<Option<String>> = vec![None];
-        for name in &names {
-            items.push(name.clone());
-            keys.push(Some(name.clone()));
+        let mut items = vec![ChannelPick::NoChannel];
+        for name in names {
+            items.push(ChannelPick::Channel { name });
         }
         // Am Ende: „new channel" – Öffnet den Channel Builder.
-        items.push("new channel".to_string());
-        keys.push(None);
+        items.push(ChannelPick::NewChannel);
 
         // Cursor auf den gebundenen Kanal der aktiven Session legen (oder 0).
         let active_name = self.sessions[self.active]
@@ -24,47 +21,39 @@ impl App {
             .as_ref()
             .and_then(|ch| self.channels.find_name(ch));
         let cursor = match &active_name {
-            Some(name) => items.iter().position(|i| i == name).unwrap_or(0),
+            Some(name) => items
+                .iter()
+                .position(|it| matches!(it, ChannelPick::Channel { name: n } if n == name))
+                .unwrap_or(0),
             None => 0,
         };
         self.channel_picker = Some(ChannelPicker {
-            items,
-            keys,
-            cursor,
+            items: Selection::new_at(items, cursor),
         });
     }
 
     pub(crate) fn handle_picker_key(&mut self, key: event::KeyEvent) {
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         match key.code {
             KeyCode::Esc => self.channel_picker = None,
             KeyCode::Delete | KeyCode::Backspace => {
-                // Gewählten Kanal aus der Registry entfernen (Entf). Nur
-                // bei bestehenden Kanälen – „(kein Kanal)" (cursor 0) und
-                // „new channel" (letzte Zeile) lassen sich nicht schließen.
-                if let Some(p) = &self.channel_picker {
-                    let is_real_channel = p.cursor > 0
-                        && p.items.get(p.cursor).map(|s| s.as_str()) != Some("new channel");
-                    if is_real_channel {
-                        if let Some(name) = p.keys.get(p.cursor).and_then(|k| k.clone()) {
-                            self.begin_close_channel(&name, CloseKind::Picker);
-                        }
-                    }
+                // Gewählten Kanal aus der Registry entfernen (Entf). Nur bei
+                // bestehenden Kanälen – „(kein Kanal)" und „new channel"
+                // lassen sich nicht schließen.
+                let name = self.channel_picker.as_mut().and_then(|p| match p.items.selected() {
+                    Some(ChannelPick::Channel { name }) => Some(name.clone()),
+                    _ => None,
+                });
+                if let Some(name) = name {
+                    self.begin_close_channel(&name, CloseKind::Picker);
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.picker_select(),
-            _ if down => {
+            _ => {
                 if let Some(p) = &mut self.channel_picker {
-                    p.cursor = step_cursor(true, p.cursor, p.items.len() - 1);
+                    let viewport = p.items.nav.len() as u16;
+                    p.items.handle_move(&key, viewport);
                 }
             }
-            _ if up => {
-                if let Some(p) = &mut self.channel_picker {
-                    p.cursor = step_cursor(false, p.cursor, p.items.len() - 1);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -73,31 +62,29 @@ impl App {
         let Some(picker) = picker else {
             return;
         };
-        if picker.cursor == 0 {
-            let s = self.active_mut();
-            s.set_channel(None);
-            apply_channel_permission_default(s);
-            return;
-        }
-        // „new channel" → Channel Builder öffnen.
-        if picker.items.get(picker.cursor).map(|s| s.as_str()) == Some("new channel") {
-            self.open_channel_builder();
-            return;
-        }
-        let key = match picker.keys.get(picker.cursor).and_then(|k| k.as_deref()) {
-            Some(k) => k.to_string(),
-            None => return,
-        };
-        match self.channels.get(&key) {
-            Some(ch) => {
-                Self::warmup_channel(&ch);
-                self.bind_active_channel(key, ch);
-            }
-            None => {
+        match picker.items.selected() {
+            Some(ChannelPick::NoChannel) => {
                 let s = self.active_mut();
-                s.error = Some(format!("Channel \"{key}\" is not available."));
-                s.error_debug = None;
+                s.set_channel(None);
+                apply_channel_permission_default(s);
             }
+            // „new channel" → Channel Builder öffnen.
+            Some(ChannelPick::NewChannel) => self.open_channel_builder(),
+            Some(ChannelPick::Channel { name }) => {
+                let ch = self.channels.get(name);
+                match ch {
+                    Some(ch) => {
+                        Self::warmup_channel(&ch);
+                        self.bind_active_channel(name.clone(), ch);
+                    }
+                    None => {
+                        let s = self.active_mut();
+                        s.error = Some(format!("Channel \"{name}\" is not available."));
+                        s.error_debug = None;
+                    }
+                }
+            }
+            None => {}
         }
     }
 

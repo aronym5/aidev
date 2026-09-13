@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use crate::channel::ChannelKind;
+
+use super::list::ListNav;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Idle,
@@ -32,11 +34,12 @@ pub enum LocalExecMode {
 
 /// Offener Bestätigungsdialog VOR dem Absenden mit `execute` auf einem
 /// Local-Kanal („lokale Ausführung kann gefährlich sein“). `session` ist die
-/// Session, deren Prompt abgeschickt werden soll; `cursor` wählt eine der drei
-/// Optionen (0 verantworten/Sandbox, 1 einzeln bestätigen, 2 abbrechen).
+/// Session, deren Prompt abgeschickt werden soll; `nav` wählt eine der drei
+/// Optionen (0 verantworten/Sandbox, 1 einzeln bestätigen, 2 abbrechen –
+/// Default beim Öffnen).
 pub struct PreSendConfirm {
     pub session: usize,
-    pub cursor: usize,
+    pub nav: ListNav,
 }
 
 /// Offene Bestätigung für EINEN `run`-Werkzeugaufruf auf einem Local-Kanal im
@@ -47,7 +50,7 @@ pub struct ExecConfirm {
     pub label: String,
     /// Kommando samt Argumenten (Rohform) für die Anzeige.
     pub command: String,
-    pub cursor: usize,
+    pub nav: ListNav,
     pub reply: mpsc::Sender<bool>,
 }
 
@@ -67,7 +70,7 @@ pub(crate) struct StopConfirmEntry {
 /// Run-Container (bzw. deren Arbeitskopien) noch **wesentliche, ungesicherte
 /// Änderungen** enthalten und durch das Ende gestoppt würden. Statt die letzte
 /// Session sofort zu beenden bzw. das Programm zu quitten, fragt aidev nach:
-/// `cursor` 0 = trotzdem beenden (& Container stoppen), 1 = abbrechen
+/// `nav`-Cursor 0 = trotzdem beenden (& Container stoppen), 1 = abbrechen
 /// (Default, sicher).
 pub struct StopConfirm {
     /// Gefundene Änderungen je betroffenem Kanal/Container.
@@ -75,7 +78,7 @@ pub struct StopConfirm {
     /// Anzahl weiterer Container mit Änderungen, die nicht mehr einzeln
     /// aufgeführt werden (Dialog-Überladung vermeiden). 0 = alle aufgeführt.
     pub more: usize,
-    pub cursor: usize,
+    pub nav: ListNav,
 }
 
 /// Zwischenspeicher für `/branch`-Daten solange ein Bestätigungsdialog offen ist.
@@ -92,9 +95,17 @@ pub(crate) struct BranchPending {
 }
 pub(crate) struct BranchConfirm {
     pub summary: String,
-    pub cursor: usize,
-    /// Options-Vektor: 4 Einträge (kein Worktree) oder 3 (Worktree vorhanden).
+    pub nav: ListNav,
+    /// Options-Vektor; dessen Länge bestimmt auch `nav.len()`.
     pub options: Vec<&'static str>,
+}
+/// Offener Bestätigungsdialog im Channel Builder: Der eingegebene Host-Pfad
+/// existiert nicht. `Enter` legt ihn an (`mkdir -p`) und geht zurück zum
+/// Builder; `Esc` bricht ab und öffnet wieder das Pfad-Eingabefeld zur
+/// Korrektur.
+pub(crate) struct PathConfirm {
+    /// Der vom User eingegebene (u. U. nicht existierende) Pfad.
+    pub path: PathBuf,
 }
 /// Phasen des Kanal-Schließens – egal ob aus dem Picker (Entf) oder beim
 /// Schließen einer Session (Ctrl+D / /end): erst geprüft, ob eine aktive
@@ -103,19 +114,19 @@ pub(crate) struct BranchConfirm {
 /// alles gekapselt in `close_channel_*` und identisch für beide Wege.
 pub enum ChannelClosePhase {
     /// Eine aktive Session arbeitet noch auf dem Kanal – erst bestätigen.
-    /// `cursor` 0 = trotzdem schließen, 1 = abbrechen (Default, sicher).
-    ActiveConfirm { cursor: usize },
+    /// `nav`-Cursor 0 = trotzdem schließen, 1 = abbrechen (Default, sicher).
+    ActiveConfirm { nav: ListNav },
     /// Worktree hat uncommittete Änderungen (wie beim Session-Schließen).
-    /// `cursor` 0 = Abbrechen, 1 = Worktree löschen, 2 = Behalten,
+    /// `nav`-Cursor 0 = Abbrechen, 1 = Worktree löschen, 2 = Behalten,
     /// 3 = Committen & löschen.
     Worktree {
         summary: String,
-        cursor: usize,
+        nav: ListNav,
         options: Vec<&'static str>,
     },
     /// Container hat wesentliche Änderungen (wie `StopConfirm`, ein Kanal).
-    /// `cursor` 0 = Kanal schließen & Container stoppen, 1 = abbrechen (Default).
-    Container { notes: Vec<String>, cursor: usize },
+    /// `nav`-Cursor 0 = Kanal schließen & Container stoppen, 1 = abbrechen (Default).
+    Container { notes: Vec<String>, nav: ListNav },
 }
 
 /// Woher der Kanal-Schließ-Vorgang kommt – steuert, was nach dem Aufräumen
@@ -147,17 +158,10 @@ pub const CHANNEL_CLOSE_WORKTREE_OPTIONS: &[&str] = &[
     "Commit & delete – create snapshot, then delete",
 ];
 
-/// Offener Options-Dialog (Ctrl+O). `cursor` wählt die aktive Option.
+/// Offener Options-Dialog (Ctrl+O). `nav` wählt die aktive Option: zwei
+/// Einträge (Maus-Ein/Aus und Modell-Status) über die gemeinsame
+/// `ListNav`-Abstraktion. Die eigentlichen Labels werden erst beim Rendern
+/// berechnet (sie ändern sich mit `mouse_enabled`/`display_model`).
 pub struct OptionsDialog {
-    pub cursor: usize,
-}
-
-/// Hilfsfunktion für Auswahl-Dialoge: liefert den neuen Cursor nach
-/// Pfeil-hoch/-runter (bzw. j/k), begrenzt auf `max` (inklusiv).
-pub(crate) fn step_cursor(down: bool, cursor: usize, max: usize) -> usize {
-    if down {
-        cursor.saturating_add(1).min(max)
-    } else {
-        cursor.saturating_sub(1)
-    }
+    pub nav: ListNav,
 }

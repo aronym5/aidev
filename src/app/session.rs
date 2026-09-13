@@ -38,11 +38,13 @@ pub struct ChatAnchor {
 /// Bildende) stabil.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewLevel {
-    /// Detail: Gedanken aufgeklappt, Run-Konsolen/Diff-Boxen vollständig.
+    /// Detail: Reasoning-Inhalt aufgeklappt (ohne Kopfzeile), Run-Konsolen/Diff-
+    /// Boxen vollständig.
     Detailed,
-    /// Dialog: Gedanken zugeklappt, Run-Konsolen/Diff kompakt.
+    /// Dialog: Gedanken als kompakte `thinking…`-Zeile, Run-Konsolen/Diff kompakt.
     Dialog,
-    /// Kompakt: Gedanken ausgeblendet, Run-Konsolen kompakt, Diffs als Zusammenfassung.
+    /// Kompakt: Gedanken ebenso als kompakte `thinking…`-Zeile, Run-Konsolen
+    /// kompakt, Diffs als Zusammenfassung.
     #[default]
     Compact,
     /// Übersicht: keine Gedanken, Edits ohne Diff, `run` ohne Ausgabe.
@@ -118,7 +120,7 @@ pub struct Session {
     /// alten `active_tool`, nur ohne parallele Puffer-Zone.
     pub(crate) active_tool_label: Option<String>,
     /// Server-bestätigte Usage dieses Turns (vom `Usage`-Event), die bei
-    /// `Done`/`Cancelled` an `finish_assistant` durchgereicht wird.
+    /// `RoundEnd`/`Done`/`Cancelled` an `finish_assistant` durchgereicht wird.
     pub(crate) pending_usage: Option<llm::Usage>,
     /// Beim Streaming gemessene Completion-Token je Bereich (reasoning/content/
     /// tool_calls) dieser Runde – wird zusammen mit `pending_usage` geliefert.
@@ -208,6 +210,26 @@ pub struct Session {
     pub(crate) active_model: Option<String>,
     /// Zeitpunkt des letzten Absendens (für die Antwort-Fußzeile).
     pub(crate) sent_at: Option<Instant>,
+    /// Zeitpunkt des Starts der laufenden HTTP-Runde (aus
+    /// `WorkerEvent::RoundStart`; Fallback `sent_at`). Count-up-Basis der
+    /// Statusleiste für „thinking… Ns“, solange noch kein erstes Token da ist.
+    pub(crate) round_started_at: Option<Instant>,
+    /// Gemessene Time-to-first-Token der laufenden Runde (aus
+    /// `WorkerEvent::FirstToken`). `None` = wartet noch auf das erste
+    /// Inhalt-Byte (Statusleiste zählt hoch). Sobald gesetzt, friert die
+    /// „thinking…“-Anzeige auf diesen Wert ein und zeigt stattdessen die TPS.
+    pub(crate) ttft_ms: Option<u64>,
+    /// Zeitpunkt, zu dem das erste Inhalt-Byte eintraf – TPS-Nenner der
+    /// Live-Anzeige (UI-Uhr).
+    pub(crate) first_token_at: Option<Instant>,
+    /// Aktueller Tokenstand der laufenden Runde (aus `WorkerEvent::
+    /// StreamProgress`): bestätigte usage-Inkremente + Schätzung des letzten
+    /// unbestätigten Fensters. Basis der Live-TPS in der Statusleiste.
+    pub(crate) stream_tokens: u64,
+    /// Streaming-Metriken der abzuschließenden Runde (aus `WorkerEvent::
+    /// RoundMetrics`), geparkt bis `finish_assistant` sie am Assistant-Event
+    /// ablegt (analog zu `pending_usage`/`pending_parts`).
+    pub(crate) pending_metrics: Option<llm::RoundMetrics>,
 }
 
 impl Session {
@@ -250,6 +272,11 @@ impl Session {
             model_alias: None,
             active_model: None,
             sent_at: None,
+            round_started_at: None,
+            ttft_ms: None,
+            first_token_at: None,
+            stream_tokens: 0,
+            pending_metrics: None,
         }
     }
 
@@ -313,7 +340,8 @@ impl Session {
     /// mindestens ein Tool-Kind registriert). Dann beginnt mit dem nächsten
     /// `Chunk`/`Reasoning`/`Usage` eine NEUE Runde – die alte muss vorher
     /// geschlossen werden (deren `pending_usage`/`pending_parts` gehören noch
-    /// zu ihr).
+    /// zu ihr). Primär schließt der Worker sie explizit per `RoundEnd` sofort
+    /// nach dem letzten `ToolEnd`; die Lazy-Abschlüsse bleiben nur Fallback.
     ///
     /// Hintergrund: Der Worker sendet ToolStart/ToolEnd einer Runde
     /// VERSCHACHTELT (`Start→End→Start→End`). Ein Abschluss direkt am ersten
@@ -383,6 +411,11 @@ impl Session {
                 self.chat.set_completion_parts(aid, Some(parts));
             }
         }
+        // Streaming-Metriken (TTFT/TPS) der Runde am Event ablegen – Grundlage
+        // der akkumulierten TTFT/der durchschnittlichen TPS in der Fußzeile.
+        if let Some(metrics) = self.pending_metrics.take() {
+            self.chat.set_round_metrics(aid, Some(metrics));
+        }
         // Token-Ableitung über den ganzen Turn: verteilt die vom Server
         // reporteten `prompt_tokens`/`completion_tokens` auf User-Prompt,
         // Assistant-Runden und Tools. Vorliegende Messwerte (`completion_parts`)
@@ -390,10 +423,29 @@ impl Session {
         // Läuft idempotent bei jedem Runden-Abschluss und heilt sich so zu den
         // finalen Werten.
         self.chat.derive_last_turn_tokens();
+        // context_len des Turns begleichen: bestätigt wo vorhanden, sonst
+        // geschätzte kumulative Kontextlänge. Dafür ab dem zugehörigen
+        // User-Prompt (Turn-Start) rechnen.
+        let parent = self.chat.event(aid).and_then(|e| e.parent_id);
+        let start = parent
+            .and_then(|pid| self.chat.order().iter().position(|&i| i == pid))
+            .unwrap_or(0);
+        self.chat.settle_context_tail(start);
         self.history_version += 1;
         self.active_tool_clear();
         self.compacting = false;
         self.aborted = aborted;
+    }
+
+    /// Setzt die Live-Streaming-Metrik-Felder für eine neue HTTP-Runde zurück
+    /// (aufgerufen bei `WorkerEvent::RoundStart`). `started_at` ist der
+    /// Request-Start des Workers – Count-up-Basis der Statusleiste, bis das
+    /// erste Inhalt-Byte eintrifft.
+    pub(crate) fn reset_stream_metrics(&mut self, started_at: Instant) {
+        self.round_started_at = Some(started_at);
+        self.ttft_ms = None;
+        self.first_token_at = None;
+        self.stream_tokens = 0;
     }
 
     /// Hängt Output an ein offenes Tool-Event an (Live-Ausgabe des `run`).
@@ -476,20 +528,33 @@ impl Session {
     }
 
     /// Server-bestätigte Usage der letzten (abgeschlossenen) Assistant-Runde –
-    /// Basis für `should_compact` und die Live-Context-Schätzbasis. Liefert
-    /// `None`, falls kein abgeschlossener Turn mit Usage vorliegt.
-    pub(crate) fn last_usage(&self) -> Option<llm::Usage> {
-        self.chat
-            .order()
-            .iter()
-            .rev()
-            .filter_map(|id| self.chat.event(*id))
-            .find_map(|ev| match &ev.kind {
-                EventKind::Assistant {
-                    reported_usage, ..
-                } if ev.time_end.is_some() => Some(*reported_usage),
-                _ => None,
-            })
+    /// NUR wenn dieser gegen den AKTUELLEN Kontext gemessen wurde: Der letzte
+    /// abgeschlossene Turn muss NACH der letzten Kompaktierung (Archive-Event)
+    /// liegen. Direkt nach einer Compaction stammt der letzte Usage sonst aus
+    /// der alten, größeren Historie und würde die Context-Anzeige fälschlich
+    /// aufblähen – dann liefern wir `None` und die Schätzung (`prompt_tokens`,
+    /// basierend auf den verschobenen `context_len`-Ankern) übernimmt.
+    pub(crate) fn last_usage_current(&self) -> Option<llm::Usage> {
+        let order = self.chat.order();
+        let last_arch = order.iter().rposition(|id| {
+            matches!(
+                self.chat.event(*id).map(|ev| &ev.kind),
+                Some(EventKind::Archive { .. })
+            )
+        });
+        for (i, id) in order.iter().enumerate().rev() {
+            let Some(ev) = self.chat.event(*id) else { continue };
+            if let EventKind::Assistant { reported_usage, .. } = &ev.kind {
+                if ev.time_end.is_some() {
+                    let current = match last_arch {
+                        Some(a) => i > a,
+                        None => true,
+                    };
+                    return current.then_some(*reported_usage);
+                }
+            }
+        }
+        None
     }
 
     /// Aufräumen nach Turn-Ende: keine offenen Mutations-Targets mehr.
@@ -573,6 +638,30 @@ impl Session {
             return;
         }
         self.chat.compact(boundary, content, tokens);
+        // Einmaliger Shift auf die überlebenden Events: alte Kontextlänge des
+        // letzten Events vor der Summary minus Summary-Länge. Dadurch zeigen die
+        // Survivors ihre alte (ggf. bestätigte) Kontextlänge im neuen
+        // Koordinatensystem. Mit einem einzigen gespeicherten `context_len`
+        // entfällt die Green/Grey-Unterscheidung hier komplett:
+        // `context_is_green` wird falsch (weicht von der bestätigten Zahl ab).
+        let order = self.chat.order().to_vec();
+        if boundary >= 1 {
+            let base = self
+                .chat
+                .event(order[boundary - 1])
+                .and_then(|e| e.context_len)
+                .unwrap_or(0);
+            let shift = base.saturating_sub(tokens);
+            if shift > 0 {
+                for &eid in &order[boundary + 1..] {
+                    if let Some(ev) = self.chat.event_mut(eid) {
+                        if let Some(cl) = ev.context_len {
+                            ev.context_len = Some(cl.saturating_sub(shift));
+                        }
+                    }
+                }
+            }
+        }
         self.history_version += 1;
     }
 }
@@ -672,37 +761,33 @@ pub(crate) fn apply_channel_permission_default(s: &mut Session) {
     }
 }
 
-/// Anzahl LLM-relevanter Zeichen im Chat (ohne manuelle `/run`-Tools) –
-/// Grundlage der 4-Zeichen-≈-1-Token-Heuristik (Kompaktierung + Live-Context).
-/// Offene (wachsende) Events zählen mit ihrem aktuellen Stand.
-pub(crate) fn prompt_chars(s: &Session) -> usize {
-    let mut total = 0usize;
-    for ev in s.chat.iter() {
-        match &ev.kind {
-            EventKind::UserPrompt { text, .. } => total += text.len(),
-            EventKind::Assistant {
-                reasoning,
-                text,
-                tool_event_ids,
-                ..
-            } => {
-                total += text.len() + reasoning.len();
-                // Tool-Outputs fließen in den Folge-Prompt ein (Differenz)
-                for tid in tool_event_ids {
-                    if let Some(t) = s.chat.event(*tid) {
-                        if let EventKind::Tool { output, .. } = &t.kind {
-                            total += output.len();
-                        }
-                    }
-                }
-            }
-            EventKind::Archive { num_tokens, .. } => {
-                // Gespeicherte Token-Zahl der Summary in Zeichen-Äquivalent
-                // überführen (Rückrechnung des `estimate_tokens`: ≈ 4 Zeichen je
-                // Token), damit die heuristische Schätzung konsistent bleibt.
-                total += (*num_tokens as usize) * 4;
-            }
-            _ => {}
+/// Token-Anzahl des AKTUELLEN Kontexts (ohne manuelle `/run`-Tools): die
+/// API-Projektion (`api_messages`) startet an der LETZTEN Summary, daher
+/// zählen auch wir nur Events ab dort – nicht die Zeichen aller Nachrichten.
+/// Die Summary selbst trägt ihre exakte Token-Zahl vom Kompaktierungs-Aufruf
+/// (`Archive.num_tokens`, = `completion_tokens` des Compaction-Aufrufs /
+/// Fallback Zeichen-Schätzung); hier kein Umweg über Zeichen. Alles danach
+/// (überlebende Turns + neue Nachrichten) muss per Zeichen-Heuristik geschätzt
+/// Anzahl der Token, die an den nächsten LLM-Aufruf geschickt werden (Basis
+/// fürs Live/Stream-Label). Seit der context_len-Mechanik die gespeicherte
+/// kumulative Kontextlänge des letzten finalisierten Events (enthält bereits
+/// bestätigte Werte und Kompaktierungs-Shifts – KEIN Zeichen-Umweg mehr);
+/// offene (wachsende) Events zählen mit ihrem aktuellen Streaming-Stand dazu.
+pub(crate) fn prompt_tokens(s: &Session) -> u64 {
+    let order = s.chat.order();
+    let mut total = 0u64;
+    for id in order {
+        let Some(ev) = s.chat.event(*id) else { continue };
+        if ev.time_end.is_none() {
+            // offen → aktueller Stand obenauf
+            total += s.chat.estimate_contribution(*id);
+            continue;
+        }
+        match ev.context_len {
+            // Resync auf die gespeicherte Kontextlänge (finalisiert).
+            Some(cl) => total = cl,
+            // Nur falls mal nicht beglichen: Beitrag einzeln schätzen.
+            None => total += s.chat.estimate_contribution(*id),
         }
     }
     total
@@ -737,21 +822,25 @@ pub(crate) fn compact_boundary(s: &Session, keep: usize) -> usize {
 }
 
 /// Entscheidet vor dem Senden, ob der Kontext komprimiert werden soll: Sobald
-/// die echten `total_tokens` des letzten Turns (oder ohne Usage eine grobe
-/// Zeichen-Heuristik, 4 Zeichen ≈ 1 Token) den Anteil `compact_at` des
-/// Kontextfensters erreichen UND genug alte Turns für eine Zusammenfassung
-/// existieren. Bewusst `total_tokens` statt `prompt_tokens`: die Antwort des
-/// letzten Turns ist Teil des NÄCHSTEN Kontextes (projiziert ab letzter
-/// Summary), muss also mitgezählt werden.
+/// die gespeicherte, kumulative Kontextlänge (`context_len` über `prompt_tokens`,
+/// bestätigt wo vorhanden, nach Kompaktierung verschoben) den Anteil
+/// `compact_at` des Kontextfensters erreicht UND genug alte Turns für eine
+/// Zusammenfassung existieren.
+///
+/// Bewusst `prompt_tokens` statt rohen `reported_usage.total_tokens`: Die
+/// überlebenden Events behalten nach einer Kompaktierung ihr (gegen die ALTE,
+/// größere Historie gemessenes) `reported_usage` – ein roher `total_tokens`-
+/// Wert als Maßstab würde also direkt nach dem Einbau der Summary wieder über
+/// der Schwelle liegen und eine sofortige DOPPEL-Kompaktierung auslösen, obwohl
+/// der echte Kontext klein ist.
+/// `prompt_tokens` folgt den verschobenen `context_len`-Ankern und misst damit
+/// den aktuellen Kontext.
 pub(crate) fn should_compact(
     s: &Session,
     cfg: &Config,
     ep: &crate::config::ResolvedEndpoint,
 ) -> bool {
     let threshold = (ep.context_window as f64 * cfg.compact_at) as u64;
-    let reached = match s.last_usage() {
-        Some(u) => u.total_tokens >= threshold,
-        None => (prompt_chars(s) as u64 / 4) >= threshold,
-    };
+    let reached = prompt_tokens(s) >= threshold;
     reached && compact_boundary(s, cfg.compact_keep_turns) > 0
 }

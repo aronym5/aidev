@@ -345,6 +345,17 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
                     "output": m.content.clone().unwrap_or_default(),
                 }));
             }
+            "tool" => {
+                // Tool-Ergebnis (role „tool“): im Responses-Format wird es wie das
+                // User-Pendant zum `function_call_output`-Item. Ohne diesen Arm
+                // gingen Tool-Antworten verloren und der Endpunkt bekäme
+                // `function_call`-Items ohne passendes Output → 400.
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "output": m.content.clone().unwrap_or_default(),
+                }));
+            }
             "user" => {
                 if let Some(c) = &m.content {
                     out.push(json!({
@@ -359,9 +370,21 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
                     .as_ref()
                     .map(|c| json!([{ "type": "output_text", "text": c }]))
                     .unwrap_or_else(|| json!([]));
-                if let Some(calls) = &m.tool_calls {
-                    // Erst die Assistant-Message, dann je ein `function_call`-Item.
+                // Thinking-Mode-Vertrag (analog zur Chat-Shape): assistant-Tool-
+                // Call-Nachrichten müssen das `reasoning_content` der Runde
+                // zurücktragen (auch leer) – sonst 400 beim Endpunkt. Einfache
+                // Assistant-Antworten ohne Tool-Calls brauchen es nicht.
+                if m.tool_calls.is_some() {
+                    let reasoning = m.reasoning_content.clone().unwrap_or_default();
+                    out.push(json!({
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": reasoning,
+                    }));
+                } else {
                     out.push(json!({ "role": "assistant", "content": content }));
+                }
+                if let Some(calls) = &m.tool_calls {
                     for tc in calls {
                         out.push(json!({
                             "type": "function_call",
@@ -370,8 +393,6 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
                             "arguments": tc.function.arguments,
                         }));
                     }
-                } else {
-                    out.push(json!({ "role": "assistant", "content": content }));
                 }
             }
             // legacy "function"/unbekannte Rollen: nicht sendbar → überspringen.
@@ -470,8 +491,16 @@ pub(crate) fn responses_text(v: &Value) -> Option<String> {
 /// Liest `usage` aus Chat- (`prompt_tokens`/`completion_tokens`) und
 /// Responses-Antworten (`input_tokens`/`output_tokens`). `total_tokens` ist in
 /// beiden enthalten; fehlt es, wird aus input+output gerechnet.
+///
+/// Beim Responses-Streaming liegt das Objekt im `response.completed`-Event
+/// verschachtelt unter `response.usage` (nicht auf Top-Level) – hier ebenfalls
+/// abgedeckt, damit die live `UsageUpdate`-Meldung und die Token-Ableitung auch
+/// im Responses-Protokoll greifen.
 pub(crate) fn parse_usage(json: &Value) -> Option<Usage> {
-    let usage = json.get("usage")?.as_object()?;
+    let usage = json
+        .get("usage")
+        .or_else(|| json.get("response").and_then(|r| r.get("usage")))?
+        .as_object()?;
 
     let total_tokens = usage
         .get("total_tokens")
@@ -514,5 +543,114 @@ pub(crate) fn parse_usage(json: &Value) -> Option<Usage> {
         total_tokens,
         cached_tokens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::{WireFunction, WireMessage, WireToolCall};
+
+    fn wire(
+        role: &str,
+        content: Option<&str>,
+        reasoning: Option<&str>,
+        tool_calls: Option<Vec<WireToolCall>>,
+        tool_call_id: Option<&str>,
+    ) -> WireMessage {
+        WireMessage {
+            role: role.into(),
+            content: content.map(str::to_string),
+            reasoning_content: reasoning.map(str::to_string),
+            tool_calls,
+            tool_call_id: tool_call_id.map(str::to_string),
+        }
+    }
+    fn call(id: &str, name: &str, args: &str) -> WireToolCall {
+        WireToolCall {
+            id: id.into(),
+            ty: "function".into(),
+            function: WireFunction {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn responses_input_traegt_tool_output_und_reasoning_zurueck() {
+        // Assistant-Tool-Call-Runde OHNE sichtbaren Text und OHNE reasoning:
+        // der Thinking-Mode-Vertrag verlangt `reasoning_content` (leer), und
+        // die Tool-Antworten (role „tool“) müssen als `function_call_output`
+        // übertragen werden – sonst 400 / verlorene Tool-Ergebnisse.
+        let msgs = vec![
+            wire("user", Some("hallo"), None, None, None),
+            wire(
+                "assistant",
+                None,
+                None,
+                Some(vec![call("call_1", "read", "{\"path\":\"x\"}")]),
+                None,
+            ),
+            wire("tool", Some("[inhalt]"), None, None, Some("call_1")),
+        ];
+        let input = responses_input(&msgs);
+        // user, assistant (mit reasoning_content), function_call, tool-output
+        assert_eq!(input.len(), 4);
+        let assistant = &input[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["reasoning_content"], "", "leer zurücksenden");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["output"], "[inhalt]");
+    }
+
+    #[test]
+    fn responses_input_laesst_reasoning_bei_reiner_antwort_weg() {
+        let msgs = vec![
+            wire("user", Some("hallo"), None, None, None),
+            wire("assistant", Some("hi"), None, None, None),
+        ];
+        let input = responses_input(&msgs);
+        assert_eq!(input.len(), 2);
+        assert!(input[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn parse_usage_liest_verschachteltes_responses_usage() {
+        // `response.completed`-Event: usage liegt unter `response.usage`
+        // (Responses-Streaming), nicht auf Top-Level.
+        let j = json!({"type":"response.completed","response":{
+            "status":"completed",
+            "usage":{
+                "input_tokens":10,
+                "output_tokens":4,
+                "total_tokens":14,
+                "input_tokens_details":{"cached_tokens":3}
+            }
+        }});
+        let u = parse_usage(&j).expect("usage vorhanden");
+        assert_eq!(u.prompt_tokens, 10);
+        assert_eq!(u.completion_tokens, 4);
+        assert_eq!(u.total_tokens, 14);
+        assert_eq!(u.cached_tokens, Some(3));
+
+        // Top-Level usage (Chat/nicht-streamend) funktioniert weiterhin.
+        let chat = json!({"usage":{
+            "prompt_tokens":10,
+            "completion_tokens":4,
+            "total_tokens":14,
+            "prompt_tokens_details":{"cached_tokens":5}
+        }});
+        let u2 = parse_usage(&chat).expect("usage vorhanden");
+        assert_eq!(u2.prompt_tokens, 10);
+        assert_eq!(u2.completion_tokens, 4);
+        assert_eq!(u2.total_tokens, 14);
+        assert_eq!(u2.cached_tokens, Some(5));
+
+        // Ohne usage → None (kein Fehl-/Null-Ereignis).
+        assert_eq!(parse_usage(&json!({"type":"response.output_text.delta"})), None);
+    }
 }
 

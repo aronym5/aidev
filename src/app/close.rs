@@ -4,6 +4,26 @@ use crossterm::event::{self, KeyCode};
 impl App {
     pub(crate) fn begin_close_channel(&mut self, name: &str, kind: CloseKind) {
         self.channel_picker = None;
+        // Session-Schluss: Wird der Kanal noch von einer anderen offenen
+        // Session genutzt, bleibt er erhalten – es wird nur der Tab
+        // geschlossen (kein Worktree-/Container-Aufräumen, kein Cancel
+        // fremder Worker, kein Detach anderer Sessions). Erst wenn die
+        // letzte Session den Kanal nutzt, läuft unten das volle Aufräumen.
+        // Picker-Schluss (Entf) bleibt explizit und unverändert.
+        if kind == CloseKind::Session {
+            if let Some(active_ch) = self.sessions[self.active].channel.clone() {
+                let shared = self.sessions.iter().enumerate().any(|(i, s)| {
+                    i != self.active
+                        && s.channel
+                            .as_ref()
+                            .is_some_and(|c| Arc::ptr_eq(c, &active_ch))
+                });
+                if shared {
+                    self.finish_close_session();
+                    return;
+                }
+            }
+        }
         // Die gerade geschlossene Session zählt bei der Aktivitätsprüfung
         // nicht mit (sie soll ja geschlossen werden).
         let skip = if kind == CloseKind::Session {
@@ -29,7 +49,10 @@ impl App {
             self.channel_close = Some(ChannelClose {
                 name: name.to_string(),
                 kind,
-                phase: ChannelClosePhase::ActiveConfirm { cursor: 1 },
+                // 2 Optionen; Default: Abbrechen (sicher).
+                phase: ChannelClosePhase::ActiveConfirm {
+                    nav: ListNav::new_at(2, 1),
+                },
             });
         } else {
             self.close_channel_worktree_phase(name, kind);
@@ -49,41 +72,52 @@ impl App {
                 }
             }
         }
+        // Nur ein von aidev angelegter Worktree wird hier aufgeräumt
+        // (`managed_worktree`); ein normaler Host-Ordner, der zufällig ein
+        // Git-Checkout ist, bleibt unangetastet.
+        let managed_wt = self
+            .channels
+            .get(name)
+            .map(|ch| ch.managed_worktree())
+            .unwrap_or(false);
         let wt = self
             .channels
             .get(name)
             .and_then(|ch| ch.owned_worktree().cloned());
-        if let Some(wt) = wt {
-            if let Ok(repo) = crate::repo::RepoManager::discover(&wt.path) {
-                match repo.is_clean(&wt.path) {
-                    Ok(true) => {
-                        // Fehlschlag beim Aufräumen ist nicht fatal – der Kanal
-                        // schließt trotzdem. Ein Konsolen-Print würde das
-                        // TUI-Layout zerschießen.
-                        let _ = repo.remove_worktree(&wt.name, true);
-                        self.close_channel_container_phase(name, kind);
-                        return;
+        if managed_wt {
+            if let Some(wt) = wt {
+                if let Ok(repo) = crate::repo::RepoManager::discover(&wt.path) {
+                    match repo.is_clean(&wt.path) {
+                        Ok(true) => {
+                            // Fehlschlag beim Aufräumen ist nicht fatal – der Kanal
+                            // schließt trotzdem. Ein Konsolen-Print würde das
+                            // TUI-Layout zerschießen.
+                            let _ = repo.remove_worktree(&wt.name, true);
+                            self.close_channel_container_phase(name, kind);
+                            return;
+                        }
+                        Ok(false) => {
+                            let summary = repo
+                                .status_summary(&wt.path)
+                                .unwrap_or_else(|_| "Worktree has uncommitted changes.".to_string());
+                            self.channel_close = Some(ChannelClose {
+                                name: name.to_string(),
+                                kind,
+                                phase: ChannelClosePhase::Worktree {
+                                    summary,
+                                    // 4 Optionen; Default: fortfahren (Worktree löschen).
+                                    nav: ListNav::new_at(4, 1),
+                                    options: CHANNEL_CLOSE_WORKTREE_OPTIONS.to_vec(),
+                                },
+                            });
+                            return;
+                        }
+                        Err(_) => {}
                     }
-                    Ok(false) => {
-                        let summary = repo
-                            .status_summary(&wt.path)
-                            .unwrap_or_else(|_| "Worktree has uncommitted changes.".to_string());
-                        self.channel_close = Some(ChannelClose {
-                            name: name.to_string(),
-                            kind,
-                            phase: ChannelClosePhase::Worktree {
-                                summary,
-                                cursor: 1,
-                                options: CHANNEL_CLOSE_WORKTREE_OPTIONS.to_vec(),
-                            },
-                        });
-                        return;
-                    }
-                    Err(_) => {}
                 }
             }
         }
-        // Kein Worktree bzw. nicht prüfbar → Container-Phase.
+        // Kein verwalteter Worktree bzw. nicht prüfbar → Container-Phase.
         self.close_channel_container_phase(name, kind);
     }
 
@@ -96,7 +130,11 @@ impl App {
             self.channel_close = Some(ChannelClose {
                 name: name.to_string(),
                 kind,
-                phase: ChannelClosePhase::Container { notes, cursor: 1 },
+                // 2 Optionen; Default: Abbrechen (sicher).
+                phase: ChannelClosePhase::Container {
+                    notes,
+                    nav: ListNav::new_at(2, 1),
+                },
             });
             return;
         }
@@ -118,13 +156,13 @@ impl App {
             }
         }
         // Konfigurierte Kanäle bleiben bei Session-Schluss registriert (nur
-        // Kanäle mit eigenem Worktree – also die per /branch bzw. Alt+D
-        // erzeugten – werden aufgeräumt); beim expliziten Kanal-Schließen
-        // (Picker) wird immer ausgetragen.
+        // Kanäle mit von aidev verwaltetem Worktree – also die per /branch,
+        // Picker-Branch bzw. Alt+D erzeugten – werden ausgetragen); beim
+        // expliziten Kanal-Schließen (Picker) wird immer ausgetragen.
         let owned = self
             .channels
             .get(name)
-            .map(|ch| ch.owned_worktree().is_some())
+            .map(|ch| ch.managed_worktree())
             .unwrap_or(false);
         if kind == CloseKind::Picker || owned {
             self.channels.unregister(name);
@@ -141,8 +179,6 @@ impl App {
             return;
         };
         let kind = d.kind;
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         // Abbruch: Dialog zu; je nach Ursprung Picker neu öffnen oder die
         // Session (und damit der Kanal) einfach offen lassen.
         let abort = |app: &mut App, _name: String, kind: CloseKind| {
@@ -152,84 +188,43 @@ impl App {
                 CloseKind::Session => {}
             }
         };
-        match &d.phase {
-            ChannelClosePhase::ActiveConfirm { cursor } => {
-                let mut cursor = *cursor;
+        match d.phase {
+            ChannelClosePhase::ActiveConfirm { nav } => {
+                let mut nav = nav;
                 match key.code {
                     KeyCode::Esc => abort(self, d.name.clone(), kind),
-                    _ if down => {
-                        cursor = (cursor + 1).min(1);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::ActiveConfirm { cursor },
-                        });
-                    }
-                    _ if up => {
-                        cursor = cursor.saturating_sub(1);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::ActiveConfirm { cursor },
-                        });
-                    }
                     KeyCode::Enter | KeyCode::Char(' ') => {
-                        if cursor == 0 {
+                        if nav.cursor() == 0 {
                             self.close_channel_worktree_phase(&d.name, kind);
                         } else {
                             abort(self, d.name.clone(), kind);
                         }
                     }
                     _ => {
+                        // 2 Optionen; gemeinsame Bewegung über die ListNav-Abstraktion.
+                        nav.handle_move(&key, 2, |_| 1);
                         self.channel_close = Some(ChannelClose {
                             name: d.name.clone(),
                             kind,
-                            phase: ChannelClosePhase::ActiveConfirm { cursor },
+                            phase: ChannelClosePhase::ActiveConfirm { nav },
                         });
                     }
                 }
             }
             ChannelClosePhase::Worktree {
                 summary,
-                cursor,
+                nav,
                 options,
             } => {
-                let mut cursor = *cursor;
-                let summary = summary.clone();
-                let options = options.clone();
-                let max = options.len() - 1;
+                let mut nav = nav;
                 match key.code {
                     KeyCode::Esc => abort(self, d.name.clone(), kind),
-                    _ if down => {
-                        cursor = (cursor + 1).min(max);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::Worktree {
-                                summary,
-                                cursor,
-                                options,
-                            },
-                        });
-                    }
-                    _ if up => {
-                        cursor = cursor.saturating_sub(1);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::Worktree {
-                                summary,
-                                cursor,
-                                options,
-                            },
-                        });
-                    }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let wt = self
                             .channels
                             .get(&d.name)
                             .and_then(|ch| ch.owned_worktree().cloned());
-                        match cursor {
+                        match nav.cursor() {
                             0 => abort(self, d.name.clone(), kind),
                             1 => {
                                 // Worktree löschen, dann Container-Phase.
@@ -263,51 +258,39 @@ impl App {
                         }
                     }
                     _ => {
+                        // Gemeinsame Bewegung über die ListNav-Abstraktion (Optionen
+                        // sind einzeilig, viewport = Options-Anzahl).
+                        nav.handle_move(&key, options.len() as u16, |_| 1);
                         self.channel_close = Some(ChannelClose {
                             name: d.name.clone(),
                             kind,
                             phase: ChannelClosePhase::Worktree {
                                 summary,
-                                cursor,
+                                nav,
                                 options,
                             },
                         });
                     }
                 }
             }
-            ChannelClosePhase::Container { notes, cursor } => {
-                let mut cursor = *cursor;
-                let notes = notes.clone();
+            ChannelClosePhase::Container { notes, nav } => {
+                let mut nav = nav;
                 match key.code {
                     KeyCode::Esc => abort(self, d.name.clone(), kind),
-                    _ if down => {
-                        cursor = (cursor + 1).min(1);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::Container { notes, cursor },
-                        });
-                    }
-                    _ if up => {
-                        cursor = cursor.saturating_sub(1);
-                        self.channel_close = Some(ChannelClose {
-                            name: d.name.clone(),
-                            kind,
-                            phase: ChannelClosePhase::Container { notes, cursor },
-                        });
-                    }
                     KeyCode::Enter | KeyCode::Char(' ') => {
-                        if cursor == 0 {
+                        if nav.cursor() == 0 {
                             self.finalize_close_channel(&d.name, kind);
                         } else {
                             abort(self, d.name.clone(), kind);
                         }
                     }
                     _ => {
+                        // 2 Optionen; gemeinsame Bewegung über die ListNav-Abstraktion.
+                        nav.handle_move(&key, 2, |_| 1);
                         self.channel_close = Some(ChannelClose {
                             name: d.name.clone(),
                             kind,
-                            phase: ChannelClosePhase::Container { notes, cursor },
+                            phase: ChannelClosePhase::Container { notes, nav },
                         });
                     }
                 }
@@ -323,8 +306,9 @@ impl App {
         self.stop_confirm = Some(StopConfirm {
             entries,
             more,
-            // Default: Abbrechen (sicher) – Stopp verliert ungesicherten Zustand.
-            cursor: 1,
+            // 2 Optionen; Default: Abbrechen (sicher) – Stopp verliert
+            // ungesicherten Zustand.
+            nav: ListNav::new_at(2, 1),
         });
         true
     }
@@ -356,26 +340,20 @@ impl App {
         let Some(mut d) = self.stop_confirm.take() else {
             return;
         };
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         match key.code {
             // Esc bzw. „Nein, abbrechen“: nichts beenden, Dialog zu.
             KeyCode::Esc => {}
-            _ if down => {
-                d.cursor = step_cursor(true, d.cursor, 1);
-                self.stop_confirm = Some(d);
-            }
-            _ if up => {
-                d.cursor = step_cursor(false, d.cursor, 1);
-                self.stop_confirm = Some(d);
-            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if d.cursor == 0 {
+                if d.nav.cursor() == 0 {
                     // Explizit bestätigt → beenden (Container werden gestoppt).
                     self.quit = true;
                 }
             }
-            _ => self.stop_confirm = Some(d),
+            _ => {
+                // Gemeinsame Bewegung über die ListNav-Abstraktion.
+                d.nav.handle_move(&key, 2, |_| 1);
+                self.stop_confirm = Some(d);
+            }
         }
     }
 }

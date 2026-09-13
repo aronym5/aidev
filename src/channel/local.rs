@@ -18,6 +18,10 @@ pub struct Local {
     timeout: Duration,
     shell: Mutex<Option<String>>,
     worktree: Option<crate::repo::WorktreeInfo>,
+    /// Ob der gemountete Host-Ordner ein von aidev angelegter Git-Worktree ist
+    /// (Picker-Branch ohne Worktree, `/branch`, `Alt+D`). In der Regel `false`;
+    /// nur beim Erzeugen des Kanals gesetzt, über die Lebensdauer unverändert.
+    managed_worktree: bool,
 }
 
 impl Local {
@@ -27,11 +31,15 @@ impl Local {
             timeout: Duration::from_secs(60),
             shell: Mutex::new(None),
             worktree: None,
+            managed_worktree: false,
         }
     }
 
     pub fn with_worktree(mut self, wt: crate::repo::WorktreeInfo) -> Self {
+        // Ein gebundener Worktree wurde von aidev angelegt → als verwaltet
+        // markieren (aufräumen beim Schließen).
         self.worktree = Some(wt);
+        self.managed_worktree = true;
         self
     }
 
@@ -114,11 +122,16 @@ impl Channel for Local {
     }
 
     fn dup(&self) -> Result<Arc<dyn Channel>, String> {
+        // Lokales Duplikat (Alt+D): gleicher Ordner, kein eigener Container und
+        // – anders als beim Podman-Duplikat – KEIN neuer Worktree angelegt. Der
+        // Duplikat-Kanal übernimmt daher die Worktree-Verwaltung nicht: Schließt
+        // er, darf der (vom Original genutzte) Ordner nicht aufgeräumt werden.
         Ok(Arc::new(Local {
             root: self.root.clone(),
             timeout: self.timeout,
             shell: Mutex::new(None),
             worktree: None,
+            managed_worktree: false,
         }))
     }
 
@@ -128,6 +141,10 @@ impl Channel for Local {
 
     fn owned_worktree(&self) -> Option<&crate::repo::WorktreeInfo> {
         self.worktree.as_ref()
+    }
+
+    fn managed_worktree(&self) -> bool {
+        self.managed_worktree
     }
 
     fn status(&self) -> ChannelStatus {

@@ -20,7 +20,7 @@ use super::tools_def::{
     apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation,
 };
 use super::wire::{WireFunction, WireMessage, WireToolCall};
-use super::{CompletionParts, Usage, WorkerEvent};
+use super::{CompletionParts, RoundMetrics, Usage, WorkerEvent};
 
 /// Prozessweit geteilter blocking-HTTP-Client. Die Verbindung zum Endpunkt
 /// bleibt als Keep-Alive im Pool liegen und wird für den nächsten Turn
@@ -184,12 +184,22 @@ pub(crate) fn do_request(
     let (mut url, mut body) = api::build_body(ep, shape, msgs, with_tools, permission, true, None);
     let mut shape_flipped = false;
 
+    // Eine neue HTTP-Runde beginnt: Die Statusleiste setzt ihre
+    // Streaming-Metrik-Felder zurück und zählt ab hier „thinking…“ hoch
+    // (Count-up-Basis; der exakte TTFT-Wert kommt später über `FirstToken`).
+    let round_t0 = Instant::now();
+    let _ = tx.send(WorkerEvent::RoundStart(session, round_t0));
+
     // Retry-Schleife: 429/5xx/Netzwerkfehler werden mit Backoff wiederholt.
     // Zwischen den Versuchen geht ein `Retrying`-Event an die UI (Statuszeile
     // mit Countdown); `cancel` (Esc) bricht auch während des Wartens ab. Erst
     // beim endgültigen Aufgeben werden Request + Antwort als Debug-Material
     // abgelegt und die einzeilige Kurzfassung nach oben gereicht.
     let mut attempt: usize = 0;
+    // Zeitpunkt des Absendens des jeweils letzten Versuchs – nach dem Erfolg
+    // (break) ist es der send des erfolgreichen Requests (TTFT-Basis). Wird
+    // beim `continue` (Retry/Shape-Fallback) neu gesetzt.
+    let mut send_t0: Instant;
     let resp = loop {
         if cancel.load(Ordering::Relaxed) {
             return Step::Cancelled;
@@ -212,6 +222,7 @@ pub(crate) fn do_request(
         } else {
             req
         };
+        send_t0 = Instant::now();
         let resp = match req
             .json(&body)
             .send()
@@ -339,7 +350,7 @@ pub(crate) fn do_request(
         .to_ascii_lowercase();
     if !content_type.contains("text/event-stream") {
         let raw = resp.text().unwrap_or_default();
-        return handle_nonstream(tx, session, shape, ep, &url, &body, &raw);
+        return handle_nonstream(tx, session, shape, ep, &url, &body, &raw, send_t0);
     }
 
     // SSE-Streaming: Der zeilenweise Stream-Lesevorgang läuft in einem
@@ -373,7 +384,7 @@ pub(crate) fn do_request(
     // Verarbeitung als Chat (choices/delta/tool_calls). Der vorhandene
     // Chat-Loop darunter ist der ChatCompletions-Zweig.
     if shape == api::ApiShape::Responses {
-        return stream_responses(tx, session, cancel, &line_rx);
+        return stream_responses(tx, session, cancel, &line_rx, send_t0);
     }
 
     let mut content = String::new();
@@ -383,6 +394,11 @@ pub(crate) fn do_request(
     // Misst die Completion-Token je Bereich (reasoning/content/tool_calls)
     // über die usage-Inkremente + Byte-Längen der Deltas.
     let mut parts_acc = RoundPartsAccumulator::default();
+    // Streaming-Metriken (TTFT/TPS) dieser Runde.
+    let mut timer = StreamTimer {
+        send_t0: Some(send_t0),
+        ..Default::default()
+    };
     let mut done = false;
     // Manche OpenAI-kompatiblen Endpunkte/Proxys zerlegen große Events (z. B.
     // lange `edit`/`write`-Argumente mit mehrzeiligen Blöcken) über mehrere
@@ -442,7 +458,7 @@ pub(crate) fn do_request(
 
         let Some(choice) = json.get("choices").and_then(|c| c.get(0)) else {
             // Nur usage (z. B. finaler Chunk ohne choices) → trotzdem anwenden.
-            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &json);
+            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
             continue;
         };
         // Fehlendes `index` (manche Proxies lassen es weg) = Delta 0; nur ein
@@ -452,11 +468,11 @@ pub(crate) fn do_request(
             .and_then(|i| i.as_u64())
             .is_some_and(|i| i != 0)
         {
-            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &json);
+            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
             continue;
         }
         let Some(delta) = choice.get("delta") else {
-            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &json);
+            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
             continue;
         };
 
@@ -469,25 +485,31 @@ pub(crate) fn do_request(
             if let Some(part) = reasoning_fragment(delta.get(key)) {
                 parts_acc.track_reasoning(part.len() as u64);
                 reasoning.push_str(&part);
+                timer.on_text(&part);
+                timer.announce_first(tx, session);
+                timer.send_progress(tx, session);
                 let _ = tx.send(WorkerEvent::Reasoning(session, part));
             }
         }
         let Some(content_delta) = delta.get("content").and_then(|c| c.as_str()) else {
-            apply_tool_delta_measured(&mut tool_accs, delta, &mut parts_acc);
-            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &json);
+            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
+            apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
             continue; // Role-/Gedanken-Delta oder leere Chunks
         };
         if !content_delta.is_empty() {
             parts_acc.track_content(content_delta.len() as u64);
             content.push_str(content_delta);
-            apply_tool_delta_measured(&mut tool_accs, delta, &mut parts_acc);
+            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
+            timer.on_text(content_delta);
+            timer.announce_first(tx, session);
+            timer.send_progress(tx, session);
             let _ = tx.send(WorkerEvent::Chunk(session, content_delta.to_string()));
         } else {
-            apply_tool_delta_measured(&mut tool_accs, delta, &mut parts_acc);
+            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
         }
         // usage NACH dem Delta derselben Zeile: Das Inkrement gehört zu den
         // Deltas, die SEIT dem letzten usage erzeugt wurden (inkl. dieses).
-        apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &json);
+        apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
     }
 
     if !done {
@@ -531,7 +553,9 @@ pub(crate) fn do_request(
         };
 
     if tool_accs.is_empty() {
-        // Keine Werkzeug-Aufrufe → finale Runde.
+        // Keine Werkzeug-Aufrufe → finale Runde. Streaming-Metriken der Runde
+        // an die UI senden (TTFT/TPS für Statusleiste und Antwort-Fußzeile).
+        timer.send_round_metrics(tx, session);
         return Step::Final {
             usage,
             parts: parts_acc.parts().clone(),
@@ -595,9 +619,12 @@ pub(crate) fn do_request(
     if calls.is_empty() {
         // (Hinweis: eine „ins Leere gelaufene" Tool-Runde wird still als
         // Final-Runde behandelt; ein Konsolen-Print würde das TUI zerschießen.)
+        timer.send_round_metrics(tx, session);
         return Step::Final { usage, parts };
     }
 
+    // Runden-Metriken (TTFT/TPS) an die UI senden – auch bei Tool-Runden.
+    timer.send_round_metrics(tx, session);
     Step::Tools {
         assistant: assistant(
             if content.is_empty() {
@@ -621,7 +648,8 @@ pub(crate) fn do_request(
 /// Nicht-SSE-Antwort mit 200: nicht-streamende Antwort oder Fehler im Body –
 /// für beide API-Shapes (Chat `choices[0].message.content` vs Responses
 /// `output`/`output_text`). Behandelt eine vorhandene Antwort wie eine
-/// einmalige Chunk-Nachricht für die UI.
+/// einmalige Chunk-Nachricht für die UI. `send_t0` ist der Absende-Zeitpunkt
+/// des Requests (TTFT-Basis, siehe `do_request`).
 fn handle_nonstream(
     tx: &Sender<WorkerEvent>,
     session: usize,
@@ -630,7 +658,12 @@ fn handle_nonstream(
     url: &str,
     body: &Value,
     raw: &str,
+    send_t0: Instant,
 ) -> Step {
+    let mut timer = StreamTimer {
+        send_t0: Some(send_t0),
+        ..Default::default()
+    };
     match serde_json::from_str::<Value>(raw) {
         Ok(json) => {
             if let Some(e) = json.get("error") {
@@ -649,7 +682,12 @@ fn handle_nonstream(
             if let Some(content) = api::content_from_nonstream(shape, &json) {
                 if !content.is_empty() {
                     let _ = tx.send(WorkerEvent::Chunk(session, content.clone()));
+                    // Wie beim Streaming: erstes Inhalt-Byte beendet die TTFT.
+                    timer.on_text(&content);
+                    timer.announce_first(tx, session);
+                    timer.send_progress(tx, session);
                 }
+                timer.send_round_metrics(tx, session);
                 return Step::Final {
                     usage: api::parse_usage(&json),
                     parts: CompletionParts::default(),
@@ -700,12 +738,17 @@ fn stream_responses(
     session: usize,
     cancel: &AtomicBool,
     line_rx: &std::sync::mpsc::Receiver<Option<String>>,
+    send_t0: Instant,
 ) -> Step {
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tool_accs: Vec<ToolCallAcc> = Vec::new();
     let mut usage: Option<Usage> = None;
     let mut parts_acc = RoundPartsAccumulator::default();
+    let mut timer = StreamTimer {
+        send_t0: Some(send_t0),
+        ..Default::default()
+    };
     let mut done = false;
     let mut aborted: Option<String> = None;
     let mut pending = String::new();
@@ -770,6 +813,9 @@ fn stream_responses(
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     parts_acc.track_content(d.len() as u64);
                     content.push_str(d);
+                    timer.on_text(d);
+                    timer.announce_first(tx, session);
+                    timer.send_progress(tx, session);
                     let _ = tx.send(WorkerEvent::Chunk(session, d.to_string()));
                 }
             }
@@ -777,6 +823,9 @@ fn stream_responses(
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     parts_acc.track_reasoning(d.len() as u64);
                     reasoning.push_str(d);
+                    timer.on_text(d);
+                    timer.announce_first(tx, session);
+                    timer.send_progress(tx, session);
                     let _ = tx.send(WorkerEvent::Reasoning(session, d.to_string()));
                 }
             }
@@ -806,6 +855,26 @@ fn stream_responses(
                             slot.name = name.to_string();
                         }
                     }
+                    // Ein Tool-Call ist ein Inhalt-Byte (TTFT-Ende) – auch wenn
+                    // er nur aus einer `output_index`-Zeile ohne Argumente besteht.
+                    timer.announce_first(tx, session);
+                    timer.send_progress(tx, session);
+                    // Manche Endpunkte/Proxys liefern die Argumente KOMPLETT im
+                    // `output_item.added`-Item (statt als nachfolgenden
+                    // `.delta`-Strom). Erst dadurch fließen deren Token-Kosten in
+                    // die usage-Verteilung (bytes_tool). Leere Argumente (der
+                    // übliche OpenAI-Fall – die Deltas folgen) tragen 0 → kein
+                    // Doppelzählen mit den anschließenden Deltas.
+                    if let Some(args) = item
+                        .and_then(|i| i.get("arguments"))
+                        .and_then(|a| a.as_str())
+                    {
+                        if !args.is_empty() {
+                            parts_acc.track_tool(index, args.len() as u64);
+                            timer.on_chars(args.chars().count() as u64);
+                            timer.send_progress(tx, session);
+                        }
+                    }
                 }
             }
             "response.function_call_arguments.delta" => {
@@ -818,6 +887,8 @@ fn stream_responses(
                     let slot = ensure_tool_slot(&mut tool_accs, index);
                     slot.arguments.push_str(d);
                     parts_acc.track_tool(index, d.len() as u64);
+                    timer.on_chars(d.chars().count() as u64);
+                    timer.send_progress(tx, session);
                 }
             }
             "response.function_call_arguments.done" => {
@@ -829,15 +900,24 @@ fn stream_responses(
                 if let Some(args) = json.get("arguments").and_then(|a| a.as_str()) {
                     let slot = ensure_tool_slot(&mut tool_accs, index);
                     // Falls Deltas unvollständig waren: vollständige Arguments setzen.
+                    // Nur wenn NICHT schon über Deltas gemessen (slot leer) – dann
+                    // gehören die Argument-Tokens in die usage-Verteilung.
                     if slot.arguments.is_empty() && !args.is_empty() {
                         slot.arguments = args.to_string();
+                        parts_acc.track_tool(index, args.len() as u64);
+                        timer.on_chars(args.chars().count() as u64);
+                        timer.send_progress(tx, session);
                     }
                 }
             }
             "response.completed" => {
                 if let Some(u) = api::parse_usage(&json) {
                     usage = Some(u);
-                    parts_acc.apply_usage(u.completion_tokens);
+                    let inc = parts_acc.apply_usage(u.completion_tokens);
+                    // Server-Inkrement in die TPS-Zählung übernehmen und den
+                    // Live-Tokenstand neu melden.
+                    timer.on_commit(inc);
+                    timer.send_progress(tx, session);
                     let _ = tx.send(WorkerEvent::UsageUpdate(session, u.total_tokens));
                 }
                 done = true;
@@ -874,6 +954,7 @@ fn stream_responses(
         }
     }
 
+    timer.send_round_metrics(tx, session);
     finish_round(content, reasoning, tool_accs, usage, parts_acc)
 }
 
@@ -1100,13 +1181,15 @@ impl RoundPartsAccumulator {
     /// completion-Inkrement (kumuliert seit dem letzten Stand) proportional
     /// nach den seit dem letzten usage gemessenen Bytes und setzt die Zähler
     /// danach zurück. `completion_tokens` ist der kumulierte Endwert des
-    /// aktuellen usage.
+    /// aktuellen usage. Liefert das **inkrementelle** completion-Inkrement
+    /// („Zwischen-Wert“), das der Server seit dem letzten usage-Event
+    /// bestätigt hat – Grundlage der TPS-Zählung (`StreamTimer::on_commit`).
     ///
     /// Hat das Inkrement messbare Bytes, wird proportional verteilt (der
     /// letzte positive Anteil erhält den Rundungsrest). Sind ALLE Bytes 0
     /// (z. B. nur ein Tool-Kopf/leeres Delta dazwischen), geht das Inkrement
     /// komplett an die zuletzt berührte Sektion.
-    pub(crate) fn apply_usage(&mut self, completion_tokens: u64) {
+    pub(crate) fn apply_usage(&mut self, completion_tokens: u64) -> u64 {
         let inc = completion_tokens.saturating_sub(self.last_completion);
         self.last_completion = completion_tokens;
 
@@ -1145,10 +1228,147 @@ impl RoundPartsAccumulator {
         self.bytes_reasoning = 0;
         self.bytes_content = 0;
         self.bytes_tool.clear();
+
+        inc
     }
 
     pub(crate) fn parts(&self) -> &CompletionParts {
         &self.parts
+    }
+}
+
+/// Misst die Streaming-Metriken einer HTTP-Runde (TTFT + TPS) direkt am
+/// SSE-Stream. Läuft parallel zum `RoundPartsAccumulator`, konsumiert aber
+/// dieselben `usage`-Ereignisse:
+///
+/// - `committed` = Summe der **inkrementellen** `completion_tokens` aus den
+///   `usage`-Events („Zwischen-Werte“, vom Server gemessen). Wird bei jedem
+///   usage um dessen Inkrement erhöht.
+/// - `pending_chars` = Zeichen aller Deltas SEIT dem letzten usage. Davon
+///   leitet sich die Schätzung `pending_chars/4` für das noch nicht vom Server
+///   bestätigte Fenster ab. Beim nächsten usage wird dieses Fenster durch das
+///   exakte Inkrement **ersetzt** (`pending_chars = 0`) – kein Doppelzählen.
+///
+/// Live-Anzeige: `tokens_live() = committed + pending_chars/4`. Liefert der
+/// Server gar kein usage, bleibt es bei der reinen Zeichen-Schätzung.
+#[derive(Debug, Default)]
+struct StreamTimer {
+    /// Zeitpunkt des (erfolgreichen) Request-Absendens – Basis der TTFT.
+    send_t0: Option<Instant>,
+    /// Zeitpunkt des ersten Inhalt-Bytes (Reasoning/Tool-Call/Content).
+    first_token_at: Option<Instant>,
+    /// Gemessene TTFT in ms (0, solange kein erstes Token).
+    ttft_ms: Option<u64>,
+    /// Erstes Inhalt-Byte wurde gerade frisch markiert (`ensure_first`), aber
+    /// noch nicht als `FirstToken`-Event gemeldet. Entkoppelt „Marke setzen“
+    /// (passiert u. a. schon in `on_text`/`on_chars`) vom „Ankündigen“
+    /// (`announce_first`) – so geht das Event auch dann raus, wenn `on_text`
+    /// vor `announce_first` lief (der eigentliche Hallo-Token-Fall).
+    announce_pending: bool,
+    /// Vom Server bestätigte Completion-Tokens (Σ usage-Inkremente).
+    committed: u64,
+    /// Zeichen der Deltas seit dem letzten usage (nur Schätzwert).
+    pending_chars: u64,
+}
+
+impl StreamTimer {
+    /// Markiert das erste Inhalt-Byte (falls noch nicht geschehen) und liefert
+    /// `true`, wenn es gerade neu gesetzt wurde (→ `FirstToken`-Event senden).
+    fn ensure_first(&mut self) -> bool {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(Instant::now());
+            self.ttft_ms = Some(
+                self.send_t0
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0),
+            );
+            self.announce_pending = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Inhalt-Byte mit vorliegendem String (Reasoning/Content): TTFT-Fenster
+    /// starten + Zeichen für die Schätzung zählen.
+    fn on_text(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.ensure_first();
+        self.pending_chars += s.chars().count() as u64;
+    }
+
+    /// Inhalt-Byte ohne String (z. B. Tool-Argument-Fortsatz): nur Zeichen
+    /// zählen; das Fenster selbst wurde bereits über `ensure_first` gestartet.
+    fn on_chars(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.ensure_first();
+        self.pending_chars += n;
+    }
+
+    /// Server-Inkrement eines `usage`-Events übernehmen: ersetzt die Schätzung
+    /// des seit dem letzten usage angelaufenen Fensters durch den exakten Wert.
+    /// Wirkt nicht als „erstes Token“ (ein usage-only-Event ist kein Inhalt).
+    fn on_commit(&mut self, inc: u64) {
+        self.committed += inc;
+        self.pending_chars = 0;
+    }
+
+    /// Aktuelle Live-Tokenzahl: bestätigte + geschätzte (noch unbestätigte).
+    fn tokens_live(&self) -> u64 {
+        self.committed + self.pending_chars / 4
+    }
+
+    /// Seit dem ersten Token vergangene Zeit in ms (0 ohne erstes Token).
+    fn stream_ms(&self) -> u64 {
+        self.first_token_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Sendet `FirstToken`, falls das erste Inhalt-Byte gerade neu markiert
+    /// wurde. Ruft `ensure_first` auf, damit auch Aufrufer ohne vorheriges
+    /// `on_text`/`on_chars` (z. B. der reine Tool-Kopf) die Marke setzen.
+    fn announce_first(&mut self, tx: &Sender<WorkerEvent>, session: usize) {
+        self.ensure_first();
+        if self.announce_pending {
+            self.announce_pending = false;
+            if let Some(ttft) = self.ttft_ms {
+                let _ = tx.send(WorkerEvent::FirstToken(session, ttft));
+            }
+        }
+    }
+
+    /// Sendet den Live-Fortschritt (nur wenn bereits ein erstes Token lief).
+    fn send_progress(&self, tx: &Sender<WorkerEvent>, session: usize) {
+        if self.first_token_at.is_some() {
+            let _ = tx.send(WorkerEvent::StreamProgress(
+                session,
+                self.tokens_live(),
+                self.stream_ms(),
+            ));
+        }
+    }
+
+    /// Sendet die abschließenden Runden-Metriken – nur wenn tatsächlich ein
+    /// erstes Token gesehen wurde (sonst keine sinnvollen Zahlen).
+    fn send_round_metrics(&self, tx: &Sender<WorkerEvent>, session: usize) {
+        if self.first_token_at.is_some() {
+            let _ = tx.send(WorkerEvent::RoundMetrics(session, self.finish()));
+        }
+    }
+
+    /// Finale Runden-Metriken: TTFT, Stream-Zeit und die Tokenzahl aus den
+    /// usage-Inkrementen (bzw. Zeichen-Schätzung, falls nie ein usage kam).
+    fn finish(&self) -> RoundMetrics {
+        RoundMetrics {
+            ttft_ms: self.ttft_ms.unwrap_or(0),
+            stream_ms: self.stream_ms(),
+            tokens: self.tokens_live(),
+        }
     }
 }
 
@@ -1175,21 +1395,162 @@ fn apply_tool_delta_measured(
     }
 }
 
+/// Wie `apply_tool_delta_measured`, versorgt zusätzlich den `StreamTimer`:
+/// Ein Tool-Call-Delta zählt als erstes Inhalt-Byte (TTFT-Ende), und die neu
+/// angekommenen Argument-Zeichen gehen in die Token-Schätzung ein. `before`/
+/// `after`-Vergleich vermeidet Doppelzählen über mehrere Delta-Events hinweg.
+fn apply_tool_delta_stream(
+    accs: &mut Vec<ToolCallAcc>,
+    delta: &Value,
+    parts_acc: &mut RoundPartsAccumulator,
+    timer: &mut StreamTimer,
+    tx: &Sender<WorkerEvent>,
+    session: usize,
+) {
+    if delta.get("tool_calls").is_none() {
+        return;
+    }
+    let before: usize = accs.iter().map(|a| a.arguments.chars().count()).sum();
+    apply_tool_delta_measured(accs, delta, parts_acc);
+    let after: usize = accs.iter().map(|a| a.arguments.chars().count()).sum();
+    let added = after.saturating_sub(before) as u64;
+    // Der bloße Tool-Kopf (id/name, 0 Argument-Zeichen) ist bereits ein
+    // „Inhalt“ – er beendet die TTFT-Wartezeit.
+    timer.announce_first(tx, session);
+    if added > 0 {
+        timer.on_chars(added);
+    }
+    timer.send_progress(tx, session);
+}
+
 /// Wendet das `usage`-Feld eines Events an (falls vorhanden) – NACH dem
 /// Delta-Tracking, damit das Inkrement dieses Events auch dessen Bytes sieht.
 /// Wird im Stream ein usage erkannt, reicht es die serverbestätigte
 /// `total_tokens` sofort als `UsageUpdate` an die UI weiter, damit die
-/// Statusleiste den aktuellen Kontextstand live anzeigen kann.
+/// Statusleiste den aktuellen Kontextstand live anzeigen kann. Parallel
+/// übernimmt der `StreamTimer` das **inkrementelle** completion-Inkrement
+/// (`on_commit`) und meldet den neuen Live-Tokenstand.
 fn apply_usage_if_any(
     tx: &Sender<WorkerEvent>,
     session: usize,
     usage: &mut Option<Usage>,
     acc: &mut RoundPartsAccumulator,
+    timer: &mut StreamTimer,
     json: &Value,
 ) {
     if let Some(u) = parse_usage(json) {
         *usage = Some(u);
-        acc.apply_usage(u.completion_tokens);
+        let inc = acc.apply_usage(u.completion_tokens);
+        timer.on_commit(inc);
+        timer.send_progress(tx, session);
         let _ = tx.send(WorkerEvent::UsageUpdate(session, u.total_tokens));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Ein `StreamTimer` ohne echte `send_t0` – TTFT wird als `0` gemessen.
+    fn timer() -> StreamTimer {
+        StreamTimer {
+            send_t0: Some(Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn first_token_wird_ausgelöst_sobald_erster_text_eingeht() {
+        let mut t = timer();
+        let (tx, rx) = mpsc::channel();
+
+        t.on_text("Hallo");
+        t.announce_first(&tx, 0);
+
+        let ev = rx.try_recv().expect("FirstToken erwartet");
+        assert!(
+            matches!(ev, WorkerEvent::FirstToken(0, _)),
+            "erwartet FirstToken(0,…), bekommen: {ev:?}"
+        );
+        assert!(!t.announce_pending, "pending consumed");
+    }
+
+    #[test]
+    fn announce_first_ohne_vorherigen_on_text_markiert_und_sendet() {
+        let mut t = timer();
+        let (tx, rx) = mpsc::channel();
+
+        // Tool-Head-Pfad: Kein on_text vorher.
+        t.announce_first(&tx, 0);
+        assert!(!t.announce_pending, "pending consumed");
+        assert!(
+            rx.try_recv().is_ok(),
+            "FirstToken wird auch ohne Vorab-on_text erwartet"
+        );
+    }
+
+    #[test]
+    fn nur_ein_emission_bei_mehreren_deltas() {
+        let mut t = timer();
+        let (tx, rx) = mpsc::channel();
+
+        t.on_text("A");
+        t.announce_first(&tx, 0);
+        t.on_text("B");
+        t.announce_first(&tx, 0);
+        t.on_text("C");
+        t.announce_first(&tx, 0);
+
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 1, "FirstToken darf nur einmal gesendet werden");
+    }
+
+    #[test]
+    fn on_commit_setzt_und_send_progress_liefert_tokens_live() {
+        let mut t = timer();
+        let (tx, rx) = mpsc::channel();
+
+        t.on_text("Hello");
+        t.announce_first(&tx, 0);
+        assert!(rx.try_recv().is_ok(), "FirstToken zuerst konsumieren");
+
+        // Vor Usage: Tokens nur aus Zeichen-Schätzung (Hello → 5 Zeichen/4 → 1;
+        // die Aufrundung hängt von der Schätzung ab – wir prüfen auf >0).
+        t.send_progress(&tx, 0);
+        match rx.try_recv().expect("StreamProgress nach FirstToken") {
+            WorkerEvent::StreamProgress(0, tokens, _) => assert!(tokens > 0, "Schätzung > 0"),
+            other => panic!("erwartet StreamProgress, bekommen: {other:?}"),
+        }
+
+        // Server-Inkrement ersetzt Schätzung.
+        t.on_commit(20);
+        t.send_progress(&tx, 0);
+        match rx.try_recv().expect("StreamProgress nach on_commit") {
+            WorkerEvent::StreamProgress(0, tokens, _) => assert_eq!(tokens, 20),
+            other => panic!("erwartet StreamProgress, bekommen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn neue_runde_mit_frischem_timer_meldet_erneut() {
+        // Jede HTTP-Runde legt einen eigenen StreamTimer an (sehen http.rs) –
+        // eine neue Runde meldet daher wieder ein FirstToken.
+        let (tx, rx) = mpsc::channel();
+
+        let round1 = {
+            let mut t = timer();
+            t.on_text("hallo");
+            t.announce_first(&tx, 0);
+            t
+        };
+        assert!(rx.try_recv().is_ok(), "Runde 1 meldet FirstToken");
+
+        let round2 = timer();
+        let _ = round1; // erste Runde "abgeschlossen"
+        assert!(!round2.announce_pending, "fresh timer noch nicht markiert");
     }
 }

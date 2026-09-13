@@ -10,7 +10,6 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{ChatAnchor, Session, ViewLevel};
 use crate::chat::{ChatEvent, EventKind, ToolKind};
-use crate::config::SymbolMode;
 use crate::llm::estimate_tokens;
 use crate::perm::Permission;
 
@@ -35,37 +34,47 @@ pub(crate) struct ChatBlock {
 
 /// Gecachte, umgebrochene Blöcke der abgeschlossenen Chat-Historie (ohne Logo
 /// und ohne laufenden Turn). Gültig, solange `width`, die Ansichtsebene
-/// (`view`) und die Historie (`version`) unverändert sind – so wird nicht bei
-/// jedem Frame der gesamte (auch nicht sichtbare) Verlauf neu umgebrochen.
+/// (`view`), die Historie (`version`) und das Theme (`theme_version`) unverändert
+/// sind – so wird nicht bei jedem Frame der gesamte (auch nicht sichtbare)
+/// Verlauf neu umgebrochen.
 pub(crate) struct HistoryCache {
     pub(crate) width: usize,
     pub(crate) view: ViewLevel,
     pub(crate) version: u64,
+    /// Theme-Version beim Aufbau: ein Theme-Wechsel (`/theme`) erhöht den Wert
+    /// und macht den Cache ungültig, damit bereits gezeichnete Texte sofort mit
+    /// dem neuen Schema neu eingefärbt werden.
+    pub(crate) theme_version: u64,
     pub(crate) blocks: Vec<ChatBlock>,
     /// Context-Schätzer am Ende der Historie (für den laufenden Turn im
     /// Übersichts-Balken zum Weiterschreiben).
     pub(crate) end_ctx: ContextEstimate,
 }
 
-/// Baut den Historie-Cache neu, falls Breite, Ansichtsebene oder Historie
-/// sich geändert haben.
+/// Baut den Historie-Cache neu, falls Breite, Ansichtsebene, Historie oder
+/// Theme sich geändert haben.
 pub(crate) fn ensure_history_cache(
     s: &mut Session,
     width: usize,
-    mode: SymbolMode,
     model: &str,
     window: u64,
 ) {
     let rebuild = s
         .history_cache
         .as_ref()
-        .is_none_or(|c| c.width != width || c.view != s.view || c.version != s.history_version);
+        .is_none_or(|c| {
+            c.width != width
+                || c.view != s.view
+                || c.version != s.history_version
+                || c.theme_version != theme_version()
+        });
     if rebuild {
-        let (blocks, end_ctx) = build_history_cache(s, width, mode, model, window);
+        let (blocks, end_ctx) = build_history_cache(s, width, model, window);
         s.history_cache = Some(HistoryCache {
             width,
             view: s.view,
             version: s.history_version,
+            theme_version: theme_version(),
             blocks,
             end_ctx,
         });
@@ -79,7 +88,6 @@ pub(crate) fn ensure_history_cache(
 pub(crate) fn build_history_cache(
     s: &Session,
     width: usize,
-    mode: SymbolMode,
     model: &str,
     window: u64,
 ) -> (Vec<ChatBlock>, ContextEstimate) {
@@ -87,10 +95,6 @@ pub(crate) fn build_history_cache(
     let mut blocks: Vec<ChatBlock> = Vec::new();
     let mut ctx = ContextEstimate::base();
     let ids: Vec<crate::chat::EventId> = s.chat.order().to_vec();
-    // Vorab: welche Events bekommen die grüne Verification von der Assistant-
-    // Runde DIREKT danach (deren `prompt_tokens`)? Die vorangehende Zeile wird
-    // vor der Runde gerendert, also muss der Wert hier schon stehen.
-    let verified_before = assistant_verified_before(s);
 
     // Modell-Stempel und Absende-Zeitpunkt des aktuellen Turns (kommen vom
     // UserPrompt, gelten für alle nachfolgenden Assistant-Runden bis zum
@@ -98,8 +102,16 @@ pub(crate) fn build_history_cache(
     // Fußzeile am Turn-Ende.
     let mut turn_model = model.to_string();
     let mut turn_begin: Option<std::time::Instant> = None;
+    // Über den Turn akkumulierte Streaming-Metriken (aus den `metrics` der
+    // Assistant-Runden): Summe der TTFTs, Summe der Tokens und des
+    // Streaming-Fensters – Grundlage für „akkumulierte ttft · durchschnittliche
+    // tps“ in der Antwort-Fußzeile.
+    let mut turn_ttft_ms: u64 = 0;
+    let mut turn_tokens: u64 = 0;
+    let mut turn_stream_ms: u64 = 0;
+    let mut turn_has_metrics = false;
 
-    for (pos, id) in ids.iter().enumerate() {
+    for id in ids.iter() {
         let Some(ev) = s.chat.event(*id) else {
             continue;
         };
@@ -107,6 +119,15 @@ pub(crate) fn build_history_cache(
         if ev.time_end.is_none() {
             continue;
         }
+        // Kontext-Anker: die gespeicherte `context_len` dieses Events anzeigen
+        // (bestätigt, geschätzt oder nach Kompaktierung verschoben). Grün ⇔ sie
+        // entspricht noch der ableitbaren bestätigten Zahl – sonst grau.
+        // Nur ein gespeicherter Wert, kein Shift-Mechanismus im Renderer.
+        ctx.set_anchor(
+            ev.context_len
+                .unwrap_or(ctx.used + s.chat.estimate_contribution(*id)),
+            s.chat.context_is_green(*id),
+        );
         match &ev.kind {
             EventKind::UserPrompt {
                 text,
@@ -116,51 +137,39 @@ pub(crate) fn build_history_cache(
                 ..
             } => {
                 if !m.is_empty() {
-                    turn_model = m.clone();
+                        turn_model = m.clone();
+                    }
+                    turn_begin = ev.time_begin;
+                    // Neuer Turn → akkumulierte Metriken neu beginnen.
+                    turn_ttft_ms = 0;
+                    turn_tokens = 0;
+                    turn_stream_ms = 0;
+                    turn_has_metrics = false;
+                    if view.is_overview() {
+                        // Abgeleitete Turn-Usage (`num_tokens`) vorziehen, solange
+                        // sie vorliegt (>0); während des Live-Turns bzw. ohne Usage
+                        // bleibt die Schätzung – so bleibt die Konto-Verbuchung
+                        // (Band + block_sum) im Live-Tail stabil und deckt sich
+                        // nach Turn-Ende mit der angezeigten Zahl.
+                        let tokens = (*num_tokens > 0)
+                            .then_some(*num_tokens)
+                            .unwrap_or_else(|| estimate_tokens(text));
+                        ctx.add_content(ContentKind::User, tokens);
+                        ctx.block_sum += tokens;
+                        blocks.push(overview_user_line(
+                            text,
+                            width,
+                            &ctx,
+                            window,
+                            Some(*permission),
+                            (tokens > 0).then_some(tokens),
+                        ));
+                    } else if text.trim().is_empty() {
+                        // leere Eingabe → nichts
+                    } else {
+                        blocks.push(user_input_block_chat(text, *permission, width));
+                    }
                 }
-                turn_begin = ev.time_begin;
-                // Grün: bestätigte Usage des zugehörigen Turns (nächste
-                // abgeschlossene Assistant-Runde). Hier zählt die PROMPT-
-                // Zahl (Kontext vor der Antwort), nicht `total_tokens`.
-                let verified = ids[pos + 1..]
-                    .iter()
-                    .filter_map(|nid| s.chat.event(*nid))
-                    .find(|e| {
-                        e.time_end.is_some() && matches!(e.kind, EventKind::Assistant { .. })
-                    })
-                    .and_then(|e| match &e.kind {
-                        EventKind::Assistant { reported_usage, .. } => {
-                            (reported_usage.prompt_tokens > 0).then_some(reported_usage.prompt_tokens)
-                        }
-                        _ => None,
-                    });
-                if view.is_overview() {
-                    // Abgeleitete Turn-Usage (`num_tokens`) vorziehen, solange
-                    // sie vorliegt (>0); während des Live-Turns bzw. ohne Usage
-                    // bleibt die Schätzung – so bleibt die Konto-Verbuchung
-                    // (Band + block_sum) im Live-Tail stabil und deckt sich
-                    // nach Turn-Ende mit der angezeigten Zahl.
-                    let tokens = (*num_tokens > 0)
-                        .then_some(*num_tokens)
-                        .unwrap_or_else(|| estimate_tokens(text));
-                    ctx.add_content(ContentKind::User, tokens);
-                    ctx.block_sum += tokens;
-                    ctx.verified_prompt = verified_before.get(id).copied().or(verified);
-                    blocks.push(overview_user_line(
-                        text,
-                        width,
-                        &ctx,
-                        window,
-                        Some(*permission),
-                        (tokens > 0).then_some(tokens),
-                    ));
-                    resync_after(&mut ctx);
-                } else if text.trim().is_empty() {
-                    // leere Eingabe → nichts
-                } else {
-                    blocks.push(user_input_block_chat(text, *permission, width, mode));
-                }
-            }
             EventKind::Assistant {
                 reasoning,
                 text,
@@ -169,15 +178,23 @@ pub(crate) fn build_history_cache(
                 num_tokens_text,
                 reported_usage: _,
                 completion_parts: _,
+                metrics,
             } => {
+                // Streaming-Metriken dieser Runde in die Turn-Akkumulation
+                // aufnehmen (auch für Tool-Runden – die Fußzeile der finalen
+                // Antwort summiert über den ganzen Turn).
+                if let Some(m) = metrics {
+                    turn_has_metrics = true;
+                    turn_ttft_ms += m.ttft_ms;
+                    turn_tokens += m.tokens;
+                    turn_stream_ms += m.stream_ms;
+                }
                 if !reasoning.trim().is_empty() && !view.is_overview() {
                     blocks.push(thoughts_block(
                         reasoning,
                         view.thoughts_open(),
                         None,
                         width,
-                        false,
-                        mode,
                         None,
                     ));
                 }
@@ -188,39 +205,35 @@ pub(crate) fn build_history_cache(
                 // sobald die Runde abgeschlossen ist (Usage da), übernimmt hier
                 // die exakte Zahl. Runden mit Usage überschreibt der Resync
                 // ohnehin zusätzlich mit dem Serverwert.
-                if !reasoning.trim().is_empty() && view.is_overview() {
+                let reasoning_tokens = (!reasoning.trim().is_empty() && view.is_overview()).then(|| {
                     let r_tokens = (*num_tokens_reasoning > 0)
                         .then_some(*num_tokens_reasoning)
                         .unwrap_or_else(|| estimate_tokens(reasoning));
                     ctx.add_content(ContentKind::Reasoning, r_tokens);
-                }
+                    // Auch die Gedanken tragen zur Context-Größe bei (Prompts inkl.
+                    // Reasoning); `block_sum` ist die Kontext-Schätzung zu diesem
+                    // Zeitpunkt, nicht die Summe gezeichneter Blocks.
+                    ctx.block_sum += r_tokens;
+                    r_tokens
+                });
                 if !text.trim().is_empty() {
                     if view.is_overview() {
                         let est = *num_tokens_text;
                         ctx.add_content(ContentKind::Content, est);
                         ctx.block_sum += est;
-                        ctx.verified_prompt = verified_before
-                            .get(id)
-                            .copied()
-                            .or_else(|| assistant_sync_ctx(ev, s));
-                        blocks.push(overview_text_line(text, width, &ctx, window, Some(est)));
-                        // KEIN resync hier: Der rundeigene Fuß (assistant_sync_ctx
-                        // unten) übernimmt direkt danach die Basis – ein Zwischen-
-                        // resync der Textzeile wäre sofort wieder überschrieben.
-                        ctx.verified_prompt = None;
+                        // Annotation vor dem Balken: ohne Reasoning nur die
+                        // Text-Tokenzahl; mit Reasoning+Text beide einzeln als
+                        // „res+txt“ (analog Tool-Call+Antwort).
+                        blocks.push(overview_text_line(
+                            text,
+                            width,
+                            &ctx,
+                            window,
+                            Some(est),
+                            reasoning_tokens,
+                        ));
                     } else {
-                        blocks.push(text_block(text, width, mode));
-                    }
-                }
-                // Kontext-Fuß dieser Runde (serverbestätigt) VOR den
-                // Tool-Kindern setzen: Eine spätere Tool-Verifikation (die
-                // `prompt_tokens` der Folgerunde, inkl. aller Tool-Ergebnisse)
-                // ist der jüngere und vollständigere Kontextstand und darf den
-                // Fuß danach verdrängen. Läge der Fuß HINTER den Tools, würde er
-                // die Tool-Verifikation sofort wieder überschreiben.
-                if view.is_overview() {
-                    if let Some(v) = assistant_sync_ctx(ev, s) {
-                        ctx.resync_to(v);
+                        blocks.push(text_block(text, width));
                     }
                 }
                 // Werkzeuge dieser Runde (maßgebliche Reihenfolge).
@@ -228,13 +241,15 @@ pub(crate) fn build_history_cache(
                     if let Some(tev) = s.chat.event(*tid) {
                         if tev.time_end.is_some() {
                             if view.is_overview() {
-                                // Grüne Verification der DIRECT NACHFOLGENDEN
-                                // Assistant-Runde (deren prompt_tokens) als neuer
-                                // `used`-Fuß (`resync_after` läuft NACH dem
-                                // add_tool in der Tool-Zeile, s. o.).
-                                ctx.verified_prompt = verified_before.get(tid).copied();
+                                // Tool-Eigen-Anker: das Tool selbst trägt seine
+                                // gespeicherte Kontextlänge (durch die Folge-
+                                // Runde verifiziert bzw. verschoben), nicht die
+                                // der Mutter-Assistant-Runde.
+                                ctx.set_anchor(
+                                    tev.context_len.unwrap_or(ctx.used),
+                                    s.chat.context_is_green(*tid),
+                                );
                                 blocks.push(overview_tool_line_chat(tev, width, &mut ctx, window));
-                                resync_after(&mut ctx);
                             } else {
                                 blocks.push(tool_block_chat(tev, width, view.boxes_open()));
                             }
@@ -245,15 +260,15 @@ pub(crate) fn build_history_cache(
                 // Tool-Aufrufe. Runden mit Tool-Calls (zu denen die Ausgabe gehört)
                 // bekommen keine Signatur, ebenso wenig der Overview-Modus.
                 if tool_event_ids.is_empty() && !view.is_overview() {
-                    blocks.push(chat_footer_block(&turn_model, ev, turn_begin, width));
+                    let turn_metrics =
+                        turn_has_metrics.then_some((turn_ttft_ms, turn_tokens, turn_stream_ms));
+                    blocks.push(chat_footer_block(&turn_model, ev, turn_begin, turn_metrics, width));
                 }
             }
             EventKind::Tool { .. } if ev.parent_id.is_none() => {
                 // Manuelles `/run`-Tool (parent None, kein Turn zugehörig).
                 if view.is_overview() {
-                    ctx.verified_prompt = verified_before.get(id).copied();
                     blocks.push(overview_tool_line_chat(ev, width, &mut ctx, window));
-                    resync_after(&mut ctx);
                 } else {
                     blocks.push(tool_block_chat(ev, width, view.boxes_open()));
                 }
@@ -264,26 +279,19 @@ pub(crate) fn build_history_cache(
                 ..
             } => {
                 // Kompaktierung: Die Summary wird zum neuen Kontext-Anker.
-                // - `verified_prompt` = Tokenzahl des Summary-Events selbst
-                //   (eigener, exakt verifizierter Anker statt der sonst üblichen
-                //   Verifikation durch die Folgerunde):
-                // - usage-bar-Zusammensetzung = NUR Summary in exakt dieser
-                //   Länge; alle bisherigen Beiträge (User/Reasoning/Content,
-                //   Tools) werden auf null zurückgesetzt – der ersetzte Teil
-                //   der Historie ist aus dem Kontext.
-                // - `shift` = Kontextlänge im letzten Event VOR der Summary
-                //   (`ctx.used`) minus der Länge der Summary. Ab hier gemessene
-                //   serverbestätigte absolute Zahlen beziehen sich auf die ALTE
-                //   Historie und werden in `resync_to` um diesen Betrag
-                //   reduziert; der Schätz-Pfad läuft auf der Summary-Basis
-                //   weiter (ergibt rechnerisch „alte absolute Zahl − shift“).
+                // Ihre Gesamtlänge ist ein eigener, exakt gemessener Anker
+                // (grüne Zahl); die Balken-Zusammensetzung besteht nur noch aus
+                // der Summary in exakt dieser Länge – der ersetzte Teil der
+                // Historie ist aus dem Kontext. Die überlebenden Events danach
+                // zeigen ihre (in `apply_compaction` verschobene) gespeicherte
+                // `context_len` automatisch als graue Rest-Zahl, weil sie dort
+                // von der ableitbaren bestätigten Zahl abweicht.
                 let summary_tokens = *num_tokens;
-                let shift = ctx.used.saturating_sub(summary_tokens);
                 ctx.contents = [0; 5];
                 ctx.contents[ContentKind::Summary as usize] = summary_tokens;
                 ctx.tools = Vec::new();
                 ctx.block_sum = summary_tokens;
-                ctx.verified_prompt = Some(summary_tokens);
+                ctx.set_anchor(summary_tokens, true);
                 if view.is_overview() {
                     blocks.push(overview_summary_line(
                         summary,
@@ -293,12 +301,8 @@ pub(crate) fn build_history_cache(
                         summary_tokens,
                     ));
                 } else {
-                    blocks.push(summary_block(summary, width, mode));
+                    blocks.push(summary_block(summary, width));
                 }
-                // Anker exakt auf die Summary-Länge setzen (Shift gilt erst
-                // für die NACHFOLGENDEN Events, sonst würde er doppelt wirken).
-                resync_after(&mut ctx);
-                ctx.compact_shift = shift;
             }
             EventKind::Abort => {
                 // Markierung eines abgebrochenen Turns (wird nicht als Inhalt
@@ -314,12 +318,8 @@ pub(crate) fn build_history_cache(
 // ── Chat-basierte Block-Helfer (neues Event-Log) ───────────────────────────
 
 /// User-Eingabe im Detail-Modus: volles Eingabe-Band mit Berechtigungsfarbe.
-fn user_input_block_chat(text: &str, p: Permission, width: usize, mode: SymbolMode) -> ChatBlock {
-    let mut lines = wrap_markdown(
-        &decorate_emphasis(decorate_symbols(logical_lines(text), mode)),
-        width,
-        PAD,
-    );
+fn user_input_block_chat(text: &str, p: Permission, width: usize) -> ChatBlock {
+    let mut lines = wrap_markdown(&decorate_emphasis(logical_lines(text)), width, PAD);
     let color = permission_color(p);
     lines = lines
         .into_iter()
@@ -327,21 +327,25 @@ fn user_input_block_chat(text: &str, p: Permission, width: usize, mode: SymbolMo
         .collect();
     ChatBlock {
         lines,
-        bg: Some(INPUT_BG),
+        bg: Some(theme().band_bg),
         gap: 0,
         is_tool: false,
 
     }
 }
 
-/// Dezente Fußzeile (Modell · Dauer) nach einem beendeten Turn. Die Dauer
-/// reicht vom Absende-Zeitpunkt des UserPrompts (`turn_begin`, Fallback:
-/// Beginn der ersten Assistant-Runde) bis zum Ende der letzten Runde – also
-/// über den ganzen Turn, nicht nur die letzte Sub-Runde.
+/// Dezente Fußzeile (Modell · Dauer · TTFT · TPS) nach einem beendeten Turn.
+/// Die Dauer reicht vom Absende-Zeitpunkt des UserPrompts (`turn_begin`,
+/// Fallback: Beginn der ersten Assistant-Runde) bis zum Ende der letzten Runde
+/// – also über den ganzen Turn, nicht nur die letzte Sub-Runde. `turn_metrics`
+/// sind die über alle Runden des Turns akkumulierten Streaming-Metriken
+/// `(ttft_ms, tokens, stream_ms)` und ergeben die „akkumulierte TTFT“ sowie die
+/// „durchschnittliche TPS“ der ganzen Antwort.
 fn chat_footer_block(
     model: &str,
     ev: &ChatEvent,
     turn_begin: Option<std::time::Instant>,
+    turn_metrics: Option<(u64, u64, u64)>,
     width: usize,
 ) -> ChatBlock {
     let mut parts = vec![model.to_string()];
@@ -349,12 +353,24 @@ fn chat_footer_block(
         let ms = e.duration_since(b).as_millis() as u64;
         parts.push(fmt_duration(ms));
     }
+    // Streaming-Metriken der ganzen Antwort: akkumulierte TTFT und
+    // durchschnittliche TPS (Σ Tokens / Σ Stream-Zeit über die Runden).
+    if let Some((ttft_ms, tokens, stream_ms)) = turn_metrics {
+        if stream_ms > 0 {
+            parts.push(format!("input processing {}", fmt_duration(ttft_ms)));
+            parts.push(format!("{} tps", fmt_tps(tokens as f64 / (stream_ms as f64 / 1000.0))));
+        } else if ttft_ms > 0 {
+            // Kein Streaming-Fenster gemessen (z. B. non-streaming-Fallback):
+            // nur die TTFT anzeigen, keine sinnlose TPS.
+            parts.push(format!("input processing {}", fmt_duration(ttft_ms)));
+        }
+    }
     muted_footer_line(&format!("— {}", parts.join(" · ")), width)
 }
 
 /// Gedeckte, einzeilige Fuß-/Hinweiszeile.
 fn muted_footer_line(text: &str, width: usize) -> ChatBlock {
-    let line = Line::from(Span::styled(text.to_string(), Style::default().fg(MUTED)));
+    let line = Line::from(Span::styled(text.to_string(), Style::default().fg(theme().muted)));
     ChatBlock {
         lines: wrap_block(&[line], width, PAD),
         bg: None,
@@ -364,7 +380,7 @@ fn muted_footer_line(text: &str, width: usize) -> ChatBlock {
 }
 
 fn def_tool_line(width: usize) -> ChatBlock {
-    let line = Line::from(Span::styled("⛭ tool", Style::default().fg(MUTED)));
+    let line = Line::from(Span::styled("⛭ tool", Style::default().fg(theme().muted)));
     ChatBlock {
         lines: wrap_block(&[line], width, PAD),
         bg: None,
@@ -529,7 +545,7 @@ fn overview_tool_line_chat(
         ..
     } = &ev.kind
     else {
-        return overview_row("⛭ tool".into(), Style::default().fg(MUTED), width, ctx, window, true, None);
+        return overview_row("⛭ tool".into(), Style::default().fg(theme().muted), width, ctx, window, true, None);
     };
     let tool = tool_name(function_name);
     let call = *num_tokens_input;
@@ -551,11 +567,11 @@ fn overview_tool_line_chat(
 }
 
 /// Gedämpfter, kursiver Hinweis für eine kontextkomprimierte Zusammenfassung.
-pub(crate) fn summary_block(content: &str, width: usize, mode: SymbolMode) -> ChatBlock {
-    let logical: Vec<Line> = decorate_symbols(logical_lines(content), mode);
+pub(crate) fn summary_block(content: &str, width: usize) -> ChatBlock {
+    let logical: Vec<Line> = logical_lines(content);
     let lines: Vec<Line> = wrap_markdown(&logical, width, PAD)
         .into_iter()
-        .map(|line| line.style(Style::default().fg(MUTED).add_modifier(Modifier::ITALIC)))
+        .map(|line| line.style(Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC)))
         .collect();
     ChatBlock {
         lines,
@@ -574,14 +590,15 @@ pub(crate) fn summary_block(content: &str, width: usize, mode: SymbolMode) -> Ch
 pub(crate) fn build_live_blocks(
     s: &Session,
     width: usize,
-    mode: SymbolMode,
     window: u64,
     start_ctx: &ContextEstimate,
 ) -> (Vec<ChatBlock>, u64) {
     let view = s.view;
     let mut blocks: Vec<ChatBlock> = Vec::new();
     let mut live_ctx = start_ctx.clone();
-    let verified_before = assistant_verified_before(s);
+    // Offene (wachsende) Events sind Schätzungen: immer grau (nie grün), auch
+    // wenn der letzte Historie-Anker eine bestätigte (grüne) Zahl war.
+    live_ctx.green = false;
     // Offene (wachsende) Events chronologisch rendern: offene Assistant-Runden
     // (Reasoning + Text) und offene Tool-Events (Live-Ausgabe). Abgeschlossene
     // Events stehen bereits im Historie-Cache.
@@ -594,15 +611,16 @@ pub(crate) fn build_live_blocks(
                 ..
             } => {
                 if !reasoning.trim().is_empty() {
-                    live_ctx.add_content(ContentKind::Reasoning, estimate_tokens(reasoning));
+                    let r_est = estimate_tokens(reasoning);
+                    live_ctx.add_content(ContentKind::Reasoning, r_est);
+                    live_ctx.block_sum += r_est;
+                    live_ctx.add_used(r_est);
                     if !view.is_overview() {
                         blocks.push(thoughts_block(
                             reasoning,
                             view.thoughts_open(),
                             None,
                             width,
-                            true,
-                            mode,
                             None,
                         ));
                     }
@@ -611,10 +629,11 @@ pub(crate) fn build_live_blocks(
                     let est = estimate_tokens(text);
                     live_ctx.add_content(ContentKind::Content, est);
                     live_ctx.block_sum += est;
+                    live_ctx.add_used(est);
                     if view.is_overview() {
-                        blocks.push(overview_text_line(text, width, &live_ctx, window, None));
+                        blocks.push(overview_text_line(text, width, &live_ctx, window, None, None));
                     } else {
-                        blocks.push(text_block(text, width, mode));
+                        blocks.push(text_block(text, width));
                     }
                 }
                 // Tool-Kinder dieser Runde: offene live (wachsend), beendete
@@ -632,20 +651,29 @@ pub(crate) fn build_live_blocks(
                                 let est = estimate_tokens(&label) + estimate_tokens(out);
                                 live_ctx.add_tool(t, est);
                                 live_ctx.block_sum += est;
+                                live_ctx.add_used(est);
                                 blocks.push(overview_active_tool_line(&label, width, &live_ctx, window));
                             } else if !out.is_empty() {
                                 blocks.push(live_run_block(&label, out, width, view.boxes_open(), true));
                             } else {
                                 blocks.push(active_tool_line(&label, width));
                             }
-                        } else {
-                            if view.is_overview() {
-                                live_ctx.verified_prompt = verified_before.get(tid).copied();
-                                blocks.push(overview_tool_line_chat(tev, width, &mut live_ctx, window));
-                                resync_after(&mut live_ctx);
-                            } else {
-                                blocks.push(tool_block_chat(tev, width, view.boxes_open()));
+                        } else if view.is_overview() {
+                            // Beendetes Tool innerhalb einer noch OFFENEN Runde:
+                            // noch kein Settle-Anker vorhanden → als Schätzung
+                            // weiterlaufen (grau), die Zusammensetzung/Akku wird
+                            // von overview_tool_line_chat gepflegt.
+                            blocks.push(overview_tool_line_chat(tev, width, &mut live_ctx, window));
+                            if let EventKind::Tool {
+                                num_tokens_input,
+                                num_tokens_output,
+                                ..
+                            } = &tev.kind
+                            {
+                                live_ctx.add_used(num_tokens_input + num_tokens_output);
                             }
+                        } else {
+                            blocks.push(tool_block_chat(tev, width, view.boxes_open()));
                         }
                     }
                 }
@@ -658,6 +686,7 @@ pub(crate) fn build_live_blocks(
                     let est = estimate_tokens(&label) + estimate_tokens(out);
                     live_ctx.add_tool("run", est);
                     live_ctx.block_sum += est;
+                    live_ctx.add_used(est);
                     blocks.push(overview_active_tool_line(&label, width, &live_ctx, window));
                 } else if !out.is_empty() {
                     blocks.push(live_run_block(&label, out, width, view.boxes_open(), true));
@@ -671,12 +700,12 @@ pub(crate) fn build_live_blocks(
     if let Some(err) = &s.error {
         let mut lines = vec![Line::from(Span::styled(
             err.clone(),
-            Style::default().fg(ERROR_FG),
+            Style::default().fg(theme().err),
         ))];
         if let Some(path) = &s.error_debug {
             lines.push(Line::from(Span::styled(
                 format!("Debug-Material: {path}"),
-                Style::default().fg(MUTED),
+                Style::default().fg(theme().muted),
             )));
         }
         blocks.push(ChatBlock {
@@ -859,7 +888,7 @@ pub(crate) fn tool_icon(tool: &str) -> &'static str {
 
 /// Dezente Kategorie-Farbe je Werkzeug, angelehnt an die Berechtigungsfarben
 /// (read=blau, write/edit=amber, run=rot) plus eigene Töne für grep (teal),
-/// glob (grün) und webfetch (violett). Unbekanntes fällt auf MUTED zurück.
+/// glob (grün) und webfetch (violett). Unbekanntes fällt auf theme().muted zurück.
 pub(crate) fn tool_color(tool: &str) -> Color {
     match tool {
         "run" => Color::Rgb(232, 138, 138),
@@ -868,7 +897,7 @@ pub(crate) fn tool_color(tool: &str) -> Color {
         "grep" => Color::Rgb(94, 200, 186),
         "glob" => Color::Rgb(129, 201, 149),
         "webfetch" => Color::Rgb(176, 148, 244),
-        _ => MUTED,
+        _ => theme().muted,
     }
 }
 
@@ -905,13 +934,13 @@ pub(crate) enum ContentKind {
 impl ContentKind {
     /// Dezent getrennte Kategorie-Farbe, deutlich abgesetzt von den
     /// Tool-Farben. `Reasoning` und `Content` spiegeln die Chat-Farben ihrer
-    /// Texte: die Gedanken sind zart grau (`MUTED`), der Antworttext ist weiß
+    /// Texte: die Gedanken sind zart grau (`theme().muted`), der Antworttext ist weiß
     /// (Standard-Textfarbe) – dadurch bleiben sie voneinander unterscheidbar.
     pub(crate) fn color(self) -> Color {
         match self {
             ContentKind::Summary => Color::Rgb(198, 146, 108),
             ContentKind::User => Color::White,
-            ContentKind::Reasoning => MUTED,
+            ContentKind::Reasoning => theme().muted,
             ContentKind::Content => Color::Black,
             ContentKind::Other => Color::Rgb(90, 100, 120),
         }
@@ -1083,9 +1112,9 @@ const PARTIAL_LEFT: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', 
 const BAR_SUB: usize = 8;
 
 /// Farbe des ungenutzten / nicht zuordenbaren Rest-Anteils der usage-bar.
-/// Bewusst dunkel (in der Nähe von `BASE_BG`), damit der flächig gefüllte
-/// Leer-Rest dezent bleibt und der sub-zeichengenaue Übergang vom letzten
-/// Farbbereich stimmig (ohne hellen „Streifen“) an ihn anschließt.
+/// Bewusst dunkel, damit der flächig gefüllte Leer-Rest dezent bleibt und der
+/// sub-zeichengenaue Übergang vom letzten Farbbereich stimmig (ohne hellen
+/// „Streifen“) an ihn anschließt.
 const BAR_LEER: Color = Color::Rgb(29, 32, 40);
 
 
@@ -1094,37 +1123,29 @@ const BAR_LEER: Color = Color::Rgb(29, 32, 40);
 /// je Tool-Kategorie ein eigener, farbiger Anteil – kumuliert über alle Aufrufe).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ContextEstimate {
-    /// Geschätzte Gesamt-`total_tokens` bis hierher: die Summe der Event-
-    /// Schätzungen. Sobald eine serverbestätigte `total_tokens` vorliegt,
-    /// springt `used` dorthin (`resync_to`) und die Event-Schätzungen laufen
-    /// auf diesem echten Wert weiter – die erste Zahl der Balken (und damit die
-    /// Gesamtlänge der Bar) ist also „letzte gemeldete total_tokens + Schätzungen
-    /// seitdem“.
+    /// Angezeigte Kontextlänge an dieser Stelle: die gespeicherte
+    /// `context_len` des gerade gerenderten Events (bestätigt, geschätzt oder
+    /// nach Kompaktierung verschoben). Steuert die erste Zahl und die
+    /// Gesamtlänge/Füllung des Balkens.
     pub(crate) used: u64,
+    /// Grün (serverbestätigt und unverschoben) oder grau (Schätzung oder
+    /// durch Kompaktierung verschoben)? On-the-fly abgeleitet: grün ⇔
+    /// `context_len` entspricht noch der ableitbaren bestätigten Zahl
+    /// (`Chat::context_is_green`).
+    pub(crate) green: bool,
     /// Kumulierte Token je Inhalts-Kategorie (Summary/User/Reasoning/Content/Other).
     /// Eine Kompaktierung setzt die Zusammensetzung auf „nur Summary“ zurück.
     pub(crate) contents: [u64; 5],
     /// Je Tool-Kategorie die kumulierten Token (falls dort etwas anfiel).
     pub(crate) tools: Vec<(String, u64)>,
-    /// Vom Server bestätigte Gesamt-`total_tokens` DES GERADE RENDERTEN Turns
-    /// (der abgeschlossenen Abschluss-Zeile mit Usage). Wird nur transitär an
-    /// der Antwort-Zeile dieses Turns gesetzt und danach sofort wieder `None`
-    /// gesetzt – Werkzeug-Zeilen, Zwischen-Kommentare und spätere Runden (die
-    /// nur Schätzungen sind) tragen nie eine Token-Zahl.
-    pub(crate) verified_prompt: Option<u64>,
-    /// Kumulierte Summe der block_token aller bis hierher gezeichneten Blocks.
-    /// Zweite Token-Zahl rechts neben der Server-Annotation; wächst mit jedem
-    /// Block, der in der Übersicht eine Zeile bekommt. Ein `Archive`-Event
+    /// Kumulierte Summe der Event-Token bis hierher (User, Reasoning, Content,
+    /// Tools) – die Schätzung der Context-Größe/Prompt-Länge zu diesem
+    /// Zeitpunkt, unabhängig davon, ob jedes Event in der Übersicht eine eigene
+    /// Zeile bekommt (z. B. auch nicht gezeichnete Gedanken-Runden). Zweite
+    /// (graue) Token-Zahl rechts neben der ersten. Ein `Archive`-Event
     /// (Kompaktierung) setzt sie auf die Summary-Schätzung zurück – danach
     /// summiert erst das nächste Event wieder normal auf.
     pub(crate) block_sum: u64,
-    /// Verschiebung durch die letzte Kompaktierung: Kontextlänge im letzten
-    /// Event VOR der Summary minus der Länge der Summary. Nachfolgende
-    /// serverbestätigte absolute Zahlen (Verifikationen) sind gegen die ALTE
-    /// (vorkompaktierte) Historie gemessen und werden in `resync_to` um genau
-    /// diesen Betrag reduziert; die Estimator-Basis läuft ab der Summary auf
-    /// dem verbleibenden Kontext. Vor einer Kompaktierung ist der Wert 0.
-    pub(crate) compact_shift: u64,
 }
 
 impl ContextEstimate {
@@ -1133,125 +1154,37 @@ impl ContextEstimate {
     pub(crate) fn base() -> Self {
         ContextEstimate {
             used: 0,
+            green: false,
             contents: [0; 5],
             tools: Vec::new(),
-            verified_prompt: None,
             block_sum: 0,
-            compact_shift: 0,
         }
     }
-    /// Bucht Token auf eine Inhalts-Kategorie (und erhöht die Gesamt-`used`).
+    /// Bucht Token auf eine Inhalts-Kategorie NUR für die Balken-Zusammensetzung
+    /// (`contents`) – die Anzeige-Basis `used` wird davon NICHT verändert
+    /// (die hängt am gespeicherten `context_len`-Anker oder an der expliziten
+    /// Live-Erhöhung in `build_live_blocks`).
     pub(crate) fn add_content(&mut self, kind: ContentKind, tokens: u64) {
-        self.used += tokens;
         self.contents[kind as usize] += tokens;
     }
+    /// Wie `add_content`, aber für Tool-Kategorien (Balken-Zusammensetzung).
     pub(crate) fn add_tool(&mut self, tool: &str, tokens: u64) {
-        self.used += tokens;
         match self.tools.iter_mut().find(|(t, _)| t == tool) {
             Some((_, v)) => *v += tokens,
             None => self.tools.push((tool.to_string(), tokens)),
         }
     }
-    /// Korrektur der laufenden Schätzung auf eine serverbestätigte
-    /// `total_tokens`: `used` springt auf den echten Wert, von dem ab die
-    /// Schätzwerte der nachfolgenden Events weiteraddieren („letzte reportete
-    /// total_tokens darüber + Schätzungen seitdem“). `contents`/`tools` bleiben
-    /// unverändert – sie dienen nur der proportionalen Balken-Aufteilung.
-    ///
-    /// Nach einer Kompaktierung (`compact_shift > 0`) ist die bestätigte Zahl
-    /// gegen die ALTE (vorkompaktierte) Historie gemessen; `used` wird um den
-    /// Shift reduziert, damit die Anzeige dem neuen, kürzeren Kontext folgt.
-    /// Vor einer Kompaktierung (Shift 0) verhält sich die Funktion unverändert.
-    pub(crate) fn resync_to(&mut self, total: u64) {
-        self.used = total.saturating_sub(self.compact_shift);
+    /// Erhöht die (Live-)Kontext-Basis um eine wachsende Schätzung (Streaming).
+    pub(crate) fn add_used(&mut self, tokens: u64) {
+        self.used += tokens;
     }
-}
-
-/// Verifikations-Leuchtfeuer: JEDE abgeschlossene Assistant-Runde mit
-/// serverbestätigten `prompt_tokens > 0` verifiziert das unmittelbar VOR ihr
-/// liegende Event – dessen Übersichts-Zeile bekommt die `prompt_tokens` als
-/// grüne Zahl (Kontextstand beim Start dieser Antwort). Unabhängig davon, ob
-/// die Runde Content hat; insbesondere wirken damit auch CONTENT-LOSE Runden
-/// (reine Gedanken), die selbst keine Zeile rendern und darum sonst übersprungen
-/// würden.
-///
-/// Warum Look-back: die vorangehende Zeile wird VOR der Assistant-Runde
-/// gerendert – die Verifikation muss daher vor dem Haupt-Loop vorliegen.
-pub(crate) fn assistant_verified_before(s: &Session) -> std::collections::HashMap<crate::chat::EventId, u64> {
-    let ids: Vec<crate::chat::EventId> = s.chat.order().to_vec();
-    let mut out = std::collections::HashMap::new();
-    for j in 1..ids.len() {
-        let Some(ev) = s.chat.event(ids[j]) else {
-            continue;
-        };
-        let EventKind::Assistant { reported_usage, .. } = &ev.kind else {
-            continue;
-        };
-        if ev.time_end.is_none() || reported_usage.prompt_tokens == 0 {
-            continue;
-        }
-        out.insert(ids[j - 1], reported_usage.prompt_tokens);
+    /// Setzt die Kontext-Anzeige auf die gespeicherte Kontextlänge eines Events
+    /// (`context_len`); `green` steuert die Farbe – grün nur für unverschobene
+    /// Server-Bestätigungen, sonst grau (Schätzung oder Kompaktierungs-Shift).
+    pub(crate) fn set_anchor(&mut self, len: u64, green: bool) {
+        self.used = len;
+        self.green = green;
     }
-    out
-}
-
-/// Re-anchor-`used` auf den zuvor gesetzten verifizierten Wert einer
-/// Übersichts-Zeile. Läuft IMMER NACH dem Rendern der Zeile, weil der Aufrufer
-/// vorher die Event-Schätzung des Blocks addiert haben kann (z. B. `add_tool`)
-/// – der absolute verifizierte Wert enthält diesen Beitrag bereits und ersetzt
-/// die Schätzung so ohne Doppelzählung. Eine verifizierte Zeile wird damit zum
-/// neuen `used`-Anker: alle Folgezeilen rechnen auf der bestätigten Basis weiter.
-pub(crate) fn resync_after(ctx: &mut ContextEstimate) {
-    if let Some(v) = ctx.verified_prompt.take() {
-        ctx.resync_to(v);
-    }
-}
-
-/// Serverbestätigte Kontext-Zahl einer abgeschlossenen Assistant-Runde, an der
-/// die erste Spalte synchronisiert wird.
-///
-/// Abschlussantworten (ohne tool_calls) liefern `total_tokens` (unverändert –
-/// das ist für die finale Antwort gewollt). Enthält die Runde Tool-Calls,
-/// werden deren Aufruf-Tokens ausgenommen:
-/// `total_tokens − ∑ tool_calls` = `prompt_tokens + reasoning + content` –
-/// die Tool-Argumente zählen nicht zum persistenten Kontext der Spalte.
-///
-/// Bevorzugt wird die beim Streaming gemessene Aufschlüsselung
-/// (`completion_parts`); fehlt sie, liefern die angehängten Tool-Events
-/// (`num_tokens_input`) die Call-Token-Summe.
-pub(crate) fn assistant_sync_ctx(ev: &ChatEvent, s: &Session) -> Option<u64> {
-    let EventKind::Assistant {
-        reported_usage,
-        tool_event_ids,
-        completion_parts,
-        ..
-    } = &ev.kind
-    else {
-        return None;
-    };
-    if reported_usage.total_tokens == 0 {
-        return None;
-    }
-    // Gemessene Aufschlüsselung (exakt aus den usage-Inkrementen).
-    if let Some(p) = completion_parts {
-        if !p.tool_calls.is_empty() {
-            return Some(reported_usage.prompt_tokens + p.reasoning + p.content);
-        }
-        return Some(reported_usage.total_tokens);
-    }
-    // Keine parts: Tool-Call-Länge aus den angehängten Tool-Events ableiten.
-    let tool_len: u64 = tool_event_ids
-        .iter()
-        .filter_map(|tid| s.chat.event(*tid))
-        .filter_map(|t| match &t.kind {
-            EventKind::Tool { num_tokens_input, .. } => Some(*num_tokens_input),
-            _ => None,
-        })
-        .sum();
-    if tool_len > 0 {
-        return Some(reported_usage.total_tokens.saturating_sub(tool_len));
-    }
-    Some(reported_usage.total_tokens)
 }
 
 /// Rechter Balken einer Übersichts-Zeile: volle Länge = Kontext-Window,
@@ -1268,18 +1201,18 @@ pub(crate) fn context_bar(ctx: &ContextEstimate, window: u64, cells: usize) -> V
         let w = s.chars().map(char_w).sum::<usize>();
         format!("{s}{}", " ".repeat(cells.saturating_sub(w)))
     }
-    // Erste Zahl neben dem Balken: die Gesamt-`total_tokens` an dieser Stelle.
-    // Liegt eine Server-Bestätigung vor (`verified_prompt`), wird sie exakt
-    // (grün) angezeigt; sonst die Schätzung (grau) = letzte gemeldete
-    // `total_tokens` + die Event-Schätzungen seitdem – so steht neben JEDEM
-    // Balken eine Kontext-Zahl, nicht nur auf bestätigten Zeilen.
-    let ctx_ann = match ctx.verified_prompt {
-        Some(vp) => (pad_ann(format!(" {}", fmt_ctx(vp)), CONTEXT_ANN_CELLS), SYM_OK),
-        None => (pad_ann(format!(" {}", fmt_ctx(ctx.used)), CONTEXT_ANN_CELLS), MUTED),
-    };
-    // Zweite Zahl direkt dahinter: die Summe der block_token aller Blocks bis
-    // hierher (` 99.9kT`). Wird IMMER reserviert (Balken entsprechend kürzer),
-    // damit beides in eine Zeile passt; bei noch 0 Blocks bleibt das Feld auf
+    // Erste Zahl neben dem Balken: die gespeicherte Kontextlänge dieses Events
+    // (`ctx.used`, gesetzt aus der `context_len` des Events). Grün ⇔ sie ist
+    // noch die ableitbare serverbestätigte Zahl (`ctx.green`); sonst grau
+    // (Schätzung oder nach Kompaktierung verschobene Rest-Kontextlänge).
+    let ctx_ann = (
+        pad_ann(format!(" {}", fmt_ctx(ctx.used)), CONTEXT_ANN_CELLS),
+        if ctx.green { theme().ok } else { theme().muted },
+    );
+    // Zweite Zahl direkt dahinter: die kumulierte Context-Schätzung bis hierher
+    // (` 99.9kT`) – d. h. auch Anteile, die im Overview keine Zeile bekommen
+    // (z. B. Reasoning). Wird IMMER reserviert (Balken entsprechend kürzer),
+    // damit beides in eine Zeile passt; bei noch 0 Tokens bleibt das Feld auf
     // voller Breite leer, damit die Spalte auch dann stabil bleibt.
     let block_sum_ann = if ctx.block_sum > 0 {
         pad_ann(format!(" {}", fmt_ctx(ctx.block_sum)), CONTEXT_BLOCKSUM_CELLS)
@@ -1394,10 +1327,10 @@ pub(crate) fn context_bar(ctx: &ContextEstimate, window: u64, cells: usize) -> V
     // Erste Zahl: Kontextgröße (grün = exakt vom Server bestätigt, sonst graue
     // Schätzung) – immer sichtbar.
     spans.push(Span::styled(ctx_ann.0, Style::default().fg(ctx_ann.1)));
-    // Zweite Zahl direkt dahinter: Summe der block_token aller Blocks bis
-    // hierher (dezent, grau) – die laufende Summe der Schätzwerte je Block.
-    // Immer mit voller Budget-Breite (auch leer), damit die Spalte fix bleibt.
-    spans.push(Span::styled(block_sum_ann, Style::default().fg(MUTED)));
+    // Zweite Zahl direkt dahinter: kumulierte Context-Schätzung bis hierher
+    // (dezent, grau) – inkl. nicht gezeichneter Anteile wie Reasoning. Immer
+    // mit voller Budget-Breite (auch leer), damit die Spalte fix bleibt.
+    spans.push(Span::styled(block_sum_ann, Style::default().fg(theme().muted)));
     spans
 }
 
@@ -1428,7 +1361,7 @@ fn overview_line(
     // den Text dafür entsprechend früher gekürzt.
     spans.push(Span::raw(" ".repeat(left_w.saturating_sub(used + ann_w))));
     if let Some(ann) = annotation {
-        spans.push(Span::styled(ann, Style::default().fg(MUTED)));
+        spans.push(Span::styled(ann, Style::default().fg(theme().muted)));
     }
     // Eine Leerzelle Abstand: der Balken beginnt dadurch auf allen Zeilen in
     // derselben Spalte.
@@ -1471,12 +1404,21 @@ pub(crate) fn overview_row(
 /// Leerzeichen), rendert Markdown (fett/italic/code-span) und kürzt gestylt
 /// auf den verfügbaren Platz links vom Context-Balken. Die Token-Annotation
 /// steht rechtsbündig kurz vor dem Balken (nicht direkt hinter dem Text).
+/// `block_tokens` ist die Text-Tokenzahl; bei Events, die zusätzlich
+/// Reasoning enthalten (`reasoning_tokens`), werden BEIDE einzeln als
+/// „res+txt“ angezeigt (analog zur Tool-Call+Antwort-Notation). Nur ohne
+/// Reasoning bleibt es bei der einzelnen Zahl wie bisher.
+///
+/// Erreichbarkeit: Diese Funktion rendert NUR Text-Zeilen (Aufrufer laufen
+/// hinter `if !text.trim().is_empty()`); reine Reasoning-Events ohne Text
+/// werden in der Übersicht übersprungen und erreichen sie nie.
 pub(crate) fn overview_text_line(
     text: &str,
     width: usize,
     ctx: &ContextEstimate,
     window: u64,
     block_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
 ) -> ChatBlock {
     let total = width.saturating_sub(PAD + PAD_R).max(1);
     let bar_w = (total / 3).max(4);
@@ -1498,9 +1440,24 @@ pub(crate) fn overview_text_line(
         }
     }
 
-    // Annotation inkl. führendem Leerzeichen (` 123`); der Text wird dafür
-    // früher gekürzt, damit die Zahl rechtsbündig vor dem Balken Platz findet.
-    let ann = block_tokens.map(|t| format!(" {t}"));
+    // Annotation inkl. führendem Leerzeichen; der Text wird dafür früher
+    // gekürzt, damit die Zahl rechtsbündig vor dem Balken Platz findet.
+    //
+    // Real erreichbare Kombinationen:
+    //  - Historie, Reasoning + Text mit abgeleiteter Tokenzahl → „r+t“
+    //  - Historie, Reasoning + Text ohne abgeleitete Token (0, kein Usage)
+    //    → nur „r“ (der Text trägt dann 0 Tokens bei)
+    //  - Historie, nur Text (kein Reasoning) → einzelne Zahl wie bisher
+    //  - beide `None` → nur Live-Tail (wachsende Schätzung: absichtlich keine
+    //    Annotation). `(Some, None)` („nur Reasoning“) ist unerreichbar, weil
+    //    text-lose Events an den `!text.trim().is_empty()`-Gates übersprungen
+    //    werden – der Arm steht nur für die Match-Vollständigkeit.
+    let ann = match (reasoning_tokens, block_tokens) {
+        (Some(r), Some(t)) if r > 0 && t > 0 => Some(format!(" {r}+{t}")),
+        (Some(r), _) => Some(format!(" {r}")),
+        (None, Some(t)) => Some(format!(" {t}")),
+        (None, None) => None,
+    };
     let ann_w = ann.as_ref().map(|a| disp_width(a)).unwrap_or(0);
     let styled = truncate_styled_spans(flat_spans, left_w.saturating_sub(ann_w));
     overview_line(styled, ann, width, ctx, window, false)
@@ -1508,7 +1465,7 @@ pub(crate) fn overview_text_line(
 
 /// Einzeilige USER-Eingabe der Übersicht: exakt wie `overview_text_line` (1
 /// Zeile + „ …“ + optionaler Token-Zahl direkt vor dem Balken), aber auf dem
-/// `INPUT_BG`-Band und mit der Berechtigungsfarbe (falls vorhanden). Der
+/// `theme().band_bg`-Band und mit der Berechtigungsfarbe (falls vorhanden). Der
 /// aufrufende `build_history_cache` liefert die abgeleitete Turn-Usage
 /// (`num_tokens`, sonst Schätzung) und trägt über `ctx.verified_prompt` die
 /// bestätigte Gesamt-Usage als grüne Zahl.
@@ -1520,8 +1477,8 @@ pub(crate) fn overview_user_line(
     permission: Option<Permission>,
     tokens: Option<u64>,
 ) -> ChatBlock {
-    let mut blk = overview_text_line(text, width, ctx, window, tokens);
-    blk.bg = Some(INPUT_BG);
+    let mut blk = overview_text_line(text, width, ctx, window, tokens, None);
+    blk.bg = Some(theme().band_bg);
     if let Some(p) = permission {
         let color = permission_color(p);
         for span in &mut blk.lines[0].spans {
@@ -1548,7 +1505,7 @@ fn overview_summary_line(
     tokens: u64,
 ) -> ChatBlock {
     let flat = flatten_for_overview(text);
-    let style = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+    let style = Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC);
     overview_row(
         flat,
         style,
@@ -1577,10 +1534,10 @@ pub(crate) fn live_run_block(
     let box_width = width.saturating_sub(2 * BOX_MARGIN).max(6);
     let content_width = box_width.saturating_sub(2 + 2 * BOX_PAD).max(1);
 
-    let border = Style::default().fg(BOX_BORDER).bg(BOX_BG);
-    let header_style = Style::default().fg(MUTED).bg(BOX_BG);
-    let content_style = Style::default().fg(BOX_TEXT).bg(BOX_BG);
-    let muted = Style::default().fg(MUTED).bg(BOX_BG);
+    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
+    let header_style = Style::default().fg(theme().muted).bg(theme().surface_bg);
+    let content_style = Style::default().fg(theme().surface_fg).bg(theme().surface_bg);
+    let muted = Style::default().fg(theme().muted).bg(theme().surface_bg);
 
     let header = format!("⚙ {label}");
     let out_rows = wrap_preformatted(output.trim_end(), content_width);
@@ -1625,11 +1582,11 @@ pub(crate) fn box_edge(width: usize, box_width: usize, style: Style, top: bool) 
     let inner = box_width.saturating_sub(2);
     let right = width.saturating_sub(BOX_MARGIN + box_width);
     let spans = vec![
-        Span::styled(" ".repeat(BOX_MARGIN), Style::default().bg(BASE_BG)),
+        Span::styled(" ".repeat(BOX_MARGIN), Style::default().bg(CANVAS_BG)),
         Span::styled(l.to_string(), style),
         Span::styled("─".repeat(inner), style),
         Span::styled(r.to_string(), style),
-        Span::styled(" ".repeat(right), Style::default().bg(BASE_BG)),
+        Span::styled(" ".repeat(right), Style::default().bg(CANVAS_BG)),
     ];
     Line::from(spans)
 }
@@ -1639,15 +1596,15 @@ pub(crate) fn box_edge(width: usize, box_width: usize, style: Style, top: bool) 
 pub(crate) fn box_line(width: usize, box_width: usize, text: &str, style: Style) -> Line<'static> {
     let content_width = box_width.saturating_sub(2 + 2 * BOX_PAD).max(1);
     let right = width.saturating_sub(BOX_MARGIN + box_width);
-    let border = Style::default().fg(BOX_BORDER).bg(BOX_BG);
+    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
     let spans = vec![
-        Span::styled(" ".repeat(BOX_MARGIN), Style::default().bg(BASE_BG)),
+        Span::styled(" ".repeat(BOX_MARGIN), Style::default().bg(CANVAS_BG)),
         Span::styled("│", border),
         Span::styled(" ".repeat(BOX_PAD), style),
         Span::styled(pad_to(text, content_width), style),
         Span::styled(" ".repeat(BOX_PAD), style),
         Span::styled("│", border),
-        Span::styled(" ".repeat(right), Style::default().bg(BASE_BG)),
+        Span::styled(" ".repeat(right), Style::default().bg(CANVAS_BG)),
     ];
     Line::from(spans)
 }
@@ -1749,8 +1706,8 @@ pub(crate) fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
 
 /// Eigenständiger Text-Block für eine chronologisch verortete Äußerung des
 /// Modells (Zwischen-Statement vor einem Tool oder die finale Antwort).
-pub(crate) fn text_block(text: &str, width: usize, mode: SymbolMode) -> ChatBlock {
-    let logical = decorate_emphasis(decorate_symbols(logical_lines(text), mode));
+pub(crate) fn text_block(text: &str, width: usize) -> ChatBlock {
+    let logical = decorate_emphasis(logical_lines(text));
     ChatBlock {
         lines: wrap_markdown(&logical, width, PAD),
         bg: None,
@@ -1760,61 +1717,131 @@ pub(crate) fn text_block(text: &str, width: usize, mode: SymbolMode) -> ChatBloc
     }
 }
 
-/// Aufklappbares Gedanken-Element, zart in Grau: „▸/▾ Gedanken“-Kopfzeile,
-/// zusammengeklappt zusätzlich mit der Gedanken-Dauer als Hinweis.
+/// Gedanken-Element in zartem Grau.
+///
+/// Je nach Zoom-Stufe:
+/// - **Detail** (`open`): der ganze Reasoning-Inhalt, mehrzeilig, ab Spalte 4
+///   eingerückt; nur in der **ersten** Zeile steht zusätzlich das Gedanken-Icon
+///   in Spalte 2.
+/// - **Mittlere Stufen** (Dialog/Kompakt, `open=false`): eine einzige Zeile mit
+///   dem Icon `U+1F5ED` in Spalte 2 und dem tatsächlichen Reasoning-Inhalt ab
+///   Spalte 4 – Zeilenumbrüche werden zu Leerzeichen, Überlauf mit „…“ gekürzt
+///   (analog zu den komprimierten Overview-Texten).
+///
+/// `duration`/`block_tokens` (Gedanken-Dauer/Token-Annotation) bleiben in den
+/// kompakten Stufen bewusst ungenutzt – dort steht nur Icon + Inhalt.
 pub(crate) fn thoughts_block(
     reasoning: &str,
     open: bool,
-    duration: Option<u64>,
+    _duration: Option<u64>,
     width: usize,
-    streaming: bool,
-    mode: SymbolMode,
-    block_tokens: Option<u64>,
+    _block_tokens: Option<u64>,
 ) -> ChatBlock {
-    let gray = Style::default().fg(MUTED);
-    let header = match (open, duration, streaming) {
-        (true, _, _) => "▾ Gedanken".to_string(),
-        (false, Some(ms), _) => format!("▸ Gedanken · {}", fmt_duration(ms)),
-        (false, None, true) => "▸ Gedanken…".to_string(),
-        (false, None, false) => "▸ Gedanken".to_string(),
-    };
-    // Token-Annotation an den Header anhängen
-    let header = if let Some(tokens) = block_tokens {
-        format!("{header} · ~{tokens}T")
-    } else {
-        header
-    };
-    let mut logical = vec![Line::from(Span::styled(
-        header,
-        gray.add_modifier(Modifier::ITALIC),
-    ))];
+    let gray = Style::default().fg(theme().muted);
     if open {
-        let mut body = Vec::new();
-        render_markdown(reasoning, &mut body);
-        for line in &mut body {
+        // Detailansicht: voller Inhalt, mehrzeilig eingerückt (Spalte 4).
+        let mut logical = Vec::new();
+        render_markdown(reasoning, &mut logical);
+        for line in &mut logical {
             for span in &mut line.spans {
-                span.style = span.style.fg(MUTED);
+                span.style = span.style.fg(theme().muted);
             }
         }
-        logical.extend(body);
-    }
-    ChatBlock {
-        lines: wrap_markdown(&decorate_symbols(logical, mode), width, THOUGHT_INDENT),
-        bg: None,
-        gap: 0,
-        is_tool: false,
+        let mut lines = wrap_markdown(&logical, width, THOUGHT_INDENT);
+        // Icon nur in der ersten Zeile: Spalte 2, Text beginnt weiterhin Spalte 4.
+        if let Some(first) = lines.first_mut() {
+            prepend_thought_icon(first);
+        }
+        ChatBlock {
+            lines,
+            bg: None,
+            gap: 0,
+            is_tool: false,
 
+        }
+    } else {
+        // Komprimierter Einzeiler (Zoom 2+3): Icon U+1F5ED in Spalte 2, Inhalt
+        // ab Spalte 4; Überlauf wird mit „…“ gekürzt (wie die Overview-Texte).
+        let flat = flatten_for_overview(reasoning);
+        let budget = width.saturating_sub(THOUGHT_INDENT + PAD_R).max(1);
+        let mut spans = thought_icon_band(gray);
+        spans.extend(truncate_styled_spans(vec![Span::raw(flat)], budget));
+        let line = Line::from(spans).style(gray);
+        ChatBlock {
+            lines: vec![line],
+            bg: None,
+            gap: 0,
+            is_tool: false,
+
+        }
     }
 }
 
-/// Dauer lesbar formatieren (z. B. „340 ms“, „52 s“, „2 m 05 s“).
+/// Gedanken-Icon (kein Emoji-Ballon, siehe Vorgabe).
+const THOUGHT_ICON: char = '\u{1F5ED}';
+
+/// Baut den Vorspann „Icon in Spalte 2, danach (je nach Icon-Breite) so viel
+/// Leerraum, dass der folgende Text in Spalte 4 (`THOUGHT_INDENT`) beginnt.
+fn thought_icon_band(style: Style) -> Vec<Span<'static>> {
+    let icon_w = char_w(THOUGHT_ICON);
+    let after = THOUGHT_INDENT.saturating_sub(2 + icon_w);
+    vec![
+        Span::raw(" ".repeat(2)),
+        Span::styled(THOUGHT_ICON.to_string(), style),
+        Span::raw(" ".repeat(after)),
+    ]
+}
+
+/// Setzt vor die erste Zeile einer mehrzeiligen Gedankenansicht (Detail) das
+/// Icon in Spalte 2; der Text startet danach weiterhin in Spalte 4. Dazu wird
+/// das von `wrap_markdown` vorangestellte Leerzeichen-Pad entfernt und durch
+/// das Icon-Band ersetzt.
+fn prepend_thought_icon(first: &mut Line<'static>) {
+    strip_leading_pad(first, THOUGHT_INDENT);
+    let mut spans = thought_icon_band(Style::default().fg(theme().muted));
+    spans.append(&mut first.spans);
+    *first = Line::from(spans).style(first.style);
+}
+
+/// Entfernt genau die ersten `n` Leerzeichen aus den führenden Spans einer
+/// Zeile (das Pad, das `wrap_markdown`/`wrap_block` vor jede Zeile stellen).
+/// Ein Span, der dabei vollständig geleert wird, verschwindet.
+fn strip_leading_pad(line: &mut Line<'static>, n: usize) {
+    let spans: Vec<Span<'static>> = std::mem::take(&mut line.spans);
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut remove = n;
+    for span in spans {
+        if remove == 0 {
+            out.push(span);
+            continue;
+        }
+        let s = span.content.clone().into_owned();
+        let lead: String = s.chars().take_while(|c| *c == ' ').take(remove).collect();
+        let removed = lead.chars().count();
+        remove -= removed;
+        if removed == 0 {
+            out.push(span);
+        } else if removed == s.chars().count() {
+            // Span bestand nur aus Pad-Spaces → ganz verwerfen.
+            continue;
+        } else {
+            // Nur den führenden Pad-Teil entfernen, Rest samt Style behalten.
+            let rest = s[removed..].to_string();
+            out.push(Span::styled(rest, span.style));
+        }
+    }
+    line.spans = out;
+}
+
+/// Dauer lesbar formatieren (z. B. „340 ms“, „52 s“, „3.4 s“, „2 m 05 s“).
+/// Der Dezimaltrenner ist – wie bei `fmt_tps` – der Punkt („.“).
 pub(crate) fn fmt_duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms} ms")
     } else if ms.is_multiple_of(1000) {
         format!("{} s", ms / 1000)
     } else if ms < 60_000 {
-        format!("{:.1} s", ms as f64 / 1000.0).replace('.', ",")
+        format!("{:.1} s", ms as f64 / 1000.0)
     } else {
         format!("{} m {:02} s", ms / 60_000, (ms % 60_000) / 1000)
     }
@@ -1835,13 +1862,13 @@ pub(crate) fn diff_block(
     open: bool,
 ) -> ChatBlock {
     let box_width = width.saturating_sub(2 * BOX_MARGIN).max(6);
-    let border = Style::default().fg(BOX_BORDER).bg(BOX_BG);
+    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
     let header_style = if ok {
-        Style::default().fg(MUTED).bg(BOX_BG)
+        Style::default().fg(theme().muted).bg(theme().surface_bg)
     } else {
-        Style::default().fg(ERROR_DIM).bg(BOX_BG)
+        Style::default().fg(theme().err_dim).bg(theme().surface_bg)
     };
-    let content_style = Style::default().fg(BOX_TEXT).bg(BOX_BG);
+    let content_style = Style::default().fg(theme().surface_fg).bg(theme().surface_bg);
 
     let max_num = diff
         .rows
@@ -1879,7 +1906,7 @@ pub(crate) fn diff_block(
             width,
             box_width,
             "…",
-            Style::default().fg(MUTED).bg(BOX_BG),
+            Style::default().fg(theme().muted).bg(theme().surface_bg),
         ));
     }
     lines.push(box_edge(width, box_width, border, false));
@@ -1913,19 +1940,19 @@ pub(crate) fn diff_row_lines(
 ) -> Vec<Line<'static>> {
     let content_inner = box_width.saturating_sub(2 + 2 * BOX_PAD).max(2);
     let right = width.saturating_sub(BOX_MARGIN + box_width);
-    let border = Style::default().fg(BOX_BORDER).bg(BOX_BG);
+    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
 
     let del = CellStyle {
         marker: '-',
-        base: Style::default().fg(DIFF_DEL_FG).bg(DIFF_DEL_BG),
-        mark: Style::default().fg(DIFF_DEL_FG).bg(DIFF_DEL_MARK_BG),
-        num_style: Style::default().fg(DIFF_DEL_FG).bg(DIFF_DEL_BG),
+        base: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_bg),
+        mark: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_mark_bg),
+        num_style: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_bg),
     };
     let add = CellStyle {
         marker: '+',
-        base: Style::default().fg(DIFF_ADD_FG).bg(DIFF_ADD_BG),
-        mark: Style::default().fg(DIFF_ADD_FG).bg(DIFF_ADD_MARK_BG),
-        num_style: Style::default().fg(DIFF_ADD_FG).bg(DIFF_ADD_BG),
+        base: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_bg),
+        mark: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_mark_bg),
+        num_style: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_bg),
     };
     let ctx = CellStyle {
         marker: ' ',
@@ -1939,7 +1966,7 @@ pub(crate) fn diff_row_lines(
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(
             " ".repeat(BOX_MARGIN),
-            Style::default().bg(BASE_BG),
+            Style::default().bg(CANVAS_BG),
         ));
         spans.push(Span::styled("│", border));
         spans.push(Span::styled(" ".repeat(BOX_PAD), content_style));
@@ -1954,7 +1981,7 @@ pub(crate) fn diff_row_lines(
         spans.push(Span::styled("│", border));
         spans.push(Span::styled(
             " ".repeat(right),
-            Style::default().bg(BASE_BG),
+            Style::default().bg(CANVAS_BG),
         ));
         Line::from(spans)
     };

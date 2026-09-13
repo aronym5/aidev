@@ -14,19 +14,21 @@ use crate::config::Config;
 use crate::llm::WorkerEvent;
 use crate::ui;
 
+mod list;
+pub(crate) use list::{ListNav, Selection};
+
 mod types;
 pub use types::*;
 
 mod session;
 pub(crate) use session::{
-    apply_channel_permission_default, apply_default_channel, prompt_chars, should_compact,
+    apply_channel_permission_default, apply_default_channel, prompt_tokens, should_compact,
     LiveChannel,
 };
 pub use session::{ChatAnchor, Session, ViewLevel};
 
 mod commands;
 pub(crate) use commands::path_tail;
-pub(crate) use types::step_cursor;
 
 mod builder;
 mod close;
@@ -35,45 +37,56 @@ pub(crate) mod models;
 mod picker;
 mod worker;
 
+/// Ein Eintrag des Kanal-Auswahl-Dialogs. Ersetzt die frühere Parallel-
+/// Struktur `items: Vec<String>` + `keys: Vec<Option<String>>`: Jeder Eintrag
+/// trägt selbst mit, ob er den Kanal-Builder öffnet oder einen echten Kanal
+/// (nach Name im Registry nachschlagbar) repräsentiert.
+pub(crate) enum ChannelPick {
+    /// „(kein Kanal)“ – Index 0; löst die Session vom Kanal.
+    NoChannel,
+    /// „new channel“ – letzter Eintrag; öffnet den Channel Builder.
+    NewChannel,
+    /// Bestehender Kanal (Name für den Registry-Zugriff).
+    Channel { name: String },
+}
+
+/// Ein Eintrag des Modell-Auswahl-Dialogs. „(Standard)“ ist ein echter
+/// Eintrag an Position 0, wenn das Default-Modell nicht unter den
+/// konfigurierten Modellen vorkommt – damit entfällt der frühere
+/// Cursor-Offset (`show_default`) komplett.
+pub(crate) enum ModelPick {
+    /// „(Standard)“ – Default-Modell der Konfiguration.
+    Default,
+    /// Konfiguriertes/fetched Modell (Key zum Nachschlagen + Anzeige).
+    Model { key: String, display: String },
+}
+
 /// Geöffneter Channel-Auswahl-Dialog für die aktive Session.
 pub struct ChannelPicker {
-    /// Auswahlzeilen; Index 0 ist immer „(kein Kanal)“.
-    pub items: Vec<String>,
-    /// Tatsächliche Channel-Namen (zum Nachschlagen im Registry).
-    /// Index 0 ist None (für „(kein Kanal)“).
-    pub keys: Vec<Option<String>>,
-    pub cursor: usize,
+    pub items: Selection<ChannelPick>,
 }
 
 /// Geöffneter Modell-Auswahl-Dialog (`/model` ohne Argument).
-/// Enthält alle konfigurierten Aliase in config.toml-Reihenfolge.
-/// „(Standard)" erscheint nur als eigener Eintrag, wenn das Default-Modell
-/// bei den konfigurierten Modellen fehlt.
+/// Enthält alle konfigurierten Aliase in config.toml-Reihenfolge;
+/// „(Standard)“ als eigener Eintrag, wenn das Default-Modell fehlt.
 pub struct ModelPicker {
-    /// Einträge `(interner_key, display_full)` – z.B. `("openai/fast", "openai/fast (gpt-4o-mini)")`.
-    pub items: Vec<(String, String)>,
-    /// `true`, wenn „(Standard)" als erster Eintrag angezeigt wird.
-    pub show_default: bool,
-    pub cursor: usize,
+    pub items: Selection<ModelPick>,
     /// `true` solange eine asynchrone Modell-Listen-Aktualisierung läuft.
     pub loading: bool,
 }
 
 /// Geöffneter Channel Builder – dreispaltiger Dialog zur Kanal-Erzeugung.
+/// Jede Spalte ist eine `Selection` (Umlauf-Navigation, `with_wrap`).
 pub struct ChannelBuilderState {
-    /// Tunnel-Optionen: Local zuerst, dann benannte Podman-Images
-    pub tunnels: Vec<crate::channel::builder::Tunnel>,
-    /// Host/Repo-Pfade: Config + cwd + argv, dedupliziert
-    pub host_paths: Vec<crate::channel::builder::HostPath>,
-    /// Worktrees des aktuell gewählten Host-Pfads
-    pub worktrees: Vec<crate::channel::builder::WorktreeEntry>,
+    /// Tunnel-Optionen: Local zuerst, dann benannte Podman-Images.
+    pub tunnels: Selection<crate::channel::builder::Tunnel>,
+    /// Host/Repo-Pfade: Config + cwd + argv, dedupliziert.
+    pub host_paths: Selection<crate::channel::builder::HostPath>,
+    /// Worktrees des aktuell gewählten Host-Pfads.
+    pub worktrees: Selection<crate::channel::builder::WorktreeEntry>,
 
-    // --- Cursor ---
-    /// Aktive Spalte (0=Tunnel, 1=Host, 2=Worktree)
+    /// Aktive Spalte (0=Tunnel, 1=Host, 2=Worktree).
     pub col: usize,
-    pub tunnel_idx: usize,
-    pub host_idx: usize,
-    pub worktree_idx: usize,
 
     // --- Container-Status ---
     pub container_info: Option<crate::channel::builder::ContainerInfo>,
@@ -86,10 +99,21 @@ pub struct ChannelBuilderState {
     /// argv-Pfad (sofern von außen übergeben)
     pub argv_path: Option<String>,
 
-    // --- Pfad-Input ---
-    /// Offenes Eingabefeld für einen benutzerdefinierten Host-Pfad (`A`-Taste).
-    /// `Some(editor)` = Pfad-Input ist aktiv, `None` = normaler Builder-Modus.
-    pub host_path_edit: Option<crate::editor::Editor>,
+    // --- Inline-Eingabefelder (Modal) ---
+    /// Offenes Eingabefeld im Builder: Pfad (`a`, Host-Spalte) oder neuer
+    /// Branch (`b`, Worktree-Spalte). `Some(..)` = Eingabe aktiv.
+    pub edit: Option<BuilderEdit>,
+    /// Fehlermeldung aus der letzten Eingabe (wird rot unter dem Editor
+    /// angezeigt, bis das Eingabefeld geschlossen wird).
+    pub edit_error: Option<String>,
+}
+
+/// Art des offenen Inline-Eingabefelds im Channel Builder.
+pub(crate) enum BuilderEdit {
+    /// Benutzerdefinierter Host-Pfad (`A`-Taste, Spalte 1).
+    HostPath(crate::editor::Editor),
+    /// Name des neuen Branches (`B`-Taste, Spalte 2 nur bei Repo).
+    Branch(crate::editor::Editor),
 }
 
 pub struct App {
@@ -124,6 +148,9 @@ pub struct App {
     pub channel_close: Option<ChannelClose>,
     /// Offener Bestätigungsdialog für `/branch` wenn der Branch schon existiert.
     pub branch_confirm: Option<BranchConfirm>,
+    /// Offener Bestätigungsdialog: eingegebener Host-Pfad existiert nicht
+    /// (Enter = anlegen mit `mkdir -p`, Esc = zurück zur Pfad-Eingabe).
+    pub path_confirm: Option<PathConfirm>,
     /// Offener Options-Dialog (Ctrl+O).
     pub options_dialog: Option<OptionsDialog>,
     /// Offener HTTP-Header-Dialog der letzten LLM-Antwort (`Alt+H`).
@@ -154,6 +181,10 @@ pub struct App {
     /// Zeitpunkt der letzten Reiter-Titel-Berechnung. Crate-intern, damit
     /// Tests die 1-s-Frist gezielt ablaufen lassen können.
     pub(crate) tab_labels_at: Instant,
+    /// Zuletzt gesetzter Terminal-Titel (gecacht, damit nur bei Änderung
+    /// geschrieben wird). Format `aidev · <status> · <tab>`, siehe
+    /// [`App::update_terminal_title`].
+    pub(crate) terminal_title: String,
 }
 
 /// Überträgt den konfigurierten Default-Kanal auf eine neue Session und setzt
@@ -278,6 +309,7 @@ impl App {
             stop_confirm: None,
             channel_close: None,
             branch_confirm: None,
+            path_confirm: None,
             options_dialog: None,
             http_headers_dialog: false,
             pending_esc: false,
@@ -291,6 +323,7 @@ impl App {
             git_status_checked: Instant::now() - Duration::from_secs(2),
             tab_labels: Vec::new(),
             tab_labels_at: Instant::now() - Duration::from_secs(2),
+            terminal_title: String::new(),
         };
         // Auch die erste Session übernimmt den konfigurierten Default-Kanal.
         apply_default_channel(&app.channels, &mut app.sessions[0]);
@@ -338,7 +371,12 @@ impl App {
     /// - Kanal mit bloßem Host-Verzeichnis → Ordnername
     /// - ohne Kanal → Modellname (Alias oder konfigurierte ID)
     fn session_tab_label(&self, idx: usize) -> String {
-        let n = idx + 1;
+        format!("{}: {}", idx + 1, self.session_label(idx))
+    }
+
+    /// Reiner Tab-Titel einer Session (`session_tab_label` ohne das `n: `-
+    /// Präfix) – auch die Basis für den Terminal-Titel der aktiven Session.
+    fn session_label(&self, idx: usize) -> String {
         match self.sessions[idx]
             .channel
             .as_ref()
@@ -348,13 +386,12 @@ impl App {
                 // Identisch zur Statusleiste: `git_status_info` liefert schon
                 // `branch@repo` (Repo-Name vom Haupt-Repo, Branch vom Worktree
                 // – wird nur max. 1×/s pro Session aufgerufen).
-                let label = crate::ui::git_status_info(&host)
+                crate::ui::git_status_info(&host)
                     .map(|info| info.label)
-                    .unwrap_or_else(|| "?@?".to_string());
-                format!("{n}: {label}")
+                    .unwrap_or_else(|| "?@?".to_string())
             }
-            Some(host) => format!("{n}: {}", path_tail(&host)),
-            None => format!("{n}: {}", self.display_model(idx)),
+            Some(host) => path_tail(&host),
+            None => self.display_model(idx),
         }
     }
 
@@ -370,6 +407,61 @@ impl App {
         self.tab_labels = (0..self.sessions.len())
             .map(|i| self.session_tab_label(i))
             .collect();
+    }
+
+    /// Ist eine Session „beschäftigt“ (LLM-Antwort streamt, Werkzeug läuft,
+    /// Retry/Backoff steht an oder es wird kompaktiert)? Grundlage sowohl für
+    /// die Warte-Animation ([`App::spinner_active`]) als auch für den
+    /// Terminal-Titel.
+    pub(crate) fn session_busy(s: &Session) -> bool {
+        s.phase == Phase::WaitingForLLM
+            || s.phase == Phase::WaitingForTool
+            || !s.open_tool_ids.is_empty()
+            || s.retrying.is_some()
+            || s.compacting
+    }
+
+    /// Beschäftigungs-Status für den Terminal-Titel:
+    /// - keine Session arbeitet → `idle`
+    /// - nur eine offene Session und beschäftigt → `busy` (ohne Zähler)
+    /// - mehrere Sessions, davon `n` beschäftigt → `n/m busy`
+    fn busy_status(&self) -> String {
+        let busy = self.sessions.iter().filter(|s| App::session_busy(s)).count();
+        match busy {
+            0 => "idle".to_string(),
+            _ if self.sessions.len() == 1 => "busy".to_string(),
+            _ => format!("{busy}/{} busy", self.sessions.len()),
+        }
+    }
+
+    /// Aktueller Terminal-Titel: `aidev · <status> · <tab>` mit `<tab>` =
+    /// Tab-Titel der gerade aktiven Session (z. B. `branch@repo`). Der
+    /// Label-Anteil wird aus dem gecachten `tab_labels` übernommen, damit
+    /// hier keine zusätzlichen Git-Aufrufe laufen.
+    fn terminal_title_string(&self) -> String {
+        let label = self
+            .tab_labels
+            .get(self.active)
+            .and_then(|s| s.split_once(": ").map(|(_, rest)| rest.to_string()))
+            .unwrap_or_else(|| self.session_label(self.active));
+        format!("aidev · {} · {label}", self.busy_status())
+    }
+
+    /// Schreibt den Terminal-Titel per OSC-Sequenz – nur wenn er sich geändert
+    /// hat (sonst würde bei jedem Redraw unnötig in die Ausgabe geschrieben).
+    /// Wird bei jedem Redraw aufgerufen; Tab-Wechsel sowie Start/Ende der
+    /// Beschäftigungs-Zustände der Sessions lösen einen solchen Redraw aus
+    /// und aktualisieren den Titel damit automatisch.
+    pub(crate) fn update_terminal_title(&mut self) {
+        let title = self.terminal_title_string();
+        if title == self.terminal_title {
+            return;
+        }
+        self.terminal_title = title;
+        let _ = crossterm::execute!(
+            io::stdout(),
+            crossterm::terminal::SetTitle(self.terminal_title.as_str())
+        );
     }
 
     /// Probt alle konfigurierten Podman-Kanäle einmalig im Hintergrund, damit
@@ -427,6 +519,10 @@ impl App {
             self.handle_branch_confirm_key(key);
             return;
         }
+        if self.path_confirm.is_some() {
+            self.handle_path_confirm_key(key);
+            return;
+        }
         if self.pre_send_confirm.is_some() {
             self.handle_pre_send_key(key);
             return;
@@ -474,7 +570,16 @@ impl App {
         self.pending_esc = false;
 
         match key.code {
-            KeyCode::Enter => self.handle_enter(),
+            KeyCode::Enter => {
+                if shift {
+                    // Shift+Enter: Zeilenumbruch im Eingabefeld, nicht senden.
+                    let s = self.active_mut();
+                    s.editor.insert_newline();
+                } else {
+                    // Enter ohne Shift: Text abschicken.
+                    self.handle_enter();
+                }
+            }
             KeyCode::Esc => {
                 self.handle_esc();
                 self.pending_esc = true;
@@ -609,11 +714,30 @@ impl App {
         }
     }
 
+    /// Fügt kopierten Text (Bracketed-Paste-Event) in den aktiven Editor ein.
+    /// Bei offenem Channel-Builder-TEXTFELD geht der Text dorthin, sonst in
+    /// die Chatzeile. `\n` aus der Zwischenablage wird dabei als Zeilenumbruch
+    /// in das Feld übernommen – nie als Enter (Senden).
+    pub(crate) fn handle_paste(&mut self, text: String) {
+        if let Some(b) = &mut self.channel_builder {
+            if let Some(edit) = &mut b.edit {
+                match edit {
+                    BuilderEdit::HostPath(ed) | BuilderEdit::Branch(ed) => {
+                        ed.insert_snippet(&text);
+                        return;
+                    }
+                }
+            }
+        }
+        let s = self.active_mut();
+        s.editor.insert_snippet(&text);
+    }
+
     fn active_mut(&mut self) -> &mut Session {
         &mut self.sessions[self.active]
     }
 
-    fn new_session(&mut self) {
+    pub(crate) fn new_session(&mut self) {
         let id = self.sessions.iter().map(|s| s.id).max().unwrap_or(0) + 1;
         let mut session = Session::new(id);
         // Neue Sessions erben den konfigurierten Default-Kanal; dessen
@@ -672,13 +796,7 @@ impl App {
         if self.any_dialog_open() {
             return false;
         }
-        self.sessions.iter().any(|s| {
-            s.phase == Phase::WaitingForLLM
-                || s.phase == Phase::WaitingForTool
-                || !s.open_tool_ids.is_empty()
-                || s.retrying.is_some()
-                || s.compacting
-        })
+        self.sessions.iter().any(App::session_busy)
     }
 
     /// Ist gerade irgendein modaler Dialog offen (er beansprucht die Tastatur
@@ -693,6 +811,7 @@ impl App {
             || self.stop_confirm.is_some()
             || self.channel_close.is_some()
             || self.branch_confirm.is_some()
+            || self.path_confirm.is_some()
             || self.options_dialog.is_some()
     }
 
@@ -707,6 +826,7 @@ impl App {
             || self.stop_confirm.is_some()
             || self.channel_close.is_some()
             || self.branch_confirm.is_some()
+            || self.path_confirm.is_some()
     }
 
     /// Betrifft die ausstehende User-Entscheidung die Session `idx`? Die
@@ -739,16 +859,17 @@ impl App {
         self.channel_picker = None;
         self.model_picker = None;
         self.channel_builder = None;
-        self.options_dialog = Some(OptionsDialog { cursor: 0 });
+        // Zwei Optionen: Maus-Ein/Aus, Modell-Status.
+        self.options_dialog = Some(OptionsDialog {
+            nav: ListNav::new(2),
+        });
     }
 
     /// Tastatur-Input für den Options-Dialog.
     pub(crate) fn handle_options_dialog_key(&mut self, key: event::KeyEvent) {
-        let Some(d) = self.options_dialog.take() else {
+        let Some(mut d) = self.options_dialog.take() else {
             return;
         };
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         match key.code {
             KeyCode::Esc => {
                 // Dialog schließen.
@@ -756,24 +877,17 @@ impl App {
             KeyCode::Char('o') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                 // Ctrl+O schließt den Dialog wieder.
             }
-            _ if down => {
-                self.options_dialog = Some(OptionsDialog {
-                    cursor: (d.cursor + 1).min(1),
-                });
-            }
-            _ if up => {
-                self.options_dialog = Some(OptionsDialog {
-                    cursor: d.cursor.saturating_sub(1),
-                });
-            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if d.cursor == 0 {
+                if d.nav.cursor() == 0 {
                     self.toggle_mouse();
                 }
                 // Dialog bleibt offen, damit der User den Status sieht.
                 self.options_dialog = Some(d);
             }
             _ => {
+                // Gemeinsame Bewegung (Pfeile/j/k, PgUp/PgDn, Home/End) über die
+                // ListNav-Abstraktion; fremde Tasten ändern den Cursor nicht.
+                d.nav.handle_move(&key, 2, |_| 1);
                 self.options_dialog = Some(d);
             }
         }
@@ -791,6 +905,8 @@ pub fn run(config: Config) -> io::Result<()> {
     let result = (|| {
         // Erster Frame sofort zeichnen, damit die UI ohne Verzögerung steht.
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        // Terminal-Titel einmalig initial setzen (danach bei jedem Redraw).
+        app.update_terminal_title();
         let mut last_draw = Instant::now();
         loop {
             // Neu zeichnen nur bei tatsächlicher Änderung: User-Input,
@@ -808,6 +924,13 @@ pub fn run(config: Config) -> io::Result<()> {
                             }
                             redraw = true;
                         }
+                    }
+                    // Bracketed Paste (mehrzeiliger Copy/Paste): wird als ein
+                    // Stück eingefügt statt als einzelne Key-Events – sonst
+                    // würde ein enthaltenes `\n` als Enter (Senden) gedeutet.
+                    CrosstermEvent::Paste(text) => {
+                        app.handle_paste(text);
+                        redraw = true;
                     }
                     // Terminalgröße geändert → Layout neu aufbauen.
                     CrosstermEvent::Resize(..) => redraw = true,
@@ -852,6 +975,9 @@ pub fn run(config: Config) -> io::Result<()> {
                 terminal.draw(|frame| ui::draw(frame, &mut app))?;
                 app.spinner += 1;
                 last_draw = Instant::now();
+                // Titel-Tab/Status können sich geändert haben (Tab-Wechsel,
+                // Session startet/endet busy) → aktualisieren (nur bei Änderung).
+                app.update_terminal_title();
             }
         }
         Ok(())

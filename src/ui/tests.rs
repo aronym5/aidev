@@ -5,7 +5,6 @@
 use super::*;
 use crate::app::Session;
 use crate::chat::EventKind;
-use crate::config::SymbolMode;
 use crate::llm::Usage;
 use crate::perm::Permission;
 
@@ -16,6 +15,95 @@ fn usage_zero() -> Usage {
         total_tokens: 0,
         cached_tokens: None,
     }
+}
+
+/// Überlebende Events zwischen Summary und neuem Turn: Ihre gespeicherte
+/// Kontextlänge (`context_len`) wird beim Einschieben der Summary um den Shift
+/// reduziert (grau); vor der Summary bleibt alles unverändert (grün), neue Turns
+/// danach sind wieder grün.
+#[test]
+fn ueberlebende_events_nach_summary_werden_verschoben() {
+    let mut s = Session::new(0);
+    // Turn 1 – wird archiviert.
+    s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
+    let a1 = s.open_assistant("gedanken alt".into(), "antwort alt".into());
+    s.chat.finalize_assistant(
+        a1,
+        std::time::Instant::now(),
+        Usage { prompt_tokens: 900, completion_tokens: 50, total_tokens: 950, cached_tokens: None },
+        3, 4, false,
+    );
+    // Turn 2 – ÜBERLEBT (bleibt NACH der Summary stehen).
+    s.push_user_message("mittlere frage".into(), Some(Permission::Read), "m".into());
+    let a2 = s.open_assistant("gedanken mittel".into(), "antwort mittel".into());
+    s.chat.finalize_assistant(
+        a2,
+        std::time::Instant::now(),
+        Usage { prompt_tokens: 1400, completion_tokens: 60, total_tokens: 1460, cached_tokens: None },
+        5, 6, false,
+    );
+    // Kompaktierung über die Session (macht den echten Shift): Turn 1 archiviert.
+    // `keep=0`: nichts wird als „letzter Turn“ geschützt – nur Turn 1 wird
+    // kompaktiert, Turn 2 bleibt als überlebendes Event zwischen Summary und
+    // neuem Turn stehen.
+    s.apply_compaction(
+        "[Compressed history - 1 earlier messages]\n\nzusammen".into(),
+        10,
+        0,
+    );
+
+    // Turn 3 – NEUER Turn NACH der Kompaktierung.
+    s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
+    let a3 = s.open_assistant("gedanken neu".into(), "antwort neu".into());
+    s.chat.finalize_assistant(
+        a3,
+        std::time::Instant::now(),
+        Usage { prompt_tokens: 2000, completion_tokens: 70, total_tokens: 2070, cached_tokens: None },
+        7, 8, false,
+    );
+
+    let ids: Vec<_> = s.chat.order().to_vec();
+    let cl = |id: crate::chat::EventId| s.chat.event(id).and_then(|e| e.context_len);
+    let is_green = |id: crate::chat::EventId| s.chat.context_is_green(id);
+
+    let find = |kind: &str, needle: &str| -> crate::chat::EventId {
+        ids.iter()
+            .copied()
+            .find(|&id| {
+                let e = s.chat.event(id).unwrap();
+                let subj = match &e.kind {
+                    EventKind::UserPrompt { text, .. } if kind == "U" => text.clone(),
+                    EventKind::Assistant { reasoning, .. } if kind == "A" => reasoning.clone(),
+                    EventKind::Archive { summary, .. } if kind == "S" => summary.clone(),
+                    _ => return false,
+                };
+                subj.contains(needle)
+            })
+            .expect(needle)
+    };
+
+    // VOR der Summary: unverändert (grün, aus Usage abgeleitet).
+    let u1 = cl(find("U", "alte frage")).unwrap();
+    let a1c = cl(find("A", "gedanken alt")).unwrap();
+    assert_eq!((u1, a1c), (900, 950), "archivierte Events behalten ihre bestätigten Zahlen");
+    assert!(is_green(find("U", "alte frage")) && is_green(find("A", "gedanken alt")));
+
+    // Shift = Kontext des letzten Events vor der Summary (A1: 950) − Summary (10).
+    let summary_arch = find("S", "zusammen");
+    assert_eq!(cl(summary_arch), Some(10), "Summary ist ihr eigener (grüner) Anker");
+
+    // Überlebende NACH der Summary: verschoben (alt − shift) und GRAU.
+    let u2 = cl(find("U", "mittlere frage")).unwrap();
+    let a2c = cl(find("A", "gedanken mittel")).unwrap();
+    assert_eq!((u2, a2c), (1400 - 940, 1460 - 940), "überlebende Zahl = alt − shift");
+    assert!(!is_green(find("U", "mittlere frage")), "überlebender Prompt ist grau (verschoben)");
+    assert!(!is_green(find("A", "gedanken mittel")), "überlebende Antwort ist grau (verschoben)");
+
+    // Neuer Turn NACH der Summary: wieder grün (neue Koordinaten).
+    let u3 = cl(find("U", "neue frage")).unwrap();
+    let a3c = cl(find("A", "gedanken neu")).unwrap();
+    assert_eq!((u3, a3c), (2000, 2070), "neue Runde misst im verkleinerten Kontext");
+    assert!(is_green(find("U", "neue frage")) && is_green(find("A", "gedanken neu")));
 }
 
 /// Session mit einem abgeschlossenen User/Assistant-Turn.
@@ -32,7 +120,7 @@ fn session_with_history() -> Session {
 fn history_cache_baut_bloecke_fuer_user_und_assistant() {
     let mut s = session_with_history();
     s.view = crate::app::ViewLevel::Overview;
-    let (blocks, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "model-x", 8192);
+    let (blocks, ctx) = build_history_cache(&s, 100, "model-x", 8192);
 
     assert!(
         blocks.len() >= 2,
@@ -44,8 +132,41 @@ fn history_cache_baut_bloecke_fuer_user_und_assistant() {
     // ist `used` > 0.
     assert!(ctx.used > 0, "Context-Estimator hält einen Wert");
     // Ohne offene Events ist der Live-Tail leer.
-    let (live, _live_used) = build_live_blocks(&s, 100, SymbolMode::Glyph, 8192, &ctx);
+    let (live, _live_used) = build_live_blocks(&s, 100, 8192, &ctx);
     assert!(live.is_empty(), "keine offenen Events → kein Live-Tail");
+}
+
+#[test]
+fn themewechsel_macht_den_history_cache_ungueltig() {
+    // `/theme` soll bereits gezeichnete Texte SOFORT neu einfärben: `set_theme`
+    // erhöht die Theme-Version, und `ensure_history_cache` baut den Cache beim
+    // nächsten Frame neu auf – auch wenn Breite/Ansicht/Historie unverändert
+    // sind (die Historie selbst bleibt unangetastet, kein history_version-Bump).
+    let mut s = session_with_history();
+    let (version_vorher, history_vorher) = {
+        ensure_history_cache(&mut s, 100, "model-x", 8192);
+        (
+            s.history_cache.as_ref().expect("Cache nach ensure").theme_version,
+            s.history_version,
+        )
+    };
+
+    set_theme(resolve(ThemeChoice::Dark));
+    assert!(theme_version() > version_vorher, "set_theme erhöht die Theme-Version");
+
+    // Nächster Frame ohne weitere Änderungen → Rebuild mit neuer Theme-Farbe.
+    ensure_history_cache(&mut s, 100, "model-x", 8192);
+    assert_eq!(
+        s.history_cache.as_ref().unwrap().theme_version,
+        theme_version(),
+        "Theme-Wechsel löst sofort einen Cache-Rebuild aus"
+    );
+    // Die Historie selbst wurde nicht angefasst – der Theme-Schlüssel allein
+    // ist für den Rebuild verantwortlich.
+    assert_eq!(s.history_version, history_vorher, "s.history_version bleibt unverändert");
+
+    // Globalen Theme-Zustand für andere (parallele) Tests wieder herstellen.
+    set_theme(resolve(ThemeChoice::Dark));
 }
 
 #[test]
@@ -55,8 +176,8 @@ fn live_blocks_zeigen_offene_assistant_rune() {
     s.ensure_open_assistant();
     s.append_text("laufende Antwort");
 
-    let (_, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
-    let (live, live_used) = build_live_blocks(&s, 100, SymbolMode::Glyph, 8192, &ctx);
+    let (_, ctx) = build_history_cache(&s, 100, "m", 8192);
+    let (live, live_used) = build_live_blocks(&s, 100, 8192, &ctx);
     assert!(!live.is_empty(), "offene Assistant-Runde wird gerendert");
     // Der Live-Tail erweitert den Kontext über das Historie-Ende hinaus – genau
     // dieser finale `used`-Wert fließt als `live_context` (Live-Tail der
@@ -95,8 +216,8 @@ fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
         ToolKind::Read { path: "a.rs".into(), range: String::new() },
     );
 
-    let (hist, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
-    let (live, _live_used) = build_live_blocks(&s, 100, SymbolMode::Glyph, 8192, &ctx);
+    let (hist, ctx) = build_history_cache(&s, 100, "m", 8192);
+    let (live, _live_used) = build_live_blocks(&s, 100, 8192, &ctx);
     let hist_text: Vec<String> = hist.iter().flat_map(|b| b.lines.iter().map(|l| l.to_string())).collect();
     let live_text: Vec<String> = live.iter().flat_map(|b| b.lines.iter().map(|l| l.to_string())).collect();
     // Das beendete Tool 1 gehört zur noch OFFENEN Runde → noch NICHT in der
@@ -110,15 +231,15 @@ fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
     // wandert das Paar (Runde + Tool-Kinder) in die Historie; der Live-Tail
     // enthält danach nichts mehr davon.
     s.finish_assistant(false, None);
-    let (hist2, ctx2) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
-    let (live2, _live_used) = build_live_blocks(&s, 100, SymbolMode::Glyph, 8192, &ctx2);
+    let (hist2, ctx2) = build_history_cache(&s, 100, "m", 8192);
+    let (live2, _live_used) = build_live_blocks(&s, 100, 8192, &ctx2);
     let hist2_text: Vec<String> = hist2.iter().flat_map(|b| b.lines.iter().map(|l| l.to_string())).collect();
     assert!(hist2_text.iter().any(|l| l.contains("glob")), "geschlossen → Tool 1 in Historie: {hist2_text:?}");
     assert!(live2.is_empty(), "kein offenes Event mehr → Live-Tail leer");
 }
 
 #[test]
-fn assistant_sync_ctx_beruecksichtigt_tool_call_anteil() {
+fn confirmed_context_len_beruecksichtigt_tool_call_anteil() {
     use crate::chat::ToolKind;
     use crate::llm::CompletionParts;
     let usage = Usage {
@@ -133,20 +254,13 @@ fn assistant_sync_ctx_beruecksichtigt_tool_call_anteil() {
         total_tokens: 0,
         cached_tokens: None,
     };
-    let assistant_ev = |s: &Session| {
-        s.chat
-            .iter()
-            .find(|e| matches!(e.kind, EventKind::Assistant { .. }))
-            .expect("assistant")
-            .clone()
-    };
 
     // 1) Abschlussantwort ohne Tools → `total_tokens`.
     let mut s = Session::new(0);
     s.push_user_message("f1".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant("".into(), "Antwort".into());
     s.chat.finalize_assistant(aid, std::time::Instant::now(), usage, 0, 0, false);
-    assert_eq!(assistant_sync_ctx(&assistant_ev(&s), &s), Some(1098));
+    assert_eq!(s.chat.confirmed_context_len(aid), Some(1098));
 
     // 2) Tool-Runde mit gemessenen completion_parts → prompt + reasoning + content.
     let mut s = Session::new(0);
@@ -171,7 +285,7 @@ fn assistant_sync_ctx_beruecksichtigt_tool_call_anteil() {
             tool_calls: vec![36, 37],
         }),
     );
-    assert_eq!(assistant_sync_ctx(&assistant_ev(&s), &s), Some(987 + 38 + 0), "parts: prompt+reasoning+content");
+    assert_eq!(s.chat.confirmed_context_len(aid), Some(987 + 38 + 0), "parts: prompt+reasoning+content");
 
     // 3) Tool-Runde OHNE parts → `total_tokens` − ∑ tool num_tokens_input.
     let mut s = Session::new(0);
@@ -188,14 +302,14 @@ fn assistant_sync_ctx_beruecksichtigt_tool_call_anteil() {
     s.chat.finalize_assistant(aid, std::time::Instant::now(), usage, 0, 0, false);
     s.chat.set_tool_tokens(t1, 36, 100);
     s.chat.set_tool_tokens(t2, 37, 200);
-    assert_eq!(assistant_sync_ctx(&assistant_ev(&s), &s), Some(1098 - 73), "ohne parts: total − tool-calls");
+    assert_eq!(s.chat.confirmed_context_len(aid), Some(1098 - 73), "ohne parts: total − tool-calls");
 
     // 4) Ohne bestätigte total_tokens → None.
     let mut s = Session::new(0);
     s.push_user_message("f4".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant("".into(), "x".into());
     s.chat.finalize_assistant(aid, std::time::Instant::now(), zero, 0, 0, false);
-    assert_eq!(assistant_sync_ctx(&assistant_ev(&s), &s), None);
+    assert_eq!(s.chat.confirmed_context_len(aid), None);
 }
 
 #[test]
@@ -213,11 +327,12 @@ fn contentlose_runde_mit_usage_synct_used_trotzdem() {
     let aid = s.open_assistant("nur Gedanken, kein Text".into(), String::new());
     s.chat.finalize_assistant(aid, std::time::Instant::now(), usage, 0, 0, false);
 
-    let (blocks, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
+    let (blocks, ctx) = build_history_cache(&s, 100, "m", 8192);
     let texts: Vec<String> = blocks.iter().flat_map(|b| b.lines.iter().map(|l| l.to_string())).collect();
     // In der Übersicht wird die Gedanken-Runde als Zeile übersprungen …
     assert!(!texts.iter().any(|l| l.contains("Gedanken")), "Reasoning ohne Text erscheint nicht als Zeile: {texts:?}");
-    // … aber `used` springt trotzdem auf die serverbestätigte Zahl (resync_to
+    // … aber `used` springt trotzdem auf die serverbestätigte Zahl (der
+    // gespeicherte `context_len`-Anker wird aus `reported_usage` abgeleitet)
     // läuft für jede geschlossene Runde, nicht nur für Text-Runden).
     assert_eq!(ctx.used, 500, "verified tokens fließen trotz leerem Text in die Schätzung");
 }
@@ -233,13 +348,55 @@ fn contentlose_runde_ohne_usage_behaelt_reasoning_schaetzung() {
     let aid = s.open_assistant("nur Gedanken".into(), String::new());
     s.chat.finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 0, 0, false);
 
-    let (_, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
+    let (_, ctx) = build_history_cache(&s, 100, "m", 8192);
     let est_user = crate::llm::estimate_tokens("kurz");
     let est_reasoning = crate::llm::estimate_tokens("nur Gedanken");
     assert_eq!(
         ctx.used,
         est_user + est_reasoning,
         "Reasoning-Schätzung bleibt ohne Usage in `used`"
+    );
+    assert_eq!(
+        ctx.block_sum,
+        est_user + est_reasoning,
+        "Reasoning trägt auch zur zweiten Zahl bei (Context-Schätzung, keine Zeile im Overview)"
+    );
+}
+
+#[test]
+fn assistant_zeile_annotiert_reasoning_und_text_getrennt() {
+    fn assistant_line(s: &Session) -> String {
+        let (blocks, _ctx) = build_history_cache(s, 100, "m", 8192);
+        blocks
+            .iter()
+            .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
+            .find(|l| l.contains("Antwort"))
+            .expect("Assistant-Textzeile")
+    }
+
+    // Reasoning + Text: beide Tokenzahlen einzeln als „res+txt“ (analog Tool-
+    // Call+Antwort) – nicht mehr nur die Textzahl.
+    let mut s = Session::new(0);
+    s.view = crate::app::ViewLevel::Overview;
+    s.push_user_message("kurz".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant("Gedanken".into(), "Antwort".into());
+    s.chat.finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 5, 7, false);
+    let line = assistant_line(&s);
+    assert!(
+        line.contains("5+7"),
+        "Reasoning+Text erscheinen getrennt als `res+txt`, Zeile: {line:?}"
+    );
+
+    // Nur Text (kein Reasoning): unverändert die einzelne Tokenzahl.
+    let mut s = Session::new(0);
+    s.view = crate::app::ViewLevel::Overview;
+    s.push_user_message("kurz".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant("".into(), "Antwort".into());
+    s.chat.finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 0, 7, false);
+    let line = assistant_line(&s);
+    assert!(
+        line.contains("7") && !line.contains('+'),
+        "ohne Reasoning bleibt die einzelne Textzahl, Zeile: {line:?}"
     );
 }
 
@@ -270,26 +427,16 @@ fn assistant_runden_verifizieren_das_event_davor() {
     let a2 = s.open_assistant("fertig".into(), "Antwort".into());
     s.chat.finalize_assistant(a2, t0, usage(910), 0, 0, false);
 
-    let user_id = s
-        .chat
-        .order()
-        .iter()
-        .find(|id| matches!(s.chat.event(**id).map(|e| &e.kind), Some(EventKind::UserPrompt { .. })))
-        .copied()
-        .expect("user");
-
-    // Helper-Map: A1 (content-los) verifiziert den User, A2 (Content) das Tool.
-    let m = assistant_verified_before(&s);
-    assert_eq!(m.get(&user_id).copied(), Some(420), "content-lose Runde verifiziert Vorgänger");
-    assert_eq!(m.get(&t1).copied(), Some(910), "content-behaftete Runde verifiziert Vorgänger");
-
     // Sichtbar: grüne Zahlen auf der User-Zeile (420T) und der Tool-Zeile (910T);
-    // die content-lose Runde selbst rendert KEINE Zeile.
-    let (blocks, _ctx) = build_history_cache(&s, 120, SymbolMode::Glyph, "m", 8192);
+    // die content-lose Runde selbst rendert KEINE Zeile. Die Anker stammen aus
+    // den gespeicherten `context_len`-Werten: der User-Prompt ist durch A1s
+    // `prompt_tokens` (420) bestätigt, das Tool T1 durch A2s (910) – jeweils
+    // noch unverschoben, also grün.
+    let (blocks, _ctx) = build_history_cache(&s, 120, "m", 8192);
     let has_green = |blk: &ChatBlock, needle: &str| {
         blk.lines.iter().any(|l| {
             l.spans.iter().any(|sp| {
-                sp.style.fg == Some(SYM_OK)
+                sp.style.fg == Some(theme().ok)
                     && sp.content.to_string().contains(needle)
             })
         })
@@ -307,124 +454,94 @@ fn assistant_runden_verifizieren_das_event_davor() {
 }
 
 #[test]
-fn tool_verifikation_resynct_used_absolut_ohne_doppelzaehlung() {
-    // Reihenfolge der Tool-Zeile: `overview_tool_line_chat` addiert erst die
-    // Tool-Schätzung (add_tool), DANN springt der verifizierte `prompt_tokens`-
-    // Wert (`resync_after`, enthält das Tool-Ergebnis bereits) auf den absoluten
-    // Stand zurück – die Tool-Schätzung wird NICHT doppelt gezählt.
+fn tool_verifikation_verankert_used_absolut() {
+    // Die Anzeige-Basis `used` hängt ausschließlich am gespeicherten
+    // Kontext-Anker (`set_anchor` = context_len des Events); die Tool-Anteile
+    // (`add_tool`) fließen nur in die Zusammensetzung (Balken-Segmente), nicht
+    // in die erste Zahl – kein Doppelzählen einer Schätzung neben dem Anker.
     let mut ctx = ContextEstimate::base();
     ctx.add_tool("glob", 136);
-    assert_eq!(ctx.used, 136);
-    ctx.resync_to(910);
-    assert_eq!(ctx.used, 910, "verifizierter Wert ersetzt die Schätzung absolut");
+    ctx.set_anchor(910, true);
+    assert_eq!(ctx.used, 910, "gespeicherter Wert ersetzt die Schätzung absolut");
+    assert!(ctx.green, "unverschobene Bestätigung ist grün");
+    assert_eq!(ctx.tools, vec![("glob".to_string(), 136)], "Zusammensetzung bleibt erhalten");
 
-    // `resync_after` kapselt setzen→rendern→re-anchor: nimmt den grünen Wert
-    // vom `verified_prompt`-Feld, resynct darauf und räumt das Feld wieder ab.
-    let mut c2 = ContextEstimate::base();
-    c2.add_tool("read", 200);
-    c2.verified_prompt = Some(1200);
-    resync_after(&mut c2);
-    assert_eq!(c2.used, 1200, "resync_after verankert auf dem verifizierten Wert");
-    assert_eq!(c2.verified_prompt, None, "resync_after räumt das Feld ab");
-    // Ohne verifizierten Wert bleibt die Schätzung unverändert.
+    // Ohne Anker kein Sprung: `used` bleibt auf der Live-Basis (add_used).
     let mut c3 = ContextEstimate::base();
-    c3.add_tool("read", 200);
-    resync_after(&mut c3);
-    assert_eq!(c3.used, 200, "ohne Verifikation kein Sprung");
+    c3.add_used(200);
+    assert_eq!(c3.used, 200, "ohne Anker bleibt die Live-Basis");
 }
 
 #[test]
 fn nachtraegliche_bestaetigung_passt_usage_bar_an_neue_daten_an() {
-    // Anforderung: Die Gesamtlänge der usage-bar ist die erste Spalte (der
-    // serverbestätigte Kontextwert), sobald er eintrudelt. Die farbigen Blöcke
-    // (Inhalts-Kategorien + Tools) bleiben die Summen der Event-Token. Sobald
-    // ein Turn abgeschlossen wird und eine bestätigte `total_tokens` vorliegt,
-    // springt `used` (Balkenlänge) auf diese Zahl – der Farbanteile-Anteil
-    // (add_content/add_tool) bleibt davon unberührt.
+    // Die Gesamtlänge der usage-bar ist die erste Spalte (der gespeicherte
+    // Kontextwert), sobald er vorliegt. Die farbigen Blöcke (Inhalts-Kategorien
+    // + Tools) bleiben die Summen der Event-Token. Sobald ein Turn abgeschlossen
+    // wird und eine bestätigte Kontextzahl vorliegt, springt `used`
+    // (Balkenlänge) auf diese Zahl – der Farbanteile-Anteil bleibt unberührt.
     let mut ctx = ContextEstimate::base();
     // Zwei User/Agent-Events + ein Tool (Event-Summen wie in build_history_cache).
     ctx.add_content(ContentKind::User, 120); // User
     ctx.add_tool("glob", 136);
     ctx.add_content(ContentKind::Content, 80); // Assistant content
-    assert_eq!(
-        ctx.used,
-        120 + 136 + 80,
-        "Balkenlänge = Summe der Event-Token ohne Grundanteil"
-    );
+    // `add_*` bucht nur die Zusammensetzung; `used` wächst erst über die
+    // gespeicherte `context_len` (Anker) bzw. die Live-Basis.
+    assert_eq!(ctx.used, 0, "Zusammensetzung allein hebt `used` nicht an");
 
-    // Nachträglich trifft die Server-Bestätigung ein: `used` (Gesamtlänge)
-    // springt auf den Kontextwert der ersten Spalte.
-    ctx.resync_to(900);
+    // Die (gespeicherte) Bestätigung steuert die Balkenlänge (erste Spalte).
+    ctx.set_anchor(900, true);
     assert_eq!(
         ctx.used, 900,
-        "bestätigte Zahl steuert die Balkenlänge (erste Spalte)"
+        "gespeicherte Zahl steuert die Balkenlänge (erste Spalte)"
     );
 }
 
 #[test]
 fn kompaktierung_reset_und_shift_steuern_usage_bar_und_folgekontext() {
     // Simulation der Sequenz des Archive-Zweigs in `build_history_cache`:
-    // Vorgeschichte bis Kontextlänge `old` → Summary (eigener Anker, nur
-    // Summary-Zusammensetzung, alle anderen Beiträge auf null) → shift =
-    // old − summary → Folge-Events mit Schätz- und Verifikations-Pfad.
-    let old = 50_000;
+    // Summary = eigener (grüner) Anker mit NUR Summary-Zusammensetzung; die
+    // überlebenden Events danach zeigen ihre gespeicherte (in `apply_compaction`
+    // um den Shift reduzierte) Kontextlänge als graue Zahl.
     let summary = 2_000;
-    let shift = old - summary;
 
-    // „Letztes Event vor der Summary“: Kontextlänge `old`.
-    let mut ctx = ContextEstimate::base();
-    ctx.add_content(ContentKind::User, 12_000);
-    ctx.add_tool("glob", 8_000);
-    ctx.resync_to(old);
-    assert_eq!(ctx.used, old, "Kontextlänge vor der Summary");
-
-    // ── Summary (Archive): verified_prompt = eigene Token; usage-bar besteht
+    // ── Summary (Archive): eigene Token als grüner Anker; usage-bar besteht
     // ── nur aus der Summary in exakt dieser Länge (Rest auf null).
+    let mut ctx = ContextEstimate::base();
     ctx.contents = [0; 5];
     ctx.contents[ContentKind::Summary as usize] = summary;
     ctx.tools = Vec::new();
     ctx.block_sum = summary;
-    ctx.verified_prompt = Some(summary);
+    ctx.set_anchor(summary, true);
     assert_eq!(
         ctx.contents,
         [summary, 0, 0, 0, 0],
         "Zusammensetzung nur aus summary in exakt dieser Länge"
     );
     assert!(ctx.tools.is_empty(), "Tool-Anteile zurückgesetzt");
-    resync_after(&mut ctx); // Anker exakt auf Summary (Shift gilt noch nicht)
-    ctx.compact_shift = shift;
     assert_eq!(ctx.used, summary, "Summary ist der neue Kontext-Anker");
-    assert_eq!(ctx.verified_prompt, None, "verified_prompt zurückgesetzt");
+    assert!(ctx.green, "Summary-Anker ist grün (eigene exakte Zahl)");
 
-    // ── Folge-Event 1 (Schätzung): läuft ab der Summary-Basis weiter – die
-    // ── angezeigte absolute Zahl ist damit die alte minus shift.
+    // ── Folge-Event 1 (überlebt, verschoben): die gespeicherte Kontextlänge
+    // ── wurde in `apply_compaction` bereits um den Shift reduziert → grau.
+    // `add_content` bucht nur die Zusammensetzung (Balken-Anteile), `used`
+    // hängt am gespeicherten Anker (set_anchor).
     ctx.add_content(ContentKind::User, 300);
-    assert_eq!(
-        ctx.used, summary + 300,
-        "Schätzung ab neuer Basis (= alte Zahl + 300 − shift)"
-    );
+    ctx.set_anchor(52_100 - 48_000, false);
+    assert_eq!(ctx.used, 4_100, "gespeicherte (verschobene) Kontextlänge steuert die erste Zahl");
+    assert!(!ctx.green, "verschobene Zahl ist grau");
+    assert_eq!(ctx.contents, [summary, 300, 0, 0, 0], "Zusammensetzung akkumuliert weiter");
 
-    // ── Folge-Event 2 mit serverbestätigter Zahl (gegen die OLD-Historie
-    // ── gemessen): verified_prompt nehmen, shift abziehen → ctx.used, Feld weg.
+    // ── Folge-Event 2: weiterer Tool-Anteil nur in der Zusammensetzung.
     ctx.add_tool("read", 120);
-    ctx.verified_prompt = Some(52_100);
-    resync_after(&mut ctx);
-    assert_eq!(
-        ctx.used,
-        52_100 - shift,
-        "verifizierte absolute Zahl − shift"
-    );
-    assert_eq!(ctx.verified_prompt, None, "verified_prompt abgeräumt");
-    // Zusammensetzung weiterhin „Daten darüber + aktuelles Event“.
-    assert_eq!(ctx.contents, [summary, 300, 0, 0, 0]);
+    assert_eq!(ctx.used, 4_100, "Tool-Anteil hebt `used` nicht an (Anker bleibt)");
     assert_eq!(ctx.tools, vec![("read".to_string(), 120)]);
 
-    // ── Ohne Kompaktierung (shift = 0) bleibt alles wie bisher.
+    // ── Ohne Kompaktierung bleibt ein bestätigter Wert grün.
     let mut plain = ContextEstimate::base();
     plain.add_tool("read", 200);
-    plain.verified_prompt = Some(1200);
-    resync_after(&mut plain);
-    assert_eq!(plain.used, 1200, "ohne Shift: Verifikation unverändert");
+    plain.set_anchor(1200, true);
+    assert_eq!(plain.used, 1200, "ohne Shift: Bestätigung unverändert");
+    assert!(plain.green, "unverschobene Bestätigung ist grün");
 }
 
 #[test]
@@ -464,25 +581,38 @@ fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
         false,
     );
     s.view = crate::app::ViewLevel::Overview;
-    let (blocks, end_ctx) = build_history_cache(&s, 120, SymbolMode::Glyph, "m", 81920);
+    let (blocks, end_ctx) = build_history_cache(&s, 120, "m", 81920);
 
-    // Summary-Zeile: eigener Anker = Tokenzahl des Summary-Events (grün, 2kT).
+    // Kompaktierung: grüner Anker jetzt NUR auf der Summary-Zeile selbst
+    // (eigene, kleine Tokenzahl). Alle Folge-Events NACH der Summary werden
+    // GRAU und um den Shift reduziert angezeigt – bestätigte Rohwerte (grün)
+    // stehen nach der Kompaktierung nicht mehr an den Zeilen.
+    // shift = Kontext im letzten Event vor der Summary − Summary-Länge.
+    let shift = old_before_summary - summary_tokens;
+    assert!(shift > 0, "Testszenario braucht echten positiven Shift");
+
     let has_green = |blk: &ChatBlock, needle: &str| {
         blk.lines.iter().any(|l| {
             l.spans
                 .iter()
-                .any(|sp| sp.style.fg == Some(SYM_OK) && sp.content.to_string().contains(needle))
+                .any(|sp| sp.style.fg == Some(theme().ok) && sp.content.to_string().contains(needle))
         })
     };
+    // Summary-Zeile: eigene Tokenzahl als grüner Anker („5T“).
+    let own = crate::ui::status::fmt_ctx(summary_tokens);
     assert!(
-        blocks.iter().any(|b| has_green(b, "2kT")),
+        blocks.iter().any(|b| has_green(b, &own)),
         "Summary-Zeile zeigt ihre eigene Tokenzahl als grünen Anker"
     );
-
-    // shift = Kontext im letzten Event vor der Summary − Summary-Länge.
-    let shift = old_before_summary - summary_tokens;
-    assert_eq!(end_ctx.compact_shift, shift, "Shift wie spezifiziert");
-    assert!(shift > 0, "Testszenario braucht echten positiven Shift");
+    // NACH der Summary: Der neue Turn (prompt_tokens 5200) wurde gegen den
+    // verkleinerten Kontext gemessen – er ist ein neuer Anker in NEUEN
+    // Koordinaten (grün, unverschoben), und der Shift wird auf 0 zurückgesetzt.
+    let green_val = crate::ui::status::fmt_ctx(5200);
+    assert!(
+        blocks.iter().any(|b| has_green(b, &green_val)),
+        "Folgebestätigung nach Summary ist grün (neuer Koordinaten-Anker, prompt_tokens=5200)"
+    );
+    assert!(end_ctx.green, "Folge-Bestätigung in neuen Koordinaten ist grün (unverschoben)");
 
     // usage-bar-Zusammensetzung am HISTORIE-ENDE = Daten darüber (nur die
     // Summary als Überbleibsel der alten Historie) + aktuelles Event:
@@ -497,12 +627,12 @@ fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
     assert_eq!(end_ctx.contents[4], 0, "kein Other-Anteil");
     assert!(end_ctx.tools.is_empty(), "keine Tool-Anteile");
 
-    // Der rundeigene verifizierte Fuß (total_tokens 5240, gegen OLD gemessen)
-    // läuft mit − shift durch die Pipeline bis zum Ende der Historie.
+    // Der rundeigene verifizierte Fuß (total_tokens 5240) stammt aus dem
+    // verkleinerten Kontext (neue Koordinaten) – kein Shift mehr.
     assert_eq!(
         end_ctx.used,
-        5240 - shift,
-        "Folge-Verifikation minus shift"
+        5240,
+        "Folge-Verifikation in neuen Koordinaten (kein Shift)"
     );
 }
 
@@ -514,7 +644,7 @@ fn usage_bar_verwendet_partial_bloecke_fuer_subzeichengenaue_uebergaenge() {
     let mut ctx = ContextEstimate::base();
     ctx.add_content(ContentKind::User, 4); // User
     ctx.add_tool("glob", 5); // Tool, größerer Anteil
-    ctx.resync_to(50); // used=50, window=100 → 50 % gefüllt
+    ctx.set_anchor(50, false); // used=50, window=100 → 50 % gefüllt
 
     let spans = context_bar(&ctx, 100, 20);
     // Gesamtzahl Zeichen = exakt `cells` Zellen (die Balkenbreite bleibt fix).
@@ -570,7 +700,7 @@ fn overview_balken_bleibt_bei_zero_width_glyphen_ausgerichtet() {
 
     let mut ctx = ContextEstimate::base();
     ctx.add_content(ContentKind::User, 120);
-    ctx.resync_to(500);
+    ctx.set_anchor(500, false);
     let window = 8192;
     let width = 120;
     let ann = Some(" 40+100".into());
@@ -612,8 +742,8 @@ fn overview_balken_bleibt_bei_zero_width_glyphen_ausgerichtet() {
 #[test]
 fn layout_blocks_reihen_logo_historie_live_auf() {
     let s = session_with_history();
-    let (blocks, ctx) = build_history_cache(&s, 100, SymbolMode::Glyph, "m", 8192);
-    let (live, _live_used) = build_live_blocks(&s, 100, SymbolMode::Glyph, 8192, &ctx);
+    let (blocks, ctx) = build_history_cache(&s, 100, "m", 8192);
+    let (live, _live_used) = build_live_blocks(&s, 100, 8192, &ctx);
     let logo = ChatBlock {
         lines: vec![Line::from("logo")],
         bg: None,
@@ -677,7 +807,7 @@ fn fusszeile_erscheint_nur_bei_antworten_ohne_tool_aufrufe() {
     let aid = s.open_assistant(String::new(), "Antwort zwei".into());
     s.chat.finalize_assistant(aid, t0, usage_zero(), 0, 0, false);
 
-    let (blocks, _ctx) = build_history_cache(&s, 200, SymbolMode::Glyph, "m", 8192);
+    let (blocks, _ctx) = build_history_cache(&s, 200, "m", 8192);
     let footers: Vec<String> = blocks
         .iter()
         .filter(|b| {
@@ -840,4 +970,76 @@ fn empty_cell_zeigt_trenner_und_gutter_struktur() {
     let total = spans.iter().map(|s| disp_width(&s.content)).sum::<usize>();
     assert_eq!(total, cell_w, "leere Zelle bleibt exakt `cell_w` breit");
     assert!(joined.starts_with("  │+"), "Gutter: `num_w` Leerraum + `│` + Marker; bekam {joined:?}");
+}
+
+// ── Gedanken-Rendering (Zoom 2/3 kompakt vs. Detail) ───────────────────────
+
+/// Zoom 2+3 (Compact/Dialog): das Gedanken-Element ist eine EINZIGE Zeile mit
+/// dem Icon `U+1F5ED` in Spalte 2 und dem tatsächlichen Reasoning-Inhalt ab
+/// Spalte 4; Zeilenumbrüche werden zu Leerzeichen (wie Overview-Texte).
+#[test]
+fn gedanken_kompakt_ikon_spalte2_inhalt_ab_spalte4() {
+    let blk = thoughts_block("Zeile eins\nZeile zwei", false, None, 40, None);
+    assert_eq!(blk.lines.len(), 1, "Zoom 2/3: genau eine komprimierte Zeile");
+    let line = &blk.lines[0];
+    let s = line.to_string();
+    // 2 Leerzeichen → Icon bei Spalte 2; danach eine Zelle Abstand → Text ab
+    // Spalte 4 (THOUGHT_INDENT).
+    assert!(
+        s.starts_with("  \u{1F5ED} "),
+        "Icon in Spalte 2, Text dahinter: {s:?}"
+    );
+    // Zeilenumbruch → Leerzeichen, echter Inhalt sichtbar.
+    assert!(
+        s.contains("Zeile eins Zeile zwei"),
+        "Inhalt wird komprimiert: {s:?}"
+    );
+    // Gedanken-Look: gedämpft, aber NICHT kursiv (Zoom 2+3 = normal).
+    assert_eq!(line.style.fg, Some(theme().muted));
+    assert!(
+        !line.style.add_modifier.contains(Modifier::ITALIC),
+        "kompakte Gedankenzeile ist nicht kursiv"
+    );
+}
+
+/// Zoom 2+3: läuft der Inhalt über den verfügbaren Platz, wird er mit „…“
+/// abgeschnitten (analog zur Overview) statt umgebrochen.
+#[test]
+fn gedanken_kompakt_kuerzt_ueberlauf_mit_auslassung() {
+    // budget = width(10) − THOUGHT_INDENT(4) − PAD_R(2) = 4 Zellen
+    // (davon 1 für „…“) → „ABC…“.
+    let blk = thoughts_block("ABCDEFGHIJ", false, None, 10, None);
+    assert_eq!(blk.lines.len(), 1, "bleibt eine Zeile, kein Umbruch");
+    let s = blk.lines[0].to_string();
+    assert!(s.ends_with("ABC…"), "Überlauf gekürzt + „…“: {s:?}");
+}
+
+/// Detail (Zoom 4): der ganze Text bleibt mehrzeilig ab Spalte 4 eingerückt;
+/// nur in der ersten Zeile steht zusätzlich das Icon in Spalte 2.
+#[test]
+fn gedanken_detail_voller_text_mit_ikon_nur_in_erster_zeile() {
+    let reason = "Ein sehr langer Gedankentext, der über die verfügbare Breite \
+                  hinaus läuft und daher in der Detailansicht umbrochen werden muss.";
+    let blk = thoughts_block(reason, true, None, 40, None);
+    let repr: Vec<String> = blk.lines.iter().map(|l| l.to_string()).collect();
+    assert!(repr.len() >= 2, "langer Text bricht mehrzeilig um: {repr:?}");
+    // Erste Zeile: Icon in Spalte 2, Text beginnt weiterhin in Spalte 4.
+    assert!(
+        repr[0].starts_with("  \u{1F5ED} Ein sehr langer"),
+        "erste Zeile: Icon Spalte 2 + Text Spalte 4: {repr:?}"
+    );
+    // Folgezeile: ohne Icon, weiterhin ab Spalte 4 eingerückt.
+    assert!(
+        repr[1].starts_with("    "),
+        "Folgezeile ab Spalte 4 (ohne Icon): {repr:?}"
+    );
+    assert!(
+        !repr[1].contains('\u{1F5ED}'),
+        "Icon steht nur in der ersten Zeile: {repr:?}"
+    );
+    // Ganzer Inhalt bleibt erhalten (keine Kürzung im Detaillevel).
+    assert!(
+        repr.iter().any(|l| l.contains("Detailansicht")),
+        "voller Text bleibt: {repr:?}"
+    );
 }

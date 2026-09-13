@@ -16,7 +16,7 @@ use super::resolve::resolve;
 use super::run::{host_uid_gid, run_with_timeout, run_with_timeout_live, sanitize};
 use super::search::search_files;
 use super::{
-    Channel, ChannelKind, ChannelStatus, Managed, PodmanMode, RunOut, SearchResult,
+    Channel, ChannelKind, ChannelStatus, PodmanMode, RunOut, SearchResult,
 };
 use crate::config::{ChannelConfig, PodmanUserMapping};
 use std::sync::atomic::AtomicBool;
@@ -59,7 +59,14 @@ pub struct PodmanChannel {
     /// Geteilter Zustand für den `⬢`-Indikator (beschrieben von
     /// `ensure_running`/`run`/`probe`; gelesen vom UI auf dem Hauptfaden).
     pub(crate) status: Arc<Mutex<ChannelStatus>>,
-    pub(crate) managed: Managed,
+    /// Ob dieser Kanal einen eigenen Run-Container startet, den aidev beim
+    /// Beenden wieder stoppt (Run-Modus: `true`; Attach: `false`). Nur beim
+    /// Erzeugen des Kanals gesetzt, über die Lebensdauer unverändert.
+    pub(crate) managed_container: bool,
+    /// Ob der gemountete Host-Ordner ein von aidev angelegter Git-Worktree ist
+    /// (Picker-Branch ohne Worktree, `/branch`, `Alt+D`). In der Regel `false`;
+    /// nur beim Erzeugen des Kanals gesetzt, über die Lebensdauer unverändert.
+    pub(crate) managed_worktree: bool,
     /// Gecachter Shell-Name (`bash`, falls im Container verfügbar, sonst `sh`)
     /// – einmalig beim ersten Shell-Einsatz im Container ermittelt.
     pub(crate) shell: Mutex<Option<String>>,
@@ -69,7 +76,6 @@ pub(super) fn podman_from_config(
     name: &str,
     cfg: &ChannelConfig,
     timeout_secs: u64,
-    managed: Managed,
     worktree: Option<crate::repo::WorktreeInfo>,
     usermapping: PodmanUserMapping,
 ) -> Result<PodmanChannel, String> {
@@ -85,7 +91,9 @@ pub(super) fn podman_from_config(
 
     let mut channel = if let Some(image) = &cfg.image {
         // Run-Modus: eigener Container (Name abgeleitet), Wurzel ist ein
-        // Host-Verzeichnis, das in den Container gemountet wird.
+        // Host-Verzeichnis, das in den Container gemountet wird. Dieser
+        // Container wird von aidev gestartet und beim Beenden wieder gestoppt
+        // (`managed_container = true`).
         let host = host_root.ok_or("Run channel needs host_root")?;
         PodmanChannel {
             name: name.to_string(),
@@ -105,11 +113,13 @@ pub(super) fn podman_from_config(
             worktree: None,
             seq: AtomicUsize::new(1),
             status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
-            managed,
+            managed_container: true,
+            managed_worktree: false,
             shell: Mutex::new(None),
         }
     } else if let Some(container) = &cfg.container {
-        // Attach-Modus: an bestehende Verbindung andocken (geteilt).
+        // Attach-Modus: an bestehende Verbindung andocken (geteilt). Der
+        // Container gehört nicht aidev → wird beim Beenden nicht gestoppt.
         PodmanChannel {
             name: name.to_string(),
             mode: PodmanMode::Attach,
@@ -127,13 +137,16 @@ pub(super) fn podman_from_config(
             worktree: None,
             seq: AtomicUsize::new(1),
             status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
-            managed,
+            managed_container: false,
+            managed_worktree: false,
             shell: Mutex::new(None),
         }
     } else {
         return Err("Podman-Kanal braucht image (run) oder container (attach)".into());
     };
     if let Some(wt) = worktree {
+        // Ein übergebener Worktree wurde von aidev angelegt (Picker-Branch ohne
+        // Worktree bzw. /branch) → als verwalteter Worktree markieren.
         channel = channel.with_worktree(wt);
     }
     Ok(channel)
@@ -229,7 +242,10 @@ pub(super) fn uidmap_args(u: u32, g: u32) -> Vec<String> {
 
 impl PodmanChannel {
     pub fn with_worktree(mut self, wt: crate::repo::WorktreeInfo) -> Self {
+        // Ein gebundener Worktree wurde von aidev angelegt → als verwaltet
+        // markieren (aufräumen beim Schließen).
         self.worktree = Some(wt);
+        self.managed_worktree = true;
         self
     }
 
@@ -264,7 +280,8 @@ impl PodmanChannel {
             worktree: None,
             seq: AtomicUsize::new(1),
             status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
-            managed: Arc::new(Mutex::new(Vec::new())),
+            managed_container: true,
+            managed_worktree: false,
             shell: Mutex::new(None),
         }
     }
@@ -352,15 +369,9 @@ impl PodmanChannel {
             ));
         }
 
-        {
-            let mut g = self
-                .managed
-                .lock()
-                .map_err(|_| "managed-Lock verloren".to_string())?;
-            if !g.iter().any(|n| n == container) {
-                g.push(container.to_string());
-            }
-        }
+        // `managed_container` ist bereits beim Erzeugen des Kanals gesetzt
+        // (Run-Modus) und wird über die Lebensdauer nicht verändert – hier ist
+        // keine Registrierung nötig.
         self.set_status(ChannelStatus::Running);
         Ok(())
     }
@@ -554,22 +565,14 @@ impl Channel for PodmanChannel {
     ///   Arbeitskopie (würden beim Stoppen des `--rm`-Containers verworfen),
     /// - nicht committete Änderungen in der Git-Arbeitskopie (`host_root`).
     ///
-    /// Nur für tatsächlich verwaltete (beim Beenden stoppt aidev nur diese)
-    /// und laufende Container; Attach-/Local- und nie gestartete Run-Kanäle
-    /// melden nichts.
+    /// Nur für tatsächlich verwaltete (beim Beenden stoppt aidev nur diese:
+    /// `managed_container = true`) und laufende Container; Attach-/Local- und
+    /// nie gestartete Run-Kanäle melden nichts.
     fn essential_changes(&self) -> Option<Vec<String>> {
-        if self.mode != PodmanMode::Run {
-            return None;
-        }
         // Nur Container, die aidev selbst verwaltet und beim Beenden stoppen
         // würde – kein Hinweis auf extern geteilte/lediglich wiederverwendete
         // Verbindungen, die gar nicht gestoppt werden.
-        let managed = self
-            .managed
-            .lock()
-            .map(|g| g.iter().any(|n| n == &self.container))
-            .unwrap_or(false);
-        if !managed {
+        if !self.managed_container {
             return None;
         }
         // Nur ein tatsächlich laufender Container kann beim Stoppen etwas
@@ -581,15 +584,16 @@ impl Channel for PodmanChannel {
             return None;
         }
 
-        let mut notes: Vec<String> = Vec::new();
-        if let Some(layer) = container_layer_changes(&self.container, &self.workdir, &self.home) {
-            notes.push(layer);
-        }
-        if let Some(host) = self.host_root.as_deref() {
-            if let Some(git) = git_worktree_changes(host) {
-                notes.push(git);
-            }
-        }
+        // Der `git status`-Aufruf für die Arbeitskopie wird nur bei verwaltetem
+        // Worktree überhaupt gestartet – sonst ist er pure Verschwendung für
+        // normale Host-Ordner.
+        let layer = container_layer_changes(&self.container, &self.workdir, &self.home);
+        let worktree = if self.managed_worktree {
+            self.host_root.as_deref().and_then(git_worktree_changes)
+        } else {
+            None
+        };
+        let notes = change_notes(self.managed_worktree, layer, worktree);
         if notes.is_empty() {
             None
         } else {
@@ -665,17 +669,24 @@ impl Channel for PodmanChannel {
                     mode: PodmanMode::Run,
                     container: format!("{}-d{seq}", self.container),
                     workdir: self.workdir.clone(),
-                    host_root: Some(worktree),
+                    host_root: Some(worktree.clone()),
                     image: self.image.clone(),
                     timeout: self.timeout,
                     uid: self.uid,
                     gid: self.gid,
                     home: self.home.clone(),
                     usermapping: self.usermapping,
-                    worktree: None,
+                    // Alt+D hat dieses Worktree selbst angelegt → verwaltet und
+                    // beim Schließen aufzuräumen (Metadata für die Aufräum-Logik).
+                    worktree: Some(crate::repo::WorktreeInfo {
+                        name: branch.clone(),
+                        branch: branch.clone(),
+                        path: worktree,
+                    }),
                     seq: AtomicUsize::new(1),
                     status: Arc::new(Mutex::new(ChannelStatus::Unknown)),
-                    managed: self.managed.clone(),
+                    managed_container: true,
+                    managed_worktree: true,
                     shell: Mutex::new(None),
                 };
                 new.ensure_running(&new.container, new.host_root.as_deref().unwrap())?;
@@ -691,6 +702,37 @@ impl Channel for PodmanChannel {
     fn owned_worktree(&self) -> Option<&crate::repo::WorktreeInfo> {
         self.worktree.as_ref()
     }
+
+    fn managed_container(&self) -> bool {
+        self.managed_container
+    }
+
+    fn managed_worktree(&self) -> bool {
+        self.managed_worktree
+    }
+}
+
+/// Baut die Hinweis-Zeilen für den Beenden-/Schließen-Dialog:
+/// - der Container-Diff (`layer`) erscheint immer,
+/// - die Arbeitskopie-Änderungen (`worktree`) nur, wenn der Kanal einen von
+///   aidev verwalteten Worktree hat (`managed_worktree`); ein normaler
+///   Host-Ordner, der zufällig ein Git-Checkout ist, wird nicht angemeckert.
+/// Reine Funktion, damit die Bedingung ohne podman/git testbar ist.
+pub(super) fn change_notes(
+    managed_worktree: bool,
+    layer: Option<String>,
+    worktree: Option<String>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(layer) = layer {
+        notes.push(layer);
+    }
+    if managed_worktree {
+        if let Some(git) = worktree {
+            notes.push(git);
+        }
+    }
+    notes
 }
 
 impl PodmanChannel {

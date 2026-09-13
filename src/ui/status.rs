@@ -11,13 +11,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::app::{App, Phase, Session};
+use crate::app::{prompt_tokens, App, Phase, Session};
 use crate::channel::ChannelStatus;
 
-use super::{
-    tool_icon, tool_name, ACCENT, ACCENT_FG, ERROR_FG, MUTED, SPINNER, STATUS_BG, SYM_ERR,
-    SYM_MUTED, SYM_OK, SYM_WARN,
-};
+use super::{fmt_duration, theme, tool_icon, tool_name, SPINNER};
 
 pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let meta = metadata_line(app);
@@ -25,12 +22,12 @@ pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::horizontal([Constraint::Fill(1), Constraint::Max(rlen)]).split(area);
 
     let left = Paragraph::new(status_left(app, cols[0].width as usize))
-        .style(Style::default().bg(STATUS_BG));
+        .style(Style::default().bg(theme().status_bg));
     f.render_widget(left, cols[0]);
 
     let right = Paragraph::new(meta)
         .alignment(Alignment::Right)
-        .style(Style::default().bg(STATUS_BG));
+        .style(Style::default().bg(theme().status_bg));
     f.render_widget(right, cols[1]);
 }
 
@@ -58,9 +55,12 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
     }
     if let Some((summary, retry_at)) = &s.retrying {
         let ch = SPINNER[app.spinner % SPINNER.len()];
-        let left = retry_at.saturating_duration_since(Instant::now()).as_secs() + 1;
+        // Countdown in Millisekunden, aufgerundet auf die nächste volle Sekunde –
+        // so zeigt `fmt_duration` ganze Sekunden und nie „0 s“/Bruchteile.
+        let left_ms = retry_at.saturating_duration_since(Instant::now()).as_millis() as u64;
+        let next_sec = (left_ms / 1000 + 1) * 1000;
         return muted_line(
-            format!(" {ch} {summary} – Retry in {left}s"),
+            format!(" {ch} {summary} – Retry in {}", fmt_duration(next_sec)),
             Color::Rgb(245, 158, 11),
         );
     }
@@ -73,13 +73,58 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
     }
     if s.phase == Phase::WaitingForLLM {
         let ch = SPINNER[app.spinner % SPINNER.len()];
-        muted_line(format!(" {ch} thinking…"), ACCENT_FG)
+        streaming_line(s, ch)
     } else if let Some(err) = &s.error {
         muted_line(format!(" {err}"), Color::Rgb(240, 113, 120))
     } else if s.aborted {
-        muted_line(" Aborted".to_string(), ACCENT_FG)
+        muted_line(" Aborted".to_string(), theme().highlight)
     } else {
         key_help(&STATUS_KEYS, max_width)
+    }
+}
+
+/// Linke Hälfte während `WaitingForLLM`: Solange kein erstes Inhalt-Byte da
+/// ist, zählt „thinking… Ns“ die Wartezeit hoch (ab dem Runden-/Request-Start,
+/// Fallback `sent_at`). Sobald Daten eintreffen, wird die Zeit auf den
+/// gemessenen TTFT-Wert eingefroren und stattdessen die aktuelle TPS-Rate
+/// angezeigt (Tokens bis jetzt / Zeit seit dem ersten Token).
+fn streaming_line(s: &Session, ch: &str) -> Line<'static> {
+    let text = match s.ttft_ms {
+        Some(ttft) => {
+            let rate = live_tps(s);
+            format!(" {ch} thinking… {} · {} tps", fmt_duration(ttft), rate)
+        }
+        None => {
+            let waited = s
+                .round_started_at
+                .or(s.sent_at)
+                .map_or(0, |t| t.elapsed().as_millis() as u64);
+            format!(" {ch} thinking… {}", fmt_duration(waited))
+        }
+    };
+    Line::from(Span::styled(text, Style::default().fg(theme().highlight)))
+}
+
+/// Live-Tokenrate der laufenden Runde: `stream_tokens` (bestätigte
+/// usage-Inkremente + Schätzung) geteilt durch die Zeit seit dem ersten Token.
+fn live_tps(s: &Session) -> String {
+    let elapsed = s.first_token_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    if elapsed <= 0.0 {
+        return fmt_tps(0.0);
+    }
+    fmt_tps(s.stream_tokens as f64 / elapsed)
+}
+
+/// Token-pro-Sekunde kompakt mit „.“ als Dezimaltrenner, z. B. „34.2“,
+/// „120“, „1.1k“ – bewusst ohne „ tps“-Suffix (das hängt der Aufrufer an).
+pub(crate) fn fmt_tps(rate: f64) -> String {
+    if rate >= 1000.0 {
+        let v = rate / 1000.0;
+        format!("{v:.1}k")
+    } else if rate >= 100.0 {
+        format!("{rate:.0}")
+    } else {
+        format!("{rate:.1}")
     }
 }
 
@@ -129,8 +174,8 @@ pub(crate) const EXEC_KEYS: [(&str, &str); 3] =
 /// passen, werden in Anzeige-Reihenfolge weggelassen. Wird von der
 /// Statusleiste und sämtlichen Dialogen gemeinsam genutzt.
 pub(crate) fn key_help(bindings: &[(&str, &str)], max_width: usize) -> Line<'static> {
-    let key_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(MUTED);
+    let key_style = Style::default().fg(theme().accent).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(theme().muted);
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     let mut width = 1usize; // führendes Leerzeichen
     let mut first = true;
@@ -173,16 +218,26 @@ pub(crate) fn key_help_full_width(bindings: &[(&str, &str)]) -> usize {
 /// Daten eintreffen (mid-stream `UsageUpdate` bzw. Runden-`Usage`), zeigt die
 /// Statusleiste Deren `total_tokens` an dieser Stelle – nicht die der letzten
 /// abgeschlossenen Runde. Nur solange noch kein Live-Wert vorliegt (Turn-Start,
-/// noch keine neuen Daten), fällt sie auf die letzte abgeschlossene Runde bzw.
-/// die `prompt_base`-Basis zurück.
+/// noch keine neuen Daten), fällt sie auf den zuletzt abgeschlossenen Turn
+/// zurück – aber NUR wenn dessen Usage den aktuellen Kontext widerspiegelt.
+/// Direkt nach einer Compaction liegt der letzte Usage in der alten (größeren)
+/// Historie; dann zeigt sie die geschätzten Kontext-Tokens (`prompt_tokens`:
+/// Summary exakt + Heuristik der überlebenden Turns) bzw. die `prompt_base`-
+/// Basis.
 fn context_tokens(s: &Session) -> Option<u64> {
     // Live-Wert hat Vorrang, sobald er gesetzt ist: neue Daten zeigen sofort
     // deren `total_tokens`, statt bis zum Rundenende zu warten.
     if let Some(t) = s.live_usage_total.filter(|&t| t > 0) {
         return Some(t);
     }
-    if let Some(u) = s.last_usage() {
+    if let Some(u) = s.last_usage_current() {
         return Some(u.total_tokens);
+    }
+    // Nach (oder ohne) Compaction: geschätzte Kontext-Tokens aus dem Event-Log
+    // (Summary exakt + überlebende Turns), sonst `prompt_base` als obere Schranke.
+    let est = prompt_tokens(s);
+    if est > 0 {
+        return Some(est);
     }
     (s.prompt_base > 0).then_some(s.prompt_base)
 }
@@ -221,7 +276,7 @@ pub(crate) fn fmt_ctx(n: u64) -> String {
 /// Git-Status (fallsRepo), Arbeitsverzeichnis.
 pub(crate) fn metadata_line(app: &App) -> Line<'static> {
     let s = &app.sessions[app.active];
-    let muted = Style::default().fg(MUTED);
+    let muted = Style::default().fg(theme().muted);
     // Gewähltes Modell der Session: Alias (falls per /model gewählt), sonst
     // die konfigurierte Modell-ID.
     let mut parts: Vec<Span<'static>> = vec![Span::styled(app.display_model(app.active), muted)];
@@ -238,7 +293,7 @@ pub(crate) fn metadata_line(app: &App) -> Line<'static> {
         // (grau wenn clean, rot wenn dirty). Der Cache ist nur gesetzt, wenn ein
         // Git-Repo gebunden ist.
         if let Some((label, clean)) = &app.git_status_cache {
-            let color = if *clean { MUTED } else { ERROR_FG };
+            let color = if *clean { theme().muted } else { theme().err };
             parts.push(Span::styled(" · ", muted));
             parts.push(Span::styled(label.clone(), Style::default().fg(color)));
         }
@@ -260,7 +315,7 @@ pub(crate) fn metadata_line(app: &App) -> Line<'static> {
                 // Aktiver Zoom: hervorgehoben
                 parts.push(Span::styled(
                     *sym,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
                 ));
             } else {
                 parts.push(Span::styled(*sym, muted));
@@ -308,9 +363,9 @@ pub(crate) fn git_status_info(host_root: &std::path::Path) -> Option<GitStatusIn
 /// Semantische Farbe des `⬢`-Kanal-Indikators je nach Zustand.
 pub(crate) fn channel_status_color(status: ChannelStatus) -> Color {
     match status {
-        ChannelStatus::Running => SYM_OK,
-        ChannelStatus::Starting => SYM_WARN,
-        ChannelStatus::Problem => SYM_ERR,
-        ChannelStatus::Unknown => SYM_MUTED,
+        ChannelStatus::Running => theme().ok,
+        ChannelStatus::Starting => theme().warn,
+        ChannelStatus::Problem => theme().err,
+        ChannelStatus::Unknown => theme().muted,
     }
 }

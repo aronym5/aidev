@@ -109,6 +109,17 @@ pub enum WorkerEvent {
     ToolOutput(usize, String),
     /// Ein Werkzeug ist beendet (Ergebnis im Session-Tool-Log).
     ToolEnd(usize, ToolActivity),
+    /// Alle Werkzeuge einer Tool-Runde sind beendet – der Worker kennt das
+    /// Rundenende explizit (er kennt `tools.len()`), die UI dagegen sieht nur
+    /// verschachtelte `ToolStart`/`ToolEnd`-Paare ohne Zähler. Die UI schließt
+    /// damit die offene Assistant-Runde sofort ab (`finish_assistant`), statt
+    /// bis zum ersten Chunk der Folgerunde zu warten – die serverbestätigte
+    /// `reported_usage` steht dadurch schon während der Folge-Anfrage auf dem
+    /// Event (`last_usage`, Verifikation, Balken), nicht erst nach deren
+    /// Time-to-first-Token. Idempotent: ohne offene Tool-Runde ein No-Op, die
+    /// Lazy-Abschlüsse bei `Chunk`/`Reasoning`/`Usage`/`Done` bleiben als
+    /// Fallback erhalten.
+    RoundEnd(usize),
     /// Ein `run`-Werkzeugaufruf auf einem Local-Kanal braucht im
     /// `ConfirmEach`-Modus die Freigabe des Users. `label` ist die
     /// Kurzbeschreibung, `command` die Rohform für die Anzeige. Über `reply`
@@ -141,6 +152,24 @@ pub enum WorkerEvent {
     ),
     /// Modell-Liste von einem Provider abgerufen: `(modell_id, demand)`.
     ModelsRefreshed(Vec<(String, Option<u64>)>),
+    /// Eine neue HTTP-Runde der laufenden Antwort wird abgesendet
+    /// (`t0` = Zeitpunkt des Request-Starts). Die Statusleiste setzt damit ihre
+    /// Streaming-Metrik-Felder zurück und zählt „thinking…“ ab diesem Zeitpunkt
+    /// hoch, bis das erste Inhalt-Byte eintrifft.
+    RoundStart(usize, Instant),
+    /// Erstes Inhalt-Byte der Antwort ist eingetroffen (Reasoning, Tool-Call
+    /// oder Content); `ttft_ms` = gemessene Time-to-first-Token ab dem Absenden
+    /// des HTTPS-Requests. Die Statusleiste friert hier ihren hochzählenden
+    /// Zähler auf diesen Wert ein.
+    FirstToken(usize, u64),
+    /// Live-Fortschritt der laufenden Runde für die TPS-Anzeige:
+    /// `(tokens, stream_ms)` – `tokens` = bestätigte (aus den inkrementellen
+    /// usage-`completion_tokens`) + für das letzte unbestätigte Fenster
+    /// geschätzte Tokens; `stream_ms` = seit dem ersten Token vergangene Zeit.
+    StreamProgress(usize, u64, u64),
+    /// Eine HTTP-Runde ist abgeschlossen; `metrics` sind die gemessenen
+    /// Streaming-Metriken (TTFT, Stream-Zeit, Tokens aus den usage-Inkrementen).
+    RoundMetrics(usize, RoundMetrics),
 }
 
 /// Token-Verbrauch der letzten Antwort (via `stream_options.include_usage`).
@@ -171,6 +200,29 @@ pub struct CompletionParts {
     pub content: u64,
     /// Je Tool-Call der Runde, in der Reihenfolge der `tool_calls` der Antwort.
     pub tool_calls: Vec<u64>,
+}
+
+/// Streaming-Metriken einer einzelnen HTTP-Runde der laufenden Antwort.
+///
+/// Wird beim Streaming gemessen (siehe `http::StreamTimer`) und als
+/// `WorkerEvent::RoundMetrics` an die UI geschickt, wo sie am zugehörigen
+/// Assistant-Event landet. Für die Fußzeile einer Antwort werden die Werte
+/// über alle Runden des Turns akkumuliert.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RoundMetrics {
+    /// Time-to-first-token in ms: Absenden des HTTPS-Requests → erstes
+    /// Inhalt-Byte (Reasoning, Tool-Call oder Content). `0` = nie ein Token
+    /// gesehen (z. B. leere Antwort).
+    pub ttft_ms: u64,
+    /// Gemessenes Streaming-Fenster in ms: vom ersten Token bis zum
+    /// Rundenende (`[DONE]`). `0` = keine Tokens.
+    pub stream_ms: u64,
+    /// Tokens im Streaming-Fenster: Summe der **inkrementellen**
+    /// `completion_tokens`, die der Server regelmäßig mitten im Stream
+    /// mitschickt (`usage`-Events, siehe `RoundPartsAccumulator::apply_usage`).
+    /// Liefert der Server gar kein usage, fällt die Zahl auf die
+    /// Zeichen-Schätzung (chars/4) zurück.
+    pub tokens: u64,
 }
 
 mod api;

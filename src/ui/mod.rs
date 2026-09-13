@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -43,16 +43,16 @@ fn logo_lines(width: usize) -> Vec<Line<'static>> {
                     spans.push(Span::raw(chars[..dot].iter().collect::<String>()));
                     spans.push(Span::styled(
                         chars[dot..dot + 1].iter().collect::<String>(),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
                         chars[dot + 1..].iter().collect::<String>(),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(theme().muted),
                     ));
                     return Line::from(spans);
                 }
             }
-            spans.push(Span::styled(l.to_string(), Style::default().fg(MUTED)));
+            spans.push(Span::styled(l.to_string(), Style::default().fg(theme().muted)));
             Line::from(spans)
         })
         .collect()
@@ -66,7 +66,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     // Gesamter Hintergrund zuerst – unterliegt allen Rändern/Paddings.
-    let bg = Paragraph::new("").style(Style::default().bg(BASE_BG));
+    let bg = Paragraph::new("").style(Style::default().bg(CANVAS_BG));
     f.render_widget(bg, area);
 
     let active = app.active;
@@ -140,15 +140,15 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         let text = format!(" {label} {mark} ");
         let style = if is_active {
             Style::default()
-                .fg(Color::White)
+                .fg(theme().band_fg)
                 .add_modifier(Modifier::BOLD)
-                .bg(INPUT_BG)
+                .bg(theme().band_bg)
         } else {
-            Style::default().fg(MUTED).bg(STATUS_BG)
+            Style::default().fg(theme().muted).bg(theme().status_bg)
         };
         spans.push(Span::styled(text, style));
     }
-    let band = Paragraph::new(Line::from(spans)).style(Style::default().bg(STATUS_BG));
+    let band = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme().status_bg));
     f.render_widget(band, area);
 }
 
@@ -161,7 +161,6 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let viewport = area.height as usize;
     let width = area.width as usize;
-    let mode = app.config.symbols;
     let active = app.active;
     let model = app.display_model(active);
     let window = app
@@ -171,7 +170,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // Historie-Cache ggf. neu aufbauen (mutabler Borrow, endet sofort).
     {
         let s = &mut app.sessions[active];
-        ensure_history_cache(s, width, mode, &model, window);
+        ensure_history_cache(s, width, &model, window);
     }
 
     // Layout + Scroll + Rendern in einem Scope, der die Chat-Daten immutable
@@ -179,7 +178,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let (new_anchor, at_bottom, live_used) = {
         let s = &app.sessions[active];
         let cache = s.history_cache.as_ref().expect("History-Cache vorhanden");
-        let (live, live_used) = build_live_blocks(s, width, mode, window, &cache.end_ctx);
+        let (live, live_used) = build_live_blocks(s, width, window, &cache.end_ctx);
 
         let logo_gap = viewport.saturating_sub(LOGO_ROWS as usize) / 2;
         let logo = ChatBlock {

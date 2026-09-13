@@ -7,233 +7,315 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Phase};
-use crate::channel::ChannelStatus;
+use crate::app::{App, BuilderEdit, ChannelPick, ListNav, ModelPick, Phase, Session};
+use crate::channel::{ChannelRegistry, ChannelStatus};
 
 use super::*;
 
-/// Schätzt die nötige Innen-Breite (ohne Innenrand) des Channel-Pickers,
-/// damit Kanalnamen und der neu eingeblendete Session-Hinweis
-/// (z. B. „· Session 1, 3 (aktiv)") nicht rechts abgeschnitten werden.
-pub(crate) fn channel_picker_content_width(app: &App, picker: &crate::app::ChannelPicker) -> usize {
-    // Titel und Fußzeile (die längste statische Zeile) mitberücksichtigen.
-    let mut w = " Choose channel for this session ".chars().count();
-    w = w.max(key_help_full_width(&CHANNEL_PICKER_KEYS));
-    // „(no channel)"-Zeile: Indikator(1) + „ {name}".
-    w = w.max(1 + 1 + "(no channel)".chars().count());
-    // Kanal-Zeilen: Indikator(1) + „ {name}" + ggf. „  {usage}".
-    for item in picker.items.iter().skip(1) {
-        let usage = channel_usage(app, item);
-        let mut row = 1 + 1 + item.chars().count();
-        if !usage.is_empty() {
-            row += 2 + usage.chars().count();
+/// Breiten-/Größen-Vorgabe eines Auswahl-Overlays.
+pub(crate) struct OverlayCfg {
+    /// Mindestbreite des Dialogs.
+    pub min_width: u16,
+    /// Maximalbreite (vor dem Rand-Abzug zur Terminalbreite) – nur für den
+    /// `fraction`-Modus relevant.
+    pub max_width: u16,
+    /// `Some(n)` → feste Breite = `n/10` der Terminalbreite (Bestätigungs-/
+    /// Builder-Stil); `None` → Breite am Inhalt orientieren (Picker-Stil).
+    pub fraction: Option<u16>,
+}
+
+/// Gemeinsames, zentriertes Rendern einer scrollbaren Auswahlliste.
+///
+/// Zeichnet Hintergrund mit Innenrand, Titel, die (ggf. gescrollten) Einträge,
+/// optionale Zusatzzeilen (`extras`, z. B. „… fetching models …“) und die
+/// Tasten-Hilfe. Reicht die Liste nicht in die verfügbare Höhe, scrollt sie
+/// über den `nav`-Offset (`follow` hält den Cursor dabei sichtbar) und die
+/// Fußzeile zeigt einen „▴ N–M/K ▾“-Hinweis.
+///
+/// `row_of(item, spaltenbreite)` liefert die (ggf. umgebrochene) Höhe eines
+/// Eintrags, `render(item, markiert)` dessen Zeile, `width_of(item)` dessen
+/// Anzeige-Breite für die Content-Fit-Dialogbreite. Reine Zeichenzählung –
+/// ohne Terminal testbar.
+/// Bewusst viele Parameter: ein Render-Widget, das alle Werte effizient in
+/// einem Rendering-Durchlauf verbraucht (statt sie in einem zusätzlichen
+/// Konfig-Objekt zu bündeln).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_list_overlay<T>(
+    f: &mut Frame,
+    area: Rect,
+    cfg: &OverlayCfg,
+    nav: &mut ListNav,
+    items: &[T],
+    title: &str,
+    title_fg: Color,
+    row_of: impl Fn(&T, u16) -> u16,
+    render: impl Fn(&T, bool) -> Line<'static>,
+    width_of: impl Fn(&T) -> usize,
+    footer: &[(&str, &str)],
+    extras: &[Line<'static>],
+) {
+    let pad = PICKER_PAD as u16;
+    let max_w = area.width.saturating_sub(4).max(cfg.min_width);
+
+    // --- Breite: fest (Fraction) oder am Inhalt orientiert ---
+    // Im Content-Fit-Fall wird der Inhalt aller Einträge vermessen (auch der
+    // nicht sichtbaren), damit nichts rechts abgeschnitten wird.
+    let width = match cfg.fraction {
+        Some(fr) => (area.width * fr / 10).clamp(cfg.min_width, cfg.max_width.min(max_w)),
+        None => {
+            let content_w = format!(" {title} ")
+                .chars()
+                .count()
+                .max(key_help_full_width(footer))
+                .max(extras.iter().map(line_width).max().unwrap_or(0))
+                .max(items.iter().map(width_of).max().unwrap_or(0));
+            ((content_w + PICKER_PAD * 2) as u16).clamp(cfg.min_width, max_w)
         }
-        w = w.max(row);
+    };
+
+    // --- Höhe: natürlich (alle Einträge) oder geklemmt (dann wird gescrollt) ---
+    let natural = items.len() as u16 + extras.len() as u16 + 4;
+    let max_height = area.height.saturating_sub(6).max(5);
+    let height = natural.min(max_height).max(5);
+    let inner_width = width.saturating_sub(pad * 2);
+    // Liste: Höhe − 2 (Rahmen) − Titel(1) − extras − Fußzeile(1), mind. 1.
+    let viewport = height
+        .saturating_sub(2)
+        .saturating_sub(1 + extras.len() as u16 + 1)
+        .max(1);
+    // Cursor im Fenster halten; `row_of` berücksichtigt mehrzeilige Einträge.
+    nav.follow(viewport, |i| row_of(&items[i], inner_width));
+    let range = nav.visible(viewport);
+
+    // --- Overlay-Rahmen ---
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let bg = Paragraph::new("").style(Style::default().bg(theme().status_bg));
+    f.render_widget(bg, rect);
+    let inner = Rect::new(
+        rect.x + pad,
+        rect.y + 1,
+        inner_width,
+        height.saturating_sub(2),
+    );
+
+    // --- Inhalt ---
+    let title_line = Line::from(Span::styled(
+        format!(" {title} "),
+        Style::default().fg(title_fg).add_modifier(Modifier::BOLD),
+    ));
+    let mut lines: Vec<Line> = Vec::with_capacity(2 + range.len() + extras.len());
+    lines.push(title_line);
+    for pos in range.clone() {
+        let selected = pos == nav.cursor();
+        lines.push(render(&items[pos], selected));
     }
-    w
+    lines.extend(extras.iter().cloned());
+    let hint = if nav.offset() > 0 || range.end < items.len() {
+        Some(scroll_hint(&range, items.len()))
+    } else {
+        None
+    };
+    lines.push(footer_line(footer, inner_width as usize, hint));
+
+    let para = Paragraph::new(lines).style(Style::default().bg(theme().status_bg));
+    f.render_widget(para, inner);
+}
+
+/// Anzeige-Breite einer (bereits gebauten) Zeile in Zeichen.
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// „▴ N–M/K ▾“-Vermerk für scrollende Listen: `▴` wenn oberhalb noch Einträge
+/// stehen, `▾` wenn unterhalb noch welche folgen.
+fn scroll_hint(range: &std::ops::Range<usize>, total: usize) -> String {
+    let mut s = String::new();
+    if range.start > 0 {
+        s.push('▴');
+    }
+    s.push_str(&format!(" {}–{}/{}", range.start + 1, range.end, total));
+    if range.end < total {
+        s.push_str(" ▾");
+    }
+    s
+}
+
+/// Tasten-Hilfszeile – mit rechtsbündig angehängtem Scroll-Hinweis, falls
+/// übergeben und noch Platz vorhanden.
+fn footer_line(
+    bindings: &[(&str, &str)],
+    max_width: usize,
+    hint: Option<String>,
+) -> Line<'static> {
+    let kh = key_help(bindings, max_width);
+    let Some(h) = hint else {
+        return kh;
+    };
+    let used: usize = kh.spans.iter().map(|s| s.content.chars().count()).sum();
+    let avail = max_width.saturating_sub(used);
+    if avail >= h.chars().count() {
+        let mut spans = kh.spans;
+        spans.push(Span::raw(" ".repeat(avail - h.chars().count())));
+        spans.push(Span::styled(h, Style::default().fg(theme().muted)));
+        Line::from(spans)
+    } else {
+        kh
+    }
 }
 
 /// Zentrierter Auswahl-Dialog für den Kanal der aktiven Session.
-pub(crate) fn draw_channel_picker(f: &mut Frame, app: &App) {
-    let Some(picker) = &app.channel_picker else {
+pub(crate) fn draw_channel_picker(f: &mut Frame, app: &mut App) {
+    let Some(picker) = app.channel_picker.as_mut() else {
         return;
     };
     let area = f.area();
-
-    // Breite dynamisch an den Inhalt anpassen – sonst werden Kanalnamen samt
-    // Session-Hinweis („· Session …") rechts abgeschnitten, sobald dieser
-    // länger als die bisherige Festbreite ist.
-    let content_w = channel_picker_content_width(app, picker);
-    let max_w = area.width.saturating_sub(4) as usize;
-    let width = ((content_w + PICKER_PAD * 2).clamp(24, max_w)) as u16;
-
-    let mut height = picker.items.len() as u16 + 4;
-    height = height.min(area.height.saturating_sub(6).max(5));
-    let rect = Rect::new(
-        area.x + (area.width.saturating_sub(width)) / 2,
-        area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
+    let channels = &app.channels;
+    let sessions = &app.sessions;
+    let cfg = OverlayCfg {
+        min_width: 24,
+        max_width: 80,
+        fraction: None,
+    };
+    draw_list_overlay(
+        f,
+        area,
+        &cfg,
+        &mut picker.items.nav,
+        &picker.items.items,
+        "Choose channel for this session",
+        theme().accent,
+        |_, _| 1,
+        |item, sel| match item {
+            ChannelPick::NoChannel => channel_picker_row("(no channel)", None, sel, ""),
+            ChannelPick::NewChannel => channel_picker_new_channel_row(sel),
+            ChannelPick::Channel { name } => {
+                let status = channels.get(name).map(|ch| ch.status());
+                let usage = channel_usage(sessions, channels, name);
+                channel_picker_row(name, status, sel, &usage)
+            }
+        },
+        |item| channel_pick_width(sessions, channels, item),
+        &CHANNEL_PICKER_KEYS,
+        &[],
     );
+}
 
-    // Hintergrund des Dialogs flächig füllen (modern ohne schwere Rahmen).
-    // Das `Clear` löscht zuerst den gesamten Inhaltsbereich unter dem Dialog,
-    // damit das Overlay den Chat vollständig abdeckt.
-    f.render_widget(Clear, rect);
-    let bg = Paragraph::new("").style(Style::default().bg(STATUS_BG));
-    f.render_widget(bg, rect);
-
-    // Inhalt beginnt erst nach einem Innenrand – der Rand gehört überall zum
-    // Overlay, nicht nur links vom Text (die Lampen liegen dadurch im Overlay).
-    let pad = PICKER_PAD as u16;
-    let inner = Rect::new(
-        rect.x + pad,
-        rect.y + 1,
-        rect.width.saturating_sub(pad * 2),
-        rect.height.saturating_sub(2),
-    );
-    let title = Line::from(Span::styled(
-        " Choose channel for this session ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ));
-    let mut lines: Vec<Line> = vec![title];
-    lines.push(channel_picker_row(
-        "(no channel)",
-        None,
-        picker.cursor == 0,
-        "",
-    ));
-    for (i, item) in picker.items.iter().enumerate().skip(1) {
-        if item == "new channel" {
-            lines.push(channel_picker_new_channel_row(i == picker.cursor));
-        } else {
-            let status = app.channels.get(item).map(|ch| ch.status());
-            let usage = channel_usage(app, item);
-            lines.push(channel_picker_row(item, status, i == picker.cursor, &usage));
+/// Anzeige-Breite einer Kanal-Picker-Zeile (Indikator 1 + „ {name}" + ggf.
+/// „  {usage}") – für die Content-Fit-Dialogbreite.
+fn channel_pick_width(
+    sessions: &[Session],
+    channels: &ChannelRegistry,
+    item: &ChannelPick,
+) -> usize {
+    match item {
+        ChannelPick::NoChannel => 1 + 1 + "(no channel)".chars().count(),
+        ChannelPick::NewChannel => 1 + 1 + "new channel".chars().count(),
+        ChannelPick::Channel { name } => {
+            let usage = channel_usage(sessions, channels, name);
+            let mut w = 1 + 1 + name.chars().count();
+            if !usage.is_empty() {
+                w += 2 + usage.chars().count();
+            }
+            w
         }
     }
-    lines.push(key_help(&CHANNEL_PICKER_KEYS, inner.width as usize));
-    let para = Paragraph::new(lines).style(Style::default().bg(STATUS_BG));
-    f.render_widget(para, inner);
 }
 
 /// Zentrierter Auswahl-Dialog für das Modell der aktiven Session (`/model`).
-/// „(Standard)" erscheint nur als eigener Eintrag, wenn das Default-Modell
-/// bei den konfigurierten Modellen fehlt.
-pub(crate) fn draw_model_picker(f: &mut Frame, app: &App) {
-    let Some(picker) = &app.model_picker else {
+/// „(Standard)" erscheint als echter Eintrag, wenn das Default-Modell bei den
+/// konfigurierten Modellen fehlt.
+pub(crate) fn draw_model_picker(f: &mut Frame, app: &mut App) {
+    let Some(picker) = app.model_picker.as_mut() else {
         return;
     };
     let area = f.area();
-
-    // Breite dynamisch an den Inhalt anpassen (Titel, Zeilen, Fußzeile).
-    let title = " Model for this session ";
-    let mut content_w = title
-        .chars()
-        .count()
-        .max(key_help_full_width(&MODEL_PICKER_KEYS));
-    if picker.show_default {
-        // +3: ⬢-Indikator ist 2 Zellen breit + führendes Leerzeichen.
-        content_w = content_w.max(" (default)".chars().count() + 3);
-    }
-    for (_key, display) in &picker.items {
-        // +3 statt +1: Der ⬢-Indikator ist 2 Zellen breit und es folgt ein
-        // Leerzeichen – sonst wird die Demand-Angabe rechts abgeschnitten.
-        let row = display.chars().count() + 3;
-        content_w = content_w.max(row);
-    }
-    if picker.loading {
-        content_w = content_w.max(" … fetching models …".chars().count() + 1);
-    }
-    let max_w = area.width.saturating_sub(4) as usize;
-    let width = ((content_w + PICKER_PAD * 2).clamp(28, max_w)) as u16;
-
-    let extra = if picker.show_default { 1 } else { 0 };
-    let rows = picker.items.len() as u16 + extra;
-    let mut height = rows + 4;
-    height = height.min(area.height.saturating_sub(6).max(5));
-    let rect = Rect::new(
-        area.x + (area.width.saturating_sub(width)) / 2,
-        area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    );
-
-    f.render_widget(Clear, rect);
-    let bg = Paragraph::new("").style(Style::default().bg(STATUS_BG));
-    f.render_widget(bg, rect);
-
-    let pad = PICKER_PAD as u16;
-    let inner = Rect::new(
-        rect.x + pad,
-        rect.y + 1,
-        rect.width.saturating_sub(pad * 2),
-        rect.height.saturating_sub(2),
-    );
-
-    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
-        title,
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    ))];
-    if picker.show_default {
-        lines.push(model_picker_row("(default)", picker.cursor == 0, None));
-    }
-    for (i, (key, display)) in picker.items.iter().enumerate() {
-        let idx = if picker.show_default { i + 1 } else { i };
-        // Farblicher Status-Indikator aus der Model-Registry.
-        let color = app.model_registry.status(key).map(|s| match s {
-            crate::app::models::ModelStatus::ConfigAndFetched => SYM_OK, // grün
-            crate::app::models::ModelStatus::ConfigStale => SYM_ERR,     // rot
-            crate::app::models::ModelStatus::FetchedOnly => SYM_MUTED,   // grau
-        });
-        lines.push(model_picker_row(display, idx == picker.cursor, color));
-    }
-    if picker.loading {
-        lines.push(Line::from(Span::styled(
+    let registry = &app.model_registry;
+    let extras: Vec<Line<'static>> = if picker.loading {
+        vec![Line::from(Span::styled(
             " … fetching models …",
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        )));
-    }
-    lines.push(key_help(&MODEL_PICKER_KEYS, inner.width as usize));
-    let para = Paragraph::new(lines).style(Style::default().bg(STATUS_BG));
-    f.render_widget(para, inner);
+            Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
+        ))]
+    } else {
+        Vec::new()
+    };
+    let cfg = OverlayCfg {
+        min_width: 28,
+        max_width: 80,
+        fraction: None,
+    };
+    draw_list_overlay(
+        f,
+        area,
+        &cfg,
+        &mut picker.items.nav,
+        &picker.items.items,
+        "Model for this session",
+        theme().accent,
+        |_, _| 1,
+        |item, sel| match item {
+            ModelPick::Default => model_picker_row("(default)", sel, None),
+            ModelPick::Model { key, display } => {
+                // Farblicher Status-Indikator aus der Model-Registry.
+                let color = registry.status(key).map(|s| match s {
+                    crate::app::models::ModelStatus::ConfigAndFetched => theme().ok, // grün
+                    crate::app::models::ModelStatus::ConfigStale => theme().err,     // rot
+                    crate::app::models::ModelStatus::FetchedOnly => theme().muted,   // grau
+                });
+                model_picker_row(display, sel, color)
+            }
+        },
+        |item| match item {
+            // +3 statt +1: Der ⬢-Indikator ist 2 Zellen breit + Leerzeichen.
+            ModelPick::Default => 3 + "(default)".chars().count(),
+            ModelPick::Model { display, .. } => display.chars().count() + 3,
+        },
+        &MODEL_PICKER_KEYS,
+        &extras,
+    );
 }
 
 /// Eine Zeile des Modell-Auswahl-Dialogs: Status-Indikator (⬢) in der Farbe
 /// des Refresh-Status + Anzeigetext. Reine Funktion, damit sie ohne Terminal
 /// testbar ist.
 fn model_picker_row(display: &str, cursor: bool, status_color: Option<Color>) -> Line<'static> {
-    let base_color = if cursor {
-        Color::White
-    } else if display == "(default)" {
-        MUTED
-    } else {
-        ACCENT_FG
-    };
-    let bold = if cursor {
-        Modifier::BOLD
-    } else {
-        Modifier::empty()
-    };
     let indicator = Span::styled(
         "\u{2b22}",
-        Style::default().fg(status_color.unwrap_or(SYM_MUTED)),
+        Style::default().fg(status_color.unwrap_or(theme().muted)),
     );
     // Aufteilen in "provider/alias (name)" und "· demand".
     let (main, demand) = match display.split_once('·') {
         Some((m, d)) => (m.trim_end(), Some(d)),
         None => (display, None),
     };
-    let mut spans = vec![indicator];
-    // Base-Anteil: nur das "provider/alias"-Kürzel in base_color, ein
-    // dahinterstehender Modellname in Klammern in MUTED (wie die Demand-Angabe).
-    let gray = Style::default().fg(MUTED);
-    match main.find(" (") {
+    let base_fg = if display == "(default)" { theme().muted } else { theme().highlight };
+    let gray = Style::default().fg(theme().muted);
+    // Nur das "provider/alias"-Kürzel ist der markierte Text; ein dahinter-
+    // stehender Modellname in Klammern und die Demand-Angabe sind grau.
+    let (short, mut extra) = match main.find(" (") {
         Some(idx) if main.ends_with(')') => {
             let (short, name) = main.split_at(idx);
-            spans.push(Span::styled(
-                format!(" {short}"),
-                Style::default().fg(base_color).add_modifier(bold),
-            ));
-            spans.push(Span::styled(name.to_string(), gray));
+            (short, vec![Span::styled(name.to_string(), gray)])
         }
-        _ => {
-            spans.push(Span::styled(
-                format!(" {main}"),
-                Style::default().fg(base_color).add_modifier(bold),
-            ));
-        }
-    }
+        _ => (main, Vec::new()),
+    };
     if let Some(d) = demand {
-        spans.push(Span::styled(format!(" ·{d}"), gray));
+        extra.push(Span::styled(format!(" ·{d}"), gray));
     }
-    Line::from(spans)
+    plain_row(indicator, short, base_fg, cursor, extra)
 }
 
 /// Channel Builder: Tunnel | Host/Repo | Worktree. Ohne Repo-Wurzel als
-/// Host-Pfad entfällt die rechte Spalte (nur zwei Spalten).
-pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
-    let Some(builder) = &app.channel_builder else {
+/// Host-Pfad entfällt die rechte Spalte (nur zwei Spalten). Jede Spalte hat
+/// ihre eigene `ListNav`-Navigation (Umlauf, `with_wrap`); lange Spalten
+/// scrollen über `follow`, damit der Cursor immer sichtbar bleibt.
+pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
+    let Some(builder) = app.channel_builder.as_mut() else {
         return;
     };
     let area = f.area();
@@ -259,7 +341,7 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
     };
 
     // Spalten-Header
-    let header_style = Style::default().fg(MUTED).add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(theme().muted).add_modifier(Modifier::BOLD);
     let tunnel_header = Line::from(Span::styled(
         format!(" {:<width$}", "Tunnel", width = tunnel_w as usize - 1),
         header_style,
@@ -288,20 +370,21 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
     // === Style-Konstanten ===
     // Aktive Spalte: cursor → White + Bold, kein Hintergrund
     let active_style = Style::default()
-        .fg(Color::White)
+        .fg(theme().band_fg)
         .add_modifier(Modifier::BOLD);
     // Inaktive Spalte: genau ein markierter Eintrag
-    let selected_style = Style::default().fg(Color::White);
+    let selected_style = Style::default().fg(theme().band_fg);
     // Restliche Einträge: gedämpft
-    let normal_style = Style::default().fg(ACCENT_FG);
+    let normal_style = Style::default().fg(theme().highlight);
     // Branches ohne Worktree: noch gedämpfter
-    let dim_style = Style::default().fg(MUTED);
+    let dim_style = Style::default().fg(theme().muted);
 
     // Tunnel-Spalte
-    let mut tunnel_lines: Vec<Line> = vec![tunnel_header];
-    for (i, tunnel) in builder.tunnels.iter().enumerate() {
+    let tunnel_cursor = builder.tunnels.nav.cursor();
+    let mut tunnel_rows: Vec<Line<'static>> = Vec::new();
+    for (i, tunnel) in builder.tunnels.items.iter().enumerate() {
         let is_active_col = builder.col == 0;
-        let is_selected = i == builder.tunnel_idx;
+        let is_selected = i == tunnel_cursor;
         let style = if is_active_col && is_selected {
             active_style
         } else if is_selected {
@@ -316,21 +399,24 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
         } else {
             "  "
         };
-        tunnel_lines.push(Line::from(Span::styled(
+        tunnel_rows.push(Line::from(Span::styled(
             format!("{}{}", marker, tunnel.label()),
             style,
         )));
     }
     // Lade-Indikator solange Podman-Images noch nicht geladen sind
-    if !builder.images_loaded {
-        tunnel_lines.push(Line::from(Span::styled("  …", Style::default().fg(MUTED))));
-    }
+    let tunnel_extra = if !builder.images_loaded {
+        Some(Line::from(Span::styled("  …", Style::default().fg(theme().muted))))
+    } else {
+        None
+    };
 
     // Host-Spalte
-    let mut host_lines: Vec<Line> = vec![host_header];
-    for (i, hp) in builder.host_paths.iter().enumerate() {
+    let host_cursor = builder.host_paths.nav.cursor();
+    let mut host_rows: Vec<Line<'static>> = Vec::new();
+    for (i, hp) in builder.host_paths.items.iter().enumerate() {
         let is_active_col = builder.col == 1;
-        let is_selected = i == builder.host_idx;
+        let is_selected = i == host_cursor;
         let style = if is_active_col && is_selected {
             active_style
         } else if is_selected {
@@ -345,55 +431,49 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
         } else {
             "  "
         };
-        host_lines.push(Line::from(Span::styled(
+        host_rows.push(Line::from(Span::styled(
             format!("{}{}", marker, hp.label()),
             style,
         )));
     }
 
-    // Worktree-Spalte – entfällt komplett, wenn der Host-Pfad keine
+    // Worktree-Spalte entfällt komplett, wenn der Host-Pfad keine
     // Repo-Wurzel ist.
-    let worktree_lines: Option<Vec<Line>> = if show_worktrees {
-        let mut lines = vec![worktree_header.expect("Header bei Worktree-Spalte")];
-        if !builder.worktrees.is_empty() {
-            for (i, wt) in builder.worktrees.iter().enumerate() {
-                let is_active_col = builder.col == 2;
-                let is_selected = i == builder.worktree_idx;
-                let base_style = if wt.has_worktree {
-                    normal_style
-                } else {
-                    dim_style
-                };
-                let style = if is_active_col && is_selected {
-                    active_style
-                } else if is_selected {
-                    selected_style
-                } else {
-                    base_style
-                };
-                let marker = if is_active_col && is_selected {
-                    "▶ "
-                } else if is_selected {
-                    "● "
-                } else if wt.has_worktree {
-                    "  "
-                } else {
-                    "○ "
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{}{}", marker, wt.label),
-                    style,
-                )));
-            }
-        } else {
-            lines.push(Line::from(Span::styled(
-                "  (no worktrees)",
-                Style::default().fg(MUTED),
+    let worktree_cursor = builder.worktrees.nav.cursor();
+    let worktree_rows: Vec<Line<'static>> = if show_worktrees {
+        let mut rows = Vec::new();
+        for (i, wt) in builder.worktrees.items.iter().enumerate() {
+            let is_active_col = builder.col == 2;
+            let is_selected = i == worktree_cursor;
+            let base_style = if wt.has_worktree {
+                normal_style
+            } else {
+                dim_style
+            };
+            let style = if is_active_col && is_selected {
+                active_style
+            } else if is_selected {
+                selected_style
+            } else {
+                base_style
+            };
+            let marker = if is_active_col && is_selected {
+                "▶ "
+            } else if is_selected {
+                "● "
+            } else if wt.has_worktree {
+                "  "
+            } else {
+                "○ "
+            };
+            rows.push(Line::from(Span::styled(
+                format!("{}{}", marker, wt.label),
+                style,
             )));
         }
-        Some(lines)
+        rows
     } else {
-        None
+        Vec::new()
     };
 
     // Wie viele Zeilen braucht jede Spalte nach dem Umbruch langer Pfade?
@@ -403,9 +483,31 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
     let col_rows = |lines: &[Line<'_>], col_w: u16| -> u16 {
         lines.iter().map(|l| wrapped_row_count(l, col_w)).sum()
     };
-    let mut max_rows = col_rows(&tunnel_lines, tunnel_w).max(col_rows(&host_lines, host_w));
-    if let Some(wt) = &worktree_lines {
-        max_rows = max_rows.max(col_rows(wt, worktree_w));
+    let mut tunnel_full = vec![tunnel_header.clone()];
+    tunnel_full.extend(tunnel_rows.iter().cloned());
+    if let Some(e) = &tunnel_extra {
+        tunnel_full.push(e.clone());
+    }
+    let mut host_full = vec![host_header.clone()];
+    host_full.extend(host_rows.iter().cloned());
+    let mut max_rows = col_rows(&tunnel_full, tunnel_w).max(col_rows(&host_full, host_w));
+    // Worktree-Spalte (inkl. Platzhalter „(no worktrees)" falls leer).
+    let worktree_placeholder = if show_worktrees {
+        Some(Line::from(Span::styled(
+            "  (no worktrees)",
+            Style::default().fg(theme().muted),
+        )))
+    } else {
+        None
+    };
+    if let Some(hdr) = &worktree_header {
+        let mut wt_full = vec![hdr.clone()];
+        if worktree_rows.is_empty() {
+            wt_full.push(worktree_placeholder.clone().expect("Placeholder bei Repo"));
+        } else {
+            wt_full.extend(worktree_rows.iter().cloned());
+        }
+        max_rows = max_rows.max(col_rows(&wt_full, worktree_w));
     }
     let max_rows = max_rows as usize;
 
@@ -423,7 +525,7 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
 
     // Hintergrund
     f.render_widget(Clear, rect);
-    let bg = Paragraph::new("").style(Style::default().bg(STATUS_BG));
+    let bg = Paragraph::new("").style(Style::default().bg(theme().status_bg));
     f.render_widget(bg, rect);
 
     // Innenrand
@@ -437,13 +539,13 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
     // Titel
     let title = Line::from(Span::styled(
         " New channel ",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
     ));
 
     // Spalten-Inhalte: Titel über den Spalten (Platz ist reserviert:
     // Spalten beginnen bei inner.y + 2 = Titel + Leerzeile).
     f.render_widget(
-        Paragraph::new(vec![title, Line::from("")]).style(Style::default().bg(STATUS_BG)),
+        Paragraph::new(vec![title, Line::from("")]).style(Style::default().bg(theme().status_bg)),
         Rect::new(inner.x, inner.y, inner.width, 2),
     );
 
@@ -459,27 +561,72 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
         inner.height.saturating_sub(4), // Titel + Footer
     ));
 
-    // Spalten rendern (auf max_rows kürzen). Mit `Wrap` werden zu lange Pfade
-    // umgebrochen, statt rechts abgeschnitten zu werden.
-    let render_col = |f: &mut Frame, area: Rect, lines: &[Line], max: usize| {
-        let display: Vec<Line> = lines.iter().take(max).cloned().collect();
+    // Spalte rendern: Header + sichtbarer (gescrollter) Ausschnitt. `follow`
+    // hält den Cursor sichtbar, `visible_rows` schneidet an Umbruchzeilen.
+    let render_col = |f: &mut Frame,
+                      area: Rect,
+                      header: &Line<'static>,
+                      nav: &mut ListNav,
+                      rows: &[Line<'static>],
+                      extra: Option<&Line<'static>>,
+                      col_w: u16| {
+        let extra_rows = if extra.is_some() { 1 } else { 0 };
+        let viewport = area.height.saturating_sub(1 + extra_rows).max(1);
+        let row_of = |i: usize| wrapped_row_count(&rows[i], col_w).max(1);
+        nav.follow(viewport, row_of);
+        let range = nav.visible_rows(viewport, row_of);
+        let mut display = vec![header.clone()];
+        for i in range {
+            display.push(rows[i].clone());
+        }
+        if let Some(e) = extra {
+            display.push(e.clone());
+        }
         let para = Paragraph::new(display)
-            .style(Style::default().bg(STATUS_BG))
+            .style(Style::default().bg(theme().status_bg))
             .wrap(Wrap { trim: false });
         f.render_widget(para, area);
     };
-
-    render_col(f, cols[0], &tunnel_lines, max_rows);
-    render_col(f, cols[1], &host_lines, max_rows);
-    if let Some(lines) = &worktree_lines {
-        render_col(f, cols[2], lines, max_rows);
+    render_col(
+        f,
+        cols[0],
+        &tunnel_header,
+        &mut builder.tunnels.nav,
+        &tunnel_rows,
+        tunnel_extra.as_ref(),
+        tunnel_w,
+    );
+    render_col(
+        f,
+        cols[1],
+        &host_header,
+        &mut builder.host_paths.nav,
+        &host_rows,
+        None,
+        host_w,
+    );
+    if show_worktrees {
+        let wt_extra = if worktree_rows.is_empty() {
+            worktree_placeholder.as_ref()
+        } else {
+            None
+        };
+        render_col(
+            f,
+            cols[2],
+            worktree_header.as_ref().expect("Header bei Repo"),
+            &mut builder.worktrees.nav,
+            &worktree_rows,
+            wt_extra,
+            worktree_w,
+        );
     }
 
     // Container-Status-Zeile (unterhalb der Spalten)
     if let Some(info) = &builder.container_info {
         let status_line = Line::from(Span::styled(
             format!(" Container: {} ({})", info.name, info.status),
-            Style::default().fg(MUTED),
+            Style::default().fg(theme().muted),
         ));
         let status_rect = Rect::new(
             inner.x,
@@ -490,26 +637,36 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
         f.render_widget(Paragraph::new(status_line), status_rect);
     }
 
-    // Fußzeile: Tasten-Hilfe. Beim Pfad-Edit ist „Pfad eingeben“ eine
-    // Beschreibung (kein Tastenkürzel); die eigentlichen Kürzel folgen über
-    // `key_help`.
-    let footer: Line<'static> = if builder.host_path_edit.is_some() {
-        let prefix = " Enter a path ·";
-        let mut spans = vec![Span::styled(prefix, Style::default().fg(MUTED))];
-        let budget = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
-        spans.extend(key_help(&[("↵", "confirm"), ("esc", "cancel")], budget).spans);
-        Line::from(spans)
-    } else {
-        key_help(
-            &[
-                ("⇅", "select"),
-                ("⇄", "column"),
-                ("a", "add path"),
-                ("↵", "confirm"),
-                ("esc", "cancel"),
-            ],
-            inner.width as usize,
-        )
+    // Fußzeile: Tasten-Hilfe. Während ein Inline-Feld offen ist, zeigt sie
+    // eine Beschreibung + `↵`/`esc`; im normalen Modus hängt die Kürzel-Liste
+    // von der aktiven Spalte ab (`a` Pfad in der Host-, `b` Branch in der
+    // Worktree-Spalte).
+    let footer: Line<'static> = match &builder.edit {
+        Some(BuilderEdit::Branch(_)) => {
+            let prefix = " New branch ·";
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(theme().muted))];
+            let budget = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
+            spans.extend(key_help(&[("↵", "confirm"), ("esc", "cancel")], budget).spans);
+            Line::from(spans)
+        }
+        Some(BuilderEdit::HostPath(_)) => {
+            let prefix = " Enter a path ·";
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(theme().muted))];
+            let budget = inner.width.saturating_sub(prefix.chars().count() as u16) as usize;
+            spans.extend(key_help(&[("↵", "confirm"), ("esc", "cancel")], budget).spans);
+            Line::from(spans)
+        }
+        None => {
+            let mut keys: Vec<(&str, &str)> = vec![("⇅", "select"), ("⇄", "column")];
+            match builder.col {
+                1 => keys.push(("a", "add path")),
+                2 if builder.current_is_git => keys.push(("b", "new branch")),
+                _ => {}
+            }
+            keys.push(("↵", "confirm"));
+            keys.push(("esc", "cancel"));
+            key_help(&keys, inner.width as usize)
+        }
     };
     let footer_rect = Rect::new(
         inner.x,
@@ -519,36 +676,65 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &App) {
     );
     f.render_widget(Paragraph::new(footer), footer_rect);
 
-    // Pfad-Input: inline unter dem letzten Host-Pfad-Eintrag.
-    if let Some(editor) = &builder.host_path_edit {
-        let input_x = cols[1].x;
-        let input_w = if show_worktrees {
-            (cols[2].x + cols[2].width).saturating_sub(cols[1].x)
-        } else {
-            cols[1].width
-        };
-        // Fußzeile ist die letzte Zeile des Dialogs; die Editor-Zeile (`entry_y+1`)
-        // muss strikt darüber liegen. Damit das Eingabefeld samt Cursor IMMER
-        // sichtbar bleibt (auch bei vielen Host-Pfaden), wird es nicht unter
-        // den letzten (ggf. abgeschnittenen) Eintrag gelegt, sondern nach oben
-        // begrenzt, sodass Label + Editor-Zeile vor der Fußzeile enden.
-        let footer_y = inner.y + inner.height.saturating_sub(1);
-        let edit_row = cols[1].y + 1 + builder.host_paths.len() as u16 + 1;
-        let entry_y = edit_row.min(footer_y.saturating_sub(2));
-        if entry_y + 1 < footer_y {
-            draw_builder_path_input_inline(f, input_x, entry_y, input_w, editor);
+    // Inline-Eingabefeld: Host-Pfad unter der mittleren, Branch-Name unter
+    // der rechten Spalte (an die Fußzeile gebunden, damit Cursor sichtbar).
+    match &builder.edit {
+        Some(BuilderEdit::HostPath(editor)) => {
+            let input_x = cols[1].x;
+            let input_w = if show_worktrees {
+                (cols[2].x + cols[2].width).saturating_sub(cols[1].x)
+            } else {
+                cols[1].width
+            };
+            let footer_y = inner.y + inner.height.saturating_sub(1);
+            let edit_row = cols[1].y + 1 + builder.host_paths.items.len() as u16 + 1;
+            let entry_y = edit_row.min(footer_y.saturating_sub(2));
+            if entry_y + 1 < footer_y {
+                draw_builder_input_inline(
+                    f,
+                    input_x,
+                    entry_y,
+                    input_w,
+                    editor,
+                    "Add path",
+                    None,
+                );
+            }
         }
+        Some(BuilderEdit::Branch(editor)) => {
+            let input_x = cols[2].x;
+            let input_w = cols[2].width;
+            let footer_y = inner.y + inner.height.saturating_sub(1);
+            let edit_row = cols[2].y + 1 + builder.worktrees.items.len() as u16 + 1;
+            // Platz für Label + Editor + ggf. rote Fehlerzeile reservieren.
+            let entry_y = edit_row.min(footer_y.saturating_sub(3));
+            if entry_y + 2 < footer_y {
+                draw_builder_input_inline(
+                    f,
+                    input_x,
+                    entry_y,
+                    input_w,
+                    editor,
+                    "New branch",
+                    builder.edit_error.as_deref(),
+                );
+            }
+        }
+        None => {}
     }
 }
 
-/// Zeichnet das Pfad-Eingabe-Feld inline im Channel Builder: Label + Editor
-/// direkt unter dem letzten Host-Pfad-Eintrag, aligned mit den Spalten.
-fn draw_builder_path_input_inline(
+/// Zeichnet das Inline-Eingabefeld im Channel Builder (Pfad oder Branch-Name):
+/// Label + Editor unter dem letzten Eintrag der jeweiligen Spalte, aligned mit
+/// den Spalten. Eine optionale Fehlermeldung erscheint rot direkt darunter.
+fn draw_builder_input_inline(
     f: &mut Frame,
     x: u16,
     y: u16,
     width: u16,
     editor: &crate::editor::Editor,
+    label: &str,
+    error: Option<&str>,
 ) {
     use crate::editor::InputLayout;
 
@@ -557,11 +743,11 @@ fn draw_builder_path_input_inline(
 
     // Label
     let label = Line::from(Span::styled(
-        " Add path:",
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        format!(" {label}:"),
+        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
     ));
     f.render_widget(
-        Paragraph::new(label).style(Style::default().bg(STATUS_BG)),
+        Paragraph::new(label).style(Style::default().bg(theme().status_bg)),
         Rect::new(x, y, width, 1),
     );
 
@@ -592,7 +778,7 @@ fn draw_builder_path_input_inline(
     // keine sichtbare Änderung – die Zelle sähe dann aus wie ein normaler
     // Textzeichenträger und der Cursor wäre praktisch unsichtbar. Ein weißer
     // Block mit dunkler Schrift ist dagegen immer klar erkennbar.
-    let cursor_style = Style::default().fg(STATUS_BG).bg(Color::White);
+    let cursor_style = Style::default().fg(theme().status_bg).bg(theme().band_fg);
 
     let chars: Vec<char> = text_str.chars().collect();
     let display_end = chars.len().min(content_width);
@@ -600,11 +786,11 @@ fn draw_builder_path_input_inline(
         let in_selection = sel_range.as_ref().is_some_and(|r| r.contains(&i));
         let is_cursor = cur_row == 0 && cur_off == i;
         let style = if in_selection {
-            Style::default().fg(Color::White).bg(INPUT_BG)
+            Style::default().fg(theme().band_fg).bg(theme().band_bg)
         } else if is_cursor {
             cursor_style
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme().band_fg)
         };
         spans.push(Span::styled(ch.to_string(), style));
     }
@@ -615,10 +801,23 @@ fn draw_builder_path_input_inline(
         spans.push(Span::styled(" ", cursor_style));
     }
 
-    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(STATUS_BG));
+    let para = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme().status_bg));
     f.render_widget(para, Rect::new(x, y + 1, width, 1));
 
-    // Während das Pfad-Feld aktiv ist, gehört der Terminal-Cursor hierher –
+    // Optionale Fehlermeldung (z. B. „Could not create branch“) rot direkt
+    // unter dem Editor – das Eingabefeld bleibt dann offen zur Korrektur.
+    if let Some(err) = error {
+        let err_line = Line::from(Span::styled(
+            format!(" {err}"),
+            Style::default().fg(theme().err),
+        ));
+        f.render_widget(
+            Paragraph::new(err_line).style(Style::default().bg(theme().status_bg)),
+            Rect::new(x, y + 2, width, 1),
+        );
+    }
+
+    // Während das Feld aktiv ist, gehört der Terminal-Cursor hierher –
     // sonst würde er (wie bei allen anderen Dialogen ohne Textinput) als
     // weiterhin leerer Platz in der Chat-Eingabezeile stehen bleiben.
     let cell_col = indent + cur_off;
@@ -637,58 +836,48 @@ pub(crate) fn channel_picker_row(
     cursor: bool,
     usage: &str,
 ) -> Line<'static> {
-    let indicator_char = if status.is_some() { "⬢" } else { " " };
     let indicator = Span::styled(
-        indicator_char,
-        Style::default().fg(status.map(channel_status_color).unwrap_or(SYM_MUTED)),
+        if status.is_some() { "⬢" } else { " " },
+        Style::default().fg(status.map(channel_status_color).unwrap_or(theme().muted)),
     );
-    let name_style = Style::default()
-        .fg(if cursor {
-            Color::White
-        } else if name == "(kein Kanal)" {
-            MUTED
-        } else {
-            ACCENT_FG
-        })
-        .add_modifier(if cursor {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
-    let mut spans = vec![indicator, Span::styled(format!(" {name}"), name_style)];
-    if !usage.is_empty() {
-        spans.push(Span::styled(
+    let base_fg = if name == "(kein Kanal)" { theme().muted } else { theme().highlight };
+    let extra = if usage.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(
             format!("  {usage}"),
-            Style::default().fg(MUTED),
-        ));
-    }
-    Line::from(spans)
+            Style::default().fg(theme().muted),
+        )]
+    };
+    plain_row(indicator, name, base_fg, cursor, extra)
 }
 
 /// Sonderzeile „new channel" im Channel-Picker: „+"-Indikator in Akzentfarbe,
 /// um den Unterschied zu bestehenden Kanälen deutlich zu machen.
 pub(crate) fn channel_picker_new_channel_row(cursor: bool) -> Line<'static> {
-    let indicator = Span::styled("+", Style::default().fg(ACCENT));
-    let name_style = Style::default()
-        .fg(if cursor { Color::White } else { ACCENT_FG })
-        .add_modifier(if cursor {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
-    Line::from(vec![indicator, Span::styled(" new channel", name_style)])
+    plain_row(
+        Span::styled("+", Style::default().fg(theme().accent)),
+        "new channel",
+        theme().highlight,
+        cursor,
+        Vec::new(),
+    )
 }
 
 /// Kurzer Hinweis, welche Sessions einen Kanal gerade nutzen – für die
 /// Anzeige im Channel-Picker (z. B. „ · Session 1, 3 (aktiv)").
-fn channel_usage(app: &App, name: &str) -> String {
+fn channel_usage(
+    sessions: &[Session],
+    channels: &ChannelRegistry,
+    name: &str,
+) -> String {
     let mut nums: Vec<usize> = Vec::new();
     let mut active = false;
-    for (i, s) in app.sessions.iter().enumerate() {
+    for (i, s) in sessions.iter().enumerate() {
         let matches = s
             .channel
             .as_ref()
-            .and_then(|ch| app.channels.find_name(ch))
+            .and_then(|ch| channels.find_name(ch))
             .as_deref()
             == Some(name);
         if matches {
@@ -723,18 +912,40 @@ fn clip(s: &str, n: usize) -> String {
     format!("{head}…")
 }
 
+/// Einheitliche Auswahl-Zeile für Listen- und Options-Einträge: Indikator
+/// voran, dann ` {text}` – mit `cursor` weiß+fett, ansonsten in `base_fg` –
+/// und optional nachgestellte Zusatz-Spans (Statushinweis, Demand …). Die
+/// konkreten Dekorateure (`option_row`, `channel_picker_row`, …) berechnen
+/// nur noch ihren Indikator, die Textfarbe und die Extra-Spans.
+fn plain_row(
+    indicator: Span<'static>,
+    text: &str,
+    base_fg: Color,
+    cursor: bool,
+    extra: Vec<Span<'static>>,
+) -> Line<'static> {
+    let mut spans = vec![indicator];
+    let style = Style::default()
+        .fg(if cursor { theme().band_fg } else { base_fg })
+        .add_modifier(if cursor {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    spans.push(Span::styled(format!(" {text}"), style));
+    spans.extend(extra);
+    Line::from(spans)
+}
+
 /// Auswahlzeile eines Bestätigungsdialogs: markiert die aktive Option.
 fn option_row(text: &str, cursor: bool) -> Line<'static> {
-    let fg = if cursor { Color::White } else { ACCENT_FG };
-    let style = Style::default().fg(fg).add_modifier(if cursor {
-        Modifier::BOLD
-    } else {
-        Modifier::empty()
-    });
-    Line::from(vec![
+    plain_row(
         Span::styled(if cursor { "▶" } else { " " }, Style::default()),
-        Span::styled(format!(" {text}"), style),
-    ])
+        text,
+        theme().highlight,
+        cursor,
+        Vec::new(),
+    )
 }
 
 /// Schätzt, wie viele sichtbare Zeilen eine `Line` bei der gegebenen Breite
@@ -837,7 +1048,7 @@ fn confirmation_dialog(
         height,
     );
     f.render_widget(Clear, rect);
-    let bg = Paragraph::new("").style(Style::default().bg(STATUS_BG));
+    let bg = Paragraph::new("").style(Style::default().bg(theme().status_bg));
     f.render_widget(bg, rect);
 
     let inner = Rect::new(
@@ -847,7 +1058,7 @@ fn confirmation_dialog(
         rect.height.saturating_sub(2),
     );
     let para = Paragraph::new(all)
-        .style(Style::default().bg(STATUS_BG))
+        .style(Style::default().bg(theme().status_bg))
         // Text umbrechen, statt ihn am rechten Rand abzuschneiden – lange
         // Überschriften/Texte (z. B. Container-Zeilen) laufen in Folgezeilen.
         .wrap(Wrap { trim: false });
@@ -861,7 +1072,7 @@ fn confirmation_dialog(
 pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
     if let Some(d) = &app.channel_close {
         match &d.phase {
-            crate::app::ChannelClosePhase::ActiveConfirm { cursor } => {
+            crate::app::ChannelClosePhase::ActiveConfirm { nav } => {
                 let options = ["Close anyway (active session running)", "Cancel"];
                 let mut lines = vec![
                     Line::from(Span::styled(
@@ -869,21 +1080,21 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
                             " Channel \"{}\" is still in use by an active session.",
                             d.name
                         ),
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(theme().err),
                     )),
                     Line::from(Span::styled(
                         " Closing it may interrupt that work.",
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(theme().err),
                     )),
                     Line::from(Span::raw(" ")),
                 ];
                 for (i, text) in options.iter().enumerate() {
-                    lines.push(option_row(text, *cursor == i));
+                    lines.push(option_row(text, nav.cursor() == i));
                 }
                 confirmation_dialog(
                     f,
                     "Close channel – active session?",
-                    ERROR_FG,
+                    theme().err,
                     lines,
                     &NAV_CONFIRM_KEYS,
                 );
@@ -891,7 +1102,7 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
             }
             crate::app::ChannelClosePhase::Worktree {
                 summary,
-                cursor,
+                nav,
                 options,
             } => {
                 let mut lines = vec![
@@ -900,7 +1111,7 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
                             " Worktree of channel \"{}\" has uncommitted changes.",
                             d.name
                         ),
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(theme().err),
                     )),
                     Line::from(Span::raw(" ")),
                 ];
@@ -908,50 +1119,50 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
                     lines.push(Line::from(Span::styled(
                         format!(" {note}"),
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme().band_fg)
                             .add_modifier(Modifier::BOLD),
                     )));
                 }
                 lines.push(Line::from(Span::raw(" ")));
                 for (i, text) in options.iter().enumerate() {
-                    lines.push(option_row(text, *cursor == i));
+                    lines.push(option_row(text, nav.cursor() == i));
                 }
                 confirmation_dialog(
                     f,
                     "Worktree has uncommitted changes",
-                    ERROR_FG,
+                    theme().err,
                     lines,
                     &NAV_CONFIRM_KEYS,
                 );
                 return;
             }
-            crate::app::ChannelClosePhase::Container { notes, cursor } => {
+            crate::app::ChannelClosePhase::Container { notes, nav } => {
                 let options = ["Yes, close channel & stop container", "No, cancel"];
                 let mut lines = vec![
                     Line::from(Span::styled(
                         format!(" Container of channel \"{}\" has unsaved changes.", d.name),
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(theme().err),
                     )),
                     Line::from(Span::styled(
                         " Closing would stop it and this state would be lost.",
-                        Style::default().fg(ERROR_FG),
+                        Style::default().fg(theme().err),
                     )),
                     Line::from(Span::raw(" ")),
                 ];
                 for note in notes {
                     lines.push(Line::from(Span::styled(
                         format!("   • {note}"),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme().band_fg),
                     )));
                 }
                 lines.push(Line::from(Span::raw(" ")));
                 for (i, text) in options.iter().enumerate() {
-                    lines.push(option_row(text, *cursor == i));
+                    lines.push(option_row(text, nav.cursor() == i));
                 }
                 confirmation_dialog(
                     f,
                     "Container has unsaved changes",
-                    ERROR_FG,
+                    theme().err,
                     lines,
                     &NAV_CONFIRM_KEYS,
                 );
@@ -964,11 +1175,11 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
         let mut lines = vec![
             Line::from(Span::styled(
                 " Self-started containers contain unsaved changes.",
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::styled(
                 " Quitting would stop them and this state would be lost.",
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::raw(" ")),
         ];
@@ -983,13 +1194,13 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
             lines.push(Line::from(Span::styled(
                 header,
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme().band_fg)
                     .add_modifier(Modifier::BOLD),
             )));
             for note in &entry.notes {
                 lines.push(Line::from(Span::styled(
                     format!("   • {note}"),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme().band_fg),
                 )));
             }
             lines.push(Line::from(Span::raw(" ")));
@@ -1005,33 +1216,59 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
                         "containers"
                     }
                 ),
-                Style::default().fg(MUTED),
+                Style::default().fg(theme().muted),
             )));
             lines.push(Line::from(Span::raw(" ")));
         }
         for (i, text) in options.iter().enumerate() {
-            lines.push(option_row(text, d.cursor == i));
+            lines.push(option_row(text, d.nav.cursor() == i));
         }
-        confirmation_dialog(f, "Really quit?", ERROR_FG, lines, &NAV_CONFIRM_KEYS);
+        confirmation_dialog(f, "Really quit?", theme().err, lines, &NAV_CONFIRM_KEYS);
         return;
     }
     if let Some(d) = &app.branch_confirm {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!(" {}", d.summary),
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::raw(" ")),
         ];
         for (i, text) in d.options.iter().enumerate() {
-            lines.push(option_row(text, d.cursor == i));
+            lines.push(option_row(text, d.nav.cursor() == i));
         }
         confirmation_dialog(
             f,
             "/branch – branch already exists",
-            ERROR_FG,
+            theme().err,
             lines,
             &NAV_CONFIRM_KEYS,
+        );
+        return;
+    }
+    if let Some(d) = &app.path_confirm {
+        let lines = vec![
+            Line::from(Span::styled(
+                " This path does not exist yet.",
+                Style::default().fg(theme().err),
+            )),
+            Line::from(Span::styled(
+                format!("   {}", clip(&d.path.to_string_lossy(), 60)),
+                Style::default()
+                    .fg(theme().band_fg)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                " Create it with 'mkdir -p' (Enter) or go back to edit (Esc)?",
+                Style::default().fg(theme().muted),
+            )),
+        ];
+        confirmation_dialog(
+            f,
+            "Create directory?",
+            theme().err,
+            lines,
+            &[("↵", "create"), ("esc", "cancel")],
         );
         return;
     }
@@ -1044,22 +1281,22 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
         let mut lines = vec![
             Line::from(Span::styled(
                 " The model may execute commands directly on your local system.",
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::styled(
                 " This can be dangerous – only send if you accept the consequences.",
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::raw(" ")),
         ];
         for (i, text) in options.iter().enumerate() {
-            let line = option_row(text, d.cursor == i);
+            let line = option_row(text, d.nav.cursor() == i);
             lines.push(line);
         }
         confirmation_dialog(
             f,
             "Local execution – confirmation",
-            ERROR_FG,
+            theme().err,
             lines,
             &NAV_CONFIRM_KEYS,
         );
@@ -1070,24 +1307,24 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
         let mut lines = vec![
             Line::from(Span::styled(
                 " Run this command on the local system?",
-                Style::default().fg(ERROR_FG),
+                Style::default().fg(theme().err),
             )),
             Line::from(Span::styled(
                 format!("   {}", clip(&d.command, 60)),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme().band_fg)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!("   {}", d.label),
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
             )),
             Line::from(Span::raw(" ")),
         ];
         for (i, text) in options.iter().enumerate() {
-            lines.push(option_row(text, d.cursor == i));
+            lines.push(option_row(text, d.nav.cursor() == i));
         }
-        confirmation_dialog(f, "Run command?", ERROR_FG, lines, &EXEC_KEYS);
+        confirmation_dialog(f, "Run command?", theme().err, lines, &EXEC_KEYS);
     }
     if let Some(d) = &app.options_dialog {
         let mouse_label = if app.mouse_enabled {
@@ -1099,7 +1336,7 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
         let options = [mouse_label, &status_label];
         let mut lines = vec![Line::from(Span::raw(" "))];
         for (i, text) in options.iter().enumerate() {
-            lines.push(option_row(text, d.cursor == i));
+            lines.push(option_row(text, d.nav.cursor() == i));
         }
         confirmation_dialog(f, "Options", Color::Cyan, lines, &NAV_CONFIRM_KEYS);
     }
@@ -1118,14 +1355,14 @@ pub(crate) fn draw_http_headers_dialog(f: &mut Frame, app: &App) {
             for (name, value) in headers {
                 lines.push(Line::from(Span::styled(
                     format!(" {name}: {value}"),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme().band_fg),
                 )));
             }
         }
         _ => {
             lines.push(Line::from(Span::styled(
                 " (no HTTP response captured yet for this session)",
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
             )));
         }
     }

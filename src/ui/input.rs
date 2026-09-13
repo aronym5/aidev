@@ -9,7 +9,7 @@ use crate::app::App;
 use crate::editor::InputLayout;
 use crate::perm::Permission;
 
-use super::{INPUT_BG, MUTED, PAD};
+use super::{theme, PAD};
 
 /// Farbliche Markierung einer Berechtigung – read=blau, write=gelb/amber,
 /// execute=rot. Hebt Prompt, Eingabetext und User-Band im Chat hervor.
@@ -51,7 +51,7 @@ pub(crate) fn draw_input(
     let color = if bound {
         permission_color(app.sessions[app.active].permission)
     } else {
-        MUTED
+        theme().muted
     };
     let (label, _) = permission_prompt(bound.then_some(app.sessions[app.active].permission));
 
@@ -81,7 +81,7 @@ pub(crate) fn draw_input(
         lines.push(Line::from(spans));
     }
 
-    let para = Paragraph::new(lines).style(Style::default().bg(INPUT_BG));
+    let para = Paragraph::new(lines).style(Style::default().bg(theme().band_bg));
     f.render_widget(para, area);
 
     // Cursor-Position (Spalte relativ zum Text, zzgl. Abstand + Prompt).

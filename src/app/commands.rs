@@ -129,18 +129,52 @@ impl App {
         }
     }
 
+    /// `/theme dark|light|auto` – Farbschema zur Laufzeit wechseln. Ohne
+    /// Argument zeigt das Kommando die aktuellen Optionen an. `auto` wechselt
+    /// auf die (gecachte) Start-Erkennung; wurde die App nicht mit `auto`
+    /// gestartet, gibt es einen Hinweis statt einer erneuten TTY-Abfrage.
+    fn user_theme(&mut self, arg: &str) {
+        let active = self.active;
+        let s = &mut self.sessions[active];
+        s.editor.clear();
+        s.error = None;
+        s.error_debug = None;
+        if arg.is_empty() {
+            s.error = Some(
+                "theme = auto | dark | light  (config: theme = \"…\" in config.toml)".to_string(),
+            );
+            return;
+        }
+        match crate::ui::ThemeChoice::parse(arg) {
+            Some(crate::ui::ThemeChoice::Auto) => match crate::ui::auto_resolved() {
+                Some(auto) => {
+                    crate::ui::set_theme(auto);
+                    s.error = Some("theme → auto".to_string());
+                }
+                None => {
+                    s.error = Some(
+                        "auto needs a startup probe – run with theme = \"auto\" in config.toml"
+                            .to_string(),
+                    );
+                }
+            },
+            Some(choice) => {
+                crate::ui::set_theme(crate::ui::resolve(choice));
+                s.error = Some(format!("theme → {}", choice.name()));
+            }
+            None => {
+                s.error = Some(format!("Unknown theme \"{arg}\" – use dark | light | auto"));
+            }
+        }
+    }
+
     pub(crate) fn open_model_picker(&mut self) {
         // Sicherstellen, dass alle config-Modelle in der Registry sind
         // (Modelle könnten nachträglich in config.models eingetragen worden sein).
         self.sync_config_to_registry();
 
-        // Items aus der zentralen Registry aufbauen.
-        let mut items: Vec<(String, String)> = Vec::new();
-        for entry in self.model_registry.all() {
-            items.push((entry.key(), entry.display_full()));
-        }
-
-        if items.is_empty() {
+        let list = self.model_pick_list();
+        if list.is_empty() {
             let s = self.active_mut();
             s.error = Some(
                 "No models configured – add a `[models.<alias>]` block in config.toml.".into(),
@@ -149,39 +183,56 @@ impl App {
             return;
         }
 
-        // Prüfen, ob das Default-Modell bei den Keys vorkommt.
+        // Cursor positionieren: auf das aktuell gewählte Modell bzw. auf
+        // „(Standard)"/das Default-Modell. Mit `ModelPick::Default` als echtem
+        // Eintrag entfällt der frühere `show_default`-Offset.
         let default_id = self.config.model.clone();
         let default_key = self
             .model_registry
             .find_by_model_id(&default_id)
             .map(|e| e.key())
             .unwrap_or_else(|| default_id.clone());
-        let default_matches = items.iter().any(|(k, _)| *k == default_key);
-        let show_default = !default_matches;
-
-        // Cursor positionieren: auf das aktuell gewählte Modell.
-        let current_key = self.sessions[self.active].model_alias.as_deref();
-        let cursor = if let Some(key) = current_key {
-            items
-                .iter()
-                .position(|(k, _)| k == key)
-                .map(|i| if show_default { i + 1 } else { i })
-                .unwrap_or(0)
-        } else if default_matches {
-            items
-                .iter()
-                .position(|(k, _)| *k == default_key)
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let target = self.sessions[self.active]
+            .model_alias
+            .clone()
+            .unwrap_or(default_key);
+        let cursor = list
+            .iter()
+            .position(|it| matches!(it, ModelPick::Model { key, .. } if *key == target))
+            .unwrap_or(0);
 
         self.model_picker = Some(ModelPicker {
-            items,
-            show_default,
-            cursor,
+            items: Selection::new_at(list, cursor),
             loading: false,
         });
+    }
+
+    /// Baut die (ggf. um „(Standard)" ergänzte) Modell-Liste für den Picker
+    /// aus der Registry. „(Standard)" steht nur vorn, wenn das Default-Modell
+    /// nicht selbst unter den Modellen vorkommt. Wird auch beim Hintergrund-
+    /// Refresh (Worker) neu aufgebaut, damit Reihenfolge/Display konsistent
+    /// bleiben.
+    pub(crate) fn model_pick_list(&self) -> Vec<ModelPick> {
+        let default_id = self.config.model.clone();
+        let default_key = self
+            .model_registry
+            .find_by_model_id(&default_id)
+            .map(|e| e.key())
+            .unwrap_or_else(|| default_id.clone());
+        let mut list: Vec<ModelPick> = Vec::new();
+        let mut has_default = false;
+        for entry in self.model_registry.all() {
+            let key = entry.key();
+            has_default |= key == default_key;
+            list.push(ModelPick::Model {
+                key,
+                display: entry.display_full(),
+            });
+        }
+        if !has_default {
+            list.insert(0, ModelPick::Default);
+        }
+        list
     }
 
     /// Stellt sicher, dass alle Modelle aus `config.models` in der Registry
@@ -192,33 +243,16 @@ impl App {
     }
 
     pub(crate) fn handle_model_picker_key(&mut self, key: event::KeyEvent) {
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         match key.code {
             KeyCode::Esc => self.model_picker = None,
             KeyCode::Enter | KeyCode::Char(' ') => self.model_picker_select(),
             KeyCode::Char('r') => self.refresh_models_from_providers(),
-            _ if down => {
+            _ => {
                 if let Some(p) = &mut self.model_picker {
-                    let max = if p.show_default {
-                        p.items.len()
-                    } else {
-                        p.items.len() - 1
-                    };
-                    p.cursor = step_cursor(true, p.cursor, max);
+                    let viewport = p.items.nav.len() as u16;
+                    p.items.handle_move(&key, viewport);
                 }
             }
-            _ if up => {
-                if let Some(p) = &mut self.model_picker {
-                    let max = if p.show_default {
-                        p.items.len()
-                    } else {
-                        p.items.len() - 1
-                    };
-                    p.cursor = step_cursor(false, p.cursor, max);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -304,16 +338,12 @@ impl App {
             return;
         };
         let default_id = self.config.model.clone();
-        // Cursor 0 ist „(Standard)" nur, wenn show_default=true.
-        let selected = if picker.show_default && picker.cursor == 0 {
-            None
-        } else {
-            let idx = if picker.show_default {
-                picker.cursor - 1
-            } else {
-                picker.cursor
-            };
-            picker.items.get(idx).cloned()
+        // „(Standard)" (Position 0 bei fehlendem Default-Konfigurationseintrag)
+        // → Session auf das Default-Modell zurückstellen.
+        let selected = match picker.items.selected() {
+            Some(ModelPick::Default) => None,
+            Some(ModelPick::Model { key, display }) => Some((key.clone(), display.clone())),
+            None => None,
         };
         let s = self.active_mut();
         match selected {
@@ -322,7 +352,7 @@ impl App {
                 s.error = Some(format!("Model for this session: default ({default_id})"));
             }
             Some((key, display)) => {
-                s.model_alias = Some(key.clone());
+                s.model_alias = Some(key);
                 s.error = Some(format!("Model for this session: {display}"));
             }
         }
@@ -473,7 +503,7 @@ impl App {
                     });
                     self.branch_confirm = Some(BranchConfirm {
                         summary,
-                        cursor: 0,
+                        nav: ListNav::new(4), // 4 Optionen, Ende = abbrechen (Default: erste)
                         options: vec![
                             "Use branch, take over working directory",
                             "Use branch without stash & copy",
@@ -519,7 +549,7 @@ impl App {
                     });
                     self.branch_confirm = Some(BranchConfirm {
                         summary: lines.join(" "),
-                        cursor: 0,
+                        nav: ListNav::new(4), // 4 Optionen, Ende = abbrechen
                         options: vec![
                             "Use branch & worktree as they are",
                             "Move branch to HEAD, take over working directory",
@@ -616,9 +646,9 @@ impl App {
                 Ok(stats) => {
                     if stats.files_linked + stats.files_copied > 0 {
                         Some(format!(
-                            "Build directory copied: {} files, {:.1}s",
+                            "Build directory copied: {} files, {}",
                             stats.files_linked + stats.files_copied,
-                            stats.duration.as_secs_f64()
+                            crate::ui::fmt_duration(stats.duration.as_millis() as u64)
                         ))
                     } else {
                         None
@@ -789,20 +819,9 @@ impl App {
         let Some(mut d) = self.branch_confirm.take() else {
             return;
         };
-        let max = d.options.len() - 1;
-        let down = key.code == KeyCode::Down || key.code == KeyCode::Char('j');
-        let up = key.code == KeyCode::Up || key.code == KeyCode::Char('k');
         match key.code {
             KeyCode::Esc => {
                 self.branch_pending = None;
-            }
-            _ if down => {
-                d.cursor = step_cursor(true, d.cursor, max);
-                self.branch_confirm = Some(d);
-            }
-            _ if up => {
-                d.cursor = step_cursor(false, d.cursor, max);
-                self.branch_confirm = Some(d);
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let pending = match self.branch_pending.take() {
@@ -813,7 +832,7 @@ impl App {
 
                 if pending.has_worktree {
                     // 4 Optionen: a) so nutzen, b) branch verschieben + übernehmen, c) committen & löschen, d) abbrechen
-                    match d.cursor {
+                    match d.nav.cursor() {
                         0 => {
                             // Branch & Worktree so nutzen wie sie sind
                             let wt_path = crate::repo::git_worktree_for_branch(
@@ -905,7 +924,7 @@ impl App {
                     }
                 } else {
                     // 5 Optionen: a) nutzen + übernehmen, b) nutzen ohne stash, c) verschieben, d) committen & löschen, e) abbrechen
-                    match d.cursor {
+                    match d.nav.cursor() {
                         0 => {
                             // Branch nutzen, Arbeitsverzeichnis übernehmen
                             if let Some(ref repo) = repo {
@@ -955,57 +974,43 @@ impl App {
                     }
                 }
             }
-            _ => self.branch_confirm = Some(d),
+            _ => {
+                // Gemeinsame Bewegung über die ListNav-Abstraktion (Optionen
+                // sind einzeilig, viewport = Options-Anzahl).
+                let viewport = d.nav.len() as u16;
+                d.nav.handle_move(&key, viewport, |_| 1);
+                self.branch_confirm = Some(d);
+            }
         }
     }
 
     pub(crate) fn handle_enter(&mut self) {
         let active = self.active;
-        // Senden während Streaming ignorieren (kein Doppel-Send).
-        if matches!(
-            self.sessions[active].phase,
-            Phase::WaitingForLLM | Phase::WaitingForTool
-        ) {
-            return;
-        }
         let content = self.sessions[active].editor.text_string();
         let content = content.trim().to_string();
         if content.is_empty() {
             return;
         }
-        // `/compact` → manuelle Kontext-Kompaktierung: alte Turns durch eine
-        // Zusammenfassung ersetzen, ohne einen LLM-Turn zu senden.
-        if content == "/compact" {
-            self.user_compact();
-            return;
-        }
-        // `/end` → Session beenden (mit Worktree-Aufräumen)
-        if content == "/end" {
-            self.user_end();
-            return;
-        }
-        // `/branch <name>` → neuen Git-Worktree anlegen, neuen Channel + Session erzeugen.
-        if let Some(branch_name) = content
-            .strip_prefix("/branch ")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            self.user_branch(branch_name.to_string());
-            return;
-        }
-        // `/commit <msg>` → alle Änderungen im aktuellen Worktree committen.
-        if let Some(msg) = content
-            .strip_prefix("/commit ")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            self.user_commit(msg.to_string());
-            return;
-        }
+
+        // ── Direkt verarbeitbare Befehle ─────────────────────────────────
+        // Diese Slashes fügen KEINEN neuen Chat-Beitrag ein und brauchen keine
+        // freie LLM-Runde – sie arbeiten nur an Session-Konfiguration, UI oder
+        // Repo. Deshalb greifen sie auch mitten im Streaming / während ein
+        // Werkzeug läuft (ein Kanalwechsel wirkt über die geteilte
+        // `channel_cell` ohnehin sofort). Nur wenn wirklich neuer Text ins
+        // Gespräch müsste, während das LLM noch nicht geantwortet hat, bleibt
+        // Enter unten reaktionslos.
+
         // `/model [alias]` → Modell für alle künftigen Anfragen dieser
         // Session wählen; ohne Argument öffnet der Auswahl-Dialog.
         if content == "/model" || content.starts_with("/model ") {
             self.user_model(content.strip_prefix("/model").unwrap_or("").trim());
+            return;
+        }
+        // `/theme [dark|light|auto]` → Farbschema live umschalten; ohne
+        // Argument wird das aktuelle Schema angezeigt.
+        if content == "/theme" || content.starts_with("/theme ") {
+            self.user_theme(content.strip_prefix("/theme").unwrap_or("").trim());
             return;
         }
         // `/channel` → ChannelPicker öffnen (wie Alt+C).
@@ -1015,6 +1020,13 @@ impl App {
             s.error = None;
             s.error_debug = None;
             self.open_channel_picker();
+            return;
+        }
+        // `/new` → neue Session/Tab erzeugen (wie Ctrl+N). Nutzt exakt
+        // dieselbe Funktion wie der Tastatur-Shortcut, damit beide Wege
+        // identisch laufen (Default-Kanal erben, Session anhängen, aktivieren).
+        if content == "/new" || content.starts_with("/new ") {
+            self.new_session();
             return;
         }
         // `/options` → Options-Dialog öffnen (wie Ctrl+O).
@@ -1033,6 +1045,51 @@ impl App {
             s.error = None;
             s.error_debug = None;
             self.http_headers_dialog = true;
+            return;
+        }
+        // `/commit <msg>` → alle Änderungen im aktuellen Worktree committen.
+        if let Some(msg) = content
+            .strip_prefix("/commit ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.user_commit(msg.to_string());
+            return;
+        }
+        // `/end` → Session beenden (mit Worktree-Aufräumen). Bricht vorher
+        // laufende Worker derselben Session ab.
+        if content == "/end" {
+            self.user_end();
+            return;
+        }
+
+        // ── Braucht eine freie LLM-Runde ─────────────────────────────────
+        // Alles Weitere fügt einen neuen Chat-Beitrag ein (`send_prompt`),
+        // startet eine Kompaktierung (`/compact`), einen zweiten Tool-Lauf
+        // (`/run`) oder einen Worktree-Turn (`/branch`) – das kollidiert mit
+        // einem laufenden Stream/Worker. Solange das LLM noch nicht geantwortet
+        // hat, wird Enter dafür still ignoriert (kein Doppel-Send, kein zweiter
+        // Worker auf derselben Session).
+        if matches!(
+            self.sessions[active].phase,
+            Phase::WaitingForLLM | Phase::WaitingForTool
+        ) {
+            return;
+        }
+
+        // `/compact` → manuelle Kontext-Kompaktierung: alte Turns durch eine
+        // Zusammenfassung ersetzen, ohne einen LLM-Turn zu senden.
+        if content == "/compact" {
+            self.user_compact();
+            return;
+        }
+        // `/branch <name>` → neuen Git-Worktree anlegen, neuen Channel + Session erzeugen.
+        if let Some(branch_name) = content
+            .strip_prefix("/branch ")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            self.user_branch(branch_name.to_string());
             return;
         }
         // `/run <shell-ausdruck>` → User-induzierter Tool-Call über den Kanal,
@@ -1054,7 +1111,7 @@ impl App {
         if needs_confirm {
             self.pre_send_confirm = Some(PreSendConfirm {
                 session: active,
-                cursor: 2, // Default: Abbrechen
+                nav: ListNav::new_at(3, 2), // Default: Abbrechen
             });
             return;
         }
@@ -1083,9 +1140,9 @@ impl App {
         // alle Inhalte monoton weiter, sodass die Statusleiste nie wieder unter
         // den zuletzt geschätzten Wert fällt (nur Compaction senkt sie).
         let prev = self.sessions[active].prompt_base;
-        let base_prompt = match self.sessions[active].last_usage() {
+        let base_prompt = match self.sessions[active].last_usage_current() {
             Some(u) => u.prompt_tokens,
-            None => prev.max((prompt_chars(&self.sessions[active]) as u64 / 4).max(1)),
+            None => prev.max(prompt_tokens(&self.sessions[active]).max(1)),
         };
         // Die beim Enter aktuell gewählte Berechtigung gilt für diesen ganzen
         // Turn und bleibt als Default für die nächste Nachricht erhalten.
@@ -1113,6 +1170,9 @@ impl App {
             s.compacting = false;
             s.active_model = Some(ep.model.clone());
             s.sent_at = Some(Instant::now());
+            // Streaming-Metrik-Felder für den neuen Turn zurücksetzen; die
+            // erste HTTP-Runde setzt sie über `RoundStart` erneut.
+            s.reset_stream_metrics(Instant::now());
             s.cancel = Arc::new(AtomicBool::new(false));
             s.phase = Phase::WaitingForLLM;
         }

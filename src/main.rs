@@ -13,7 +13,8 @@ mod ui;
 use std::io::{self, Write};
 
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 
@@ -27,9 +28,23 @@ fn main() -> io::Result<()> {
 
     let config = config::Config::load();
 
+    // Theme auflösen: `auto` fragt die Terminal-Defaultfarben per OSC-11 ab.
+    // Muss VOR Raw-Mode/Alt-Screen passieren (siehe theme::resolve).
+    let theme_choice = ui::ThemeChoice::parse(&config.theme).unwrap_or_default();
+    ui::set_theme(ui::resolve(theme_choice));
+
     crossterm::terminal::enable_raw_mode()?;
     let guard = TerminalGuard;
     execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+
+    // Aktuellen Fenster-Titel auf den xterm-Titel-Stack pushen (`ESC[22;0t`),
+    // damit wir ihn beim Beenden wiederherstellen können (`ESC[23;0t` in
+    // `TerminalGuard::drop`). Der OSC-0-Titel von aidev ist global für den
+    // Tab/Window (nicht am Alternate Screen gebunden) und würde sonst nach
+    // dem Exit stehen bleiben. Terminals ohne Titel-Stack (z. B. GNOME
+    // Terminal, Windows Terminal) ignorieren die Sequenz harmlos.
+    let _ = io::stdout().write_all(b"\x1b[22;0t");
+    let _ = io::stdout().flush();
 
     // Keyboard-Enhancement aktivieren (Kitty-Protokoll), damit Numpad-Tasten
     // (KP_+, KP_-, KP_Enter usw.) als eigenständige KeyCodes erkannt werden
@@ -38,6 +53,11 @@ fn main() -> io::Result<()> {
         io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
+
+    // Bracketed Paste einschalten: Damit kommt eingefügter (mehrzeiliger) Text
+    // als ein zusammenhängendes `Paste`-Event an statt als einzelne Key-Events
+    // (deren `\n` sonst als Enter = Senden interpretiert würde).
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
 
     // Maus-Reporting nur aktivieren, wenn in der Config gewünscht (`mouse = true`).
     // Ohne Maus-Reporting funktioniert Textmarkierung und Einfügen mit der
@@ -93,6 +113,14 @@ impl Drop for TerminalGuard {
         // Maus-Reporting deaktivieren, bevor wir den Alt-Screen verlassen.
         let _ = io::stdout().write_all(b"\x1b[?1000l\x1b[?1006l");
         let _ = io::stdout().flush();
+        // Vorher gesicherten Fenster-Titel wiederherstellen (`ESC[23;0t`,
+        // Gegenstück zum Push in `main`). In Terminals ohne Titel-Stack ein
+        // No-Op – dort bleibt der zuletzt gesetzte Titel stehen.
+        let _ = io::stdout().write_all(b"\x1b[23;0t");
+        let _ = io::stdout().flush();
+        // Bracketed Paste wieder ausschalten (sonst bliebe das Terminal im
+        // Zustand und z. B. die Shell würde eingefügte Newlines maskieren).
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
