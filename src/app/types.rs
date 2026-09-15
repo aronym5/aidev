@@ -158,10 +158,10 @@ pub const CHANNEL_CLOSE_WORKTREE_OPTIONS: &[&str] = &[
     "Commit & delete – create snapshot, then delete",
 ];
 
-/// Offener Options-Dialog (Ctrl+O). `nav` wählt die aktive Option: zwei
-/// Einträge (Maus-Ein/Aus und Modell-Status) über die gemeinsame
-/// `ListNav`-Abstraktion. Die eigentlichen Labels werden erst beim Rendern
-/// berechnet (sie ändern sich mit `mouse_enabled`/`display_model`).
+/// Offener Options-Dialog (Ctrl+O). `nav` wählt die aktive Option: drei
+/// Einträge (laufende Version [Info], Maus-Ein/Aus und Modell-Status) über die
+/// gemeinsame `ListNav`-Abstraktion. Die eigentlichen Labels werden erst beim
+/// Rendern berechnet (sie ändern sich mit `mouse_enabled`/`display_model`).
 pub struct OptionsDialog {
     pub nav: ListNav,
 }

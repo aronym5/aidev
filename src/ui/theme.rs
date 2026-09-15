@@ -456,7 +456,10 @@ mod tests {
             Color::Rgb(r, g, b) => luminance((r, g, b)),
             _ => 0.0,
         };
-        let rgb = |c: Color| match c { Color::Rgb(r, g, b) => (r, g, b), _ => (0, 0, 0) };
+        let rgb = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (0, 0, 0),
+        };
         // Panels/Text invertieren (dunkel ↔ hell) – der Kanvas ist dagegen in
         // beiden Themes Terminal-Default (siehe `kanvas_ist_terminal_default…`).
         assert!(lum(LIGHT.surface_fg) < lum(DARK.surface_fg));
@@ -476,7 +479,10 @@ mod tests {
             parse_osc_ps(b"\x1b]11;rgb:1a1a/2b2b/3c3c\x1b\\", 11),
             Some((0x1a, 0x2b, 0x3c))
         );
-        assert_eq!(parse_osc_ps(b"\x1b]11;rgb:1a/2b/3c\x07", 11), Some((0x1a, 0x2b, 0x3c)));
+        assert_eq!(
+            parse_osc_ps(b"\x1b]11;rgb:1a/2b/3c\x07", 11),
+            Some((0x1a, 0x2b, 0x3c))
+        );
         assert_eq!(parse_osc_ps(b"nix", 11), None);
         // Beide Abfragen in einem Puffer, getrennt nach ps.
         let both = b"\x1b]10;rgb:fafa/fafa/fafa\x1b\\\x1b]11;rgb:1414/1414/3030\x1b\\";
@@ -502,6 +508,10 @@ mod tests {
         assert_eq!(colorfgbg_bg_rgb(), Some((0, 0, 0)));
         std::env::set_var("COLORFGBG", "0;15");
         assert_eq!(colorfgbg_bg_rgb(), Some((255, 255, 255)));
-        if let Some(v) = old { std::env::set_var("COLORFGBG", v); } else { std::env::remove_var("COLORFGBG"); }
+        if let Some(v) = old {
+            std::env::set_var("COLORFGBG", v);
+        } else {
+            std::env::remove_var("COLORFGBG");
+        }
     }
 }

@@ -34,7 +34,9 @@ impl StyleSheet for ChatSheet {
     }
 
     fn code(&self) -> Style {
-        Style::new().fg(Color::Rgb(129, 201, 149)).bg(theme().surface_bg) // Grün wie theme().ok
+        Style::new()
+            .fg(Color::Rgb(129, 201, 149))
+            .bg(theme().surface_bg) // Grün wie theme().ok
     }
 }
 

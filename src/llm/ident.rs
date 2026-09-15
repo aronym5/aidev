@@ -5,7 +5,7 @@
 //!   (`timestamp_ms × 0x1000 + counter`, für absteigend bitweise invertiert),
 //! - der 14-Base62-Teil ein Zufallswert ist (Kollisionsschutz).
 //!
-//! Sessions werden **absteigend** erzeugt (neueste zuerst), Messages/Parts/… 
+//! Sessions werden **absteigend** erzeugt (neueste zuerst), Messages/Parts/…
 //! **aufsteigend** (chronologische Sortierung ohne Extraschritt).
 
 use std::collections::HashMap;
@@ -67,9 +67,7 @@ fn payload(descending: bool) -> String {
 
     // 14 Zufalls-Zeichen (Base62) über splitmix64-PRNG – kein externer `rand`-
     // Abruf nötig; der Seed mischt Zeit + Sequenz für ausreichend Entropie.
-    let mut seed: u64 = ts
-        ^ (counter as u64).wrapping_mul(0x9E3779B97F4A7C15)
-        ^ (now_ms() << 32);
+    let mut seed: u64 = ts ^ (counter as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (now_ms() << 32);
     let rand: String = (0..14)
         .map(|_| {
             seed = seed.wrapping_add(0x9E3779B97F4A7C15);

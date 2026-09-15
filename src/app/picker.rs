@@ -39,10 +39,13 @@ impl App {
                 // Gewählten Kanal aus der Registry entfernen (Entf). Nur bei
                 // bestehenden Kanälen – „(kein Kanal)" und „new channel"
                 // lassen sich nicht schließen.
-                let name = self.channel_picker.as_mut().and_then(|p| match p.items.selected() {
-                    Some(ChannelPick::Channel { name }) => Some(name.clone()),
-                    _ => None,
-                });
+                let name = self
+                    .channel_picker
+                    .as_mut()
+                    .and_then(|p| match p.items.selected() {
+                        Some(ChannelPick::Channel { name }) => Some(name.clone()),
+                        _ => None,
+                    });
                 if let Some(name) = name {
                     self.begin_close_channel(&name, CloseKind::Picker);
                 }

@@ -323,7 +323,10 @@ fn wrap_ranges(chars: &[char], width: usize) -> Vec<Range<usize>> {
     let mut i = 0usize;
     while i <= n {
         // Logische Zeile: Text bis zum nächsten (exklusiven) `\n` bzw. Textende.
-        let line_end = chars[i..n].iter().position(|&c| c == '\n').map_or(n, |p| i + p);
+        let line_end = chars[i..n]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(n, |p| i + p);
         let seg_len = line_end - i;
         if seg_len == 0 {
             // Leere Zeile (z. B. doppelter Umbruch): trotzdem als Zeile sichtbar.
@@ -354,7 +357,10 @@ fn wrap_ranges(chars: &[char], width: usize) -> Vec<Range<usize>> {
                 // Kein Whitespace im Fenster → auf Trennzeichen (-, /, .)
                 // ausweichen (bleibt sichtbar, dahinter wird getrennt), sonst
                 // blind brechen.
-                match (start..f_end).rev().find(|&p| matches!(chars[p], '-' | '/' | '.')) {
+                match (start..f_end)
+                    .rev()
+                    .find(|&p| matches!(chars[p], '-' | '/' | '.'))
+                {
                     Some(p) => (p + 1 - start, p + 1 - start),
                     None => (width, width),
                 }

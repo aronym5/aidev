@@ -81,7 +81,7 @@ fn main() -> io::Result<()> {
 fn probe_cli(args: &[String]) -> Option<i32> {
     match args.first().map(String::as_str) {
         Some("-V" | "--version") => {
-            print!("aidev {}\n", config::VERSION);
+            println!("aidev {}", config::VERSION);
             Some(0)
         }
         Some("-h" | "--help") => {

@@ -57,7 +57,9 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
         let ch = SPINNER[app.spinner % SPINNER.len()];
         // Countdown in Millisekunden, aufgerundet auf die nächste volle Sekunde –
         // so zeigt `fmt_duration` ganze Sekunden und nie „0 s“/Bruchteile.
-        let left_ms = retry_at.saturating_duration_since(Instant::now()).as_millis() as u64;
+        let left_ms = retry_at
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u64;
         let next_sec = (left_ms / 1000 + 1) * 1000;
         return muted_line(
             format!(" {ch} {summary} – Retry in {}", fmt_duration(next_sec)),
@@ -78,6 +80,13 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
         muted_line(format!(" {err}"), Color::Rgb(240, 113, 120))
     } else if s.aborted {
         muted_line(" Aborted".to_string(), theme().highlight)
+    } else if app.any_dialog_open() {
+        // Solange ein Dialog (Picker/Options/Builder/Bestätigung) die Tastatur
+        // beansprucht, keine Haupt-Tastenkürzel in der Chat-Statuszeile zeigen –
+        // der Dialog trägt seine eigene Tasten-Hilfe. Läuft die Session gerade
+        // („thinking…“, Tool, Retry, …), steht das weiter oben schon; nur im
+        // schlichten Idle bleibt die Zeile leer.
+        Line::default()
     } else {
         key_help(&STATUS_KEYS, max_width)
     }
@@ -174,7 +183,9 @@ pub(crate) const EXEC_KEYS: [(&str, &str); 3] =
 /// passen, werden in Anzeige-Reihenfolge weggelassen. Wird von der
 /// Statusleiste und sämtlichen Dialogen gemeinsam genutzt.
 pub(crate) fn key_help(bindings: &[(&str, &str)], max_width: usize) -> Line<'static> {
-    let key_style = Style::default().fg(theme().accent).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(theme().accent)
+        .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme().muted);
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
     let mut width = 1usize; // führendes Leerzeichen
@@ -315,7 +326,9 @@ pub(crate) fn metadata_line(app: &App) -> Line<'static> {
                 // Aktiver Zoom: hervorgehoben
                 parts.push(Span::styled(
                     *sym,
-                    Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme().accent)
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 parts.push(Span::styled(*sym, muted));

@@ -534,7 +534,11 @@ mod tests {
         nav.page_down(5);
         assert_eq!(nav.cursor(), 5);
         nav.follow(10, |_| 1);
-        assert_eq!(nav.offset(), 0, "Cursor passt ins Fenster – kein Scroll nötig");
+        assert_eq!(
+            nav.offset(),
+            0,
+            "Cursor passt ins Fenster – kein Scroll nötig"
+        );
     }
 
     #[test]
@@ -551,7 +555,13 @@ mod tests {
     #[test]
     fn follow_haelt_mehrzeiligen_eintrag_komplett_sichtbar() {
         // Eintrag 2 ist 4 Zeilen hoch; Fensterhöhe 5.
-        let row_of = |i: usize| -> u16 { if i == 2 { 4 } else { 1 } };
+        let row_of = |i: usize| -> u16 {
+            if i == 2 {
+                4
+            } else {
+                1
+            }
+        };
         let mut nav = ListNav::new(10);
         nav.page_down(2);
         assert_eq!(nav.cursor(), 2);
@@ -565,7 +575,13 @@ mod tests {
     fn follow_einziger_eintrag_hoeher_als_fenster_bleibt_am_cursor() {
         // Ein einzelner Eintrag (Index 2) ist höher als das Fenster:
         // Offset kann nicht mehr schieben, bleibt am Cursor stehen.
-        let row_of = |i: usize| -> u16 { if i == 2 { 8 } else { 1 } };
+        let row_of = |i: usize| -> u16 {
+            if i == 2 {
+                8
+            } else {
+                1
+            }
+        };
         let mut nav = ListNav::new(10);
         nav.offset = 0;
         nav.page_down(2);
@@ -585,7 +601,11 @@ mod tests {
         nav2.offset = 3;
         nav2.page_down(4);
         nav2.follow(0, |_| 1);
-        assert_eq!(nav2.offset(), 0, "kein Fenster → Scroll-Offset zurückgesetzt");
+        assert_eq!(
+            nav2.offset(),
+            0,
+            "kein Fenster → Scroll-Offset zurückgesetzt"
+        );
     }
 
     // ── visible (sichtbarer Ausschnitt) ──────────────────────────────────────
@@ -639,7 +659,12 @@ mod tests {
         assert_eq!(nav.cursor(), 3);
         // Enter/Esc/Sondertasten gehören den Aufrufern – die Navigation
         // konsumiert sie nicht und verändert den Cursor nicht.
-        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('r'), KeyCode::Char(' ')] {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('r'),
+            KeyCode::Char(' '),
+        ] {
             assert!(!nav.handle_move(&key(code), 10, |_| 1));
         }
         assert_eq!(nav.cursor(), 3, "Cursor bleibt bei fremden Tasten");
@@ -717,7 +742,11 @@ mod tests {
         assert_eq!(sel.nav.len(), 3, "push verlängert die Navigation");
         assert_eq!(sel.selected(), Some(&20), "Cursor bleibt wo er war");
         sel.set_cursor(99);
-        assert_eq!(sel.nav.cursor(), 2, "set_cursor klemmt auf das letzte Element");
+        assert_eq!(
+            sel.nav.cursor(),
+            2,
+            "set_cursor klemmt auf das letzte Element"
+        );
         assert_eq!(sel.selected(), Some(&30));
     }
 
@@ -726,7 +755,13 @@ mod tests {
     #[test]
     fn visible_rows_zählt_zeilen_statt_einträge() {
         // Zwei Einträge: einer ist doppelt so hoch (Zeilenhöhe 2).
-        let row_of = |i: usize| -> u16 { if i == 1 { 2 } else { 1 } };
+        let row_of = |i: usize| -> u16 {
+            if i == 1 {
+                2
+            } else {
+                1
+            }
+        };
         let mut nav = ListNav::new(4);
         nav.set_cursor(3); // Cursor auf dem letzten Eintrag
         nav.follow(3, row_of);
@@ -742,7 +777,13 @@ mod tests {
     fn visible_rows_zeigt_mindestens_einen_eintrag() {
         // Ein Eintrag ist höher als das Fenster – trotzdem mindestens einer.
         let mut nav = ListNav::new(5);
-        let row_of = |i: usize| -> u16 { if i == 0 { 99 } else { 1 } };
+        let row_of = |i: usize| -> u16 {
+            if i == 0 {
+                99
+            } else {
+                1
+            }
+        };
         nav.follow(3, row_of); // follow stoppt am Cursor (Eintrag 0)
         assert_eq!(nav.offset(), 0);
         let range = nav.visible_rows(3, row_of);

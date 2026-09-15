@@ -81,7 +81,8 @@ Two channel types:
 
 - **podman** — runs in a container started from an image. *Run* mode creates its own
   container (duplicateable per session); *attach* mode joins an existing container.
-  Commands run as your host UID with keep-id, so file permissions match the host.
+  By default the image's guest UID/GID is mapped onto your host user (`uidmap`), so
+  file permissions match the host; `keep-id` is available as an alternative.
 - **local** — runs directly on the host (no container). Practical in sandboxes/CI where
   rootless podman is unavailable.
 
@@ -160,6 +161,7 @@ with the arrow keys.
 | `/options`         | Open options dialog (same as `Ctrl+O`)                        |
 | `/branch <name>`   | Create a new worktree + channel + session                     |
 | `/commit <msg>`    | Commit the current worktree's changes                         |
+| `/reload`          | Reload config.toml (models, channels, paths, theme, ...)      |
 
 ---
 
@@ -203,7 +205,7 @@ base_url = "http://localhost:11434/v1"    # no key needed
 
 # Named models, choosable per session with /model or alt+m
 [models]
-smart = "zen/big-pickle"                  # short form: just the model ID
+smart = "zen/big-pickle"                  # short form: just the provider/modelname
 
 [models.local]                            # long form with context window
 id = "ollama/llama3"

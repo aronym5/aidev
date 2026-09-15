@@ -208,8 +208,18 @@ impl App {
             }
         }
 
-        // 2. Versuch: Default-Modell über Registry auflösen (alias = None
-        //    oder Key nicht gefunden → Fallback auf config.model).
+        // 1b. Default-Modellfeld ZUERST als Alias interpretieren:
+        //     `model = "prov/mod"` meint den Alias `[models.mod]` bzw.
+        //     `[models] mod = "…"`, sofern er für den Provider `prov`
+        //     definiert ist (gesendet wird dann dessen Servername, z.B. "bla").
+        if alias.is_none() {
+            if let Some(m) = self.config.resolve_default_alias() {
+                return self.config.resolve_from_default_alias(m);
+            }
+        }
+
+        // 2. Versuch: Default-Modell als Servername über Registry auflösen
+        //    (alias = None oder Key nicht gefunden → Fallback auf config.model).
         let model_id = alias.unwrap_or(&self.config.model);
         if let Some(entry) = self.model_registry.find_by_model_id(model_id) {
             return self.resolve_from_entry(entry);
@@ -266,8 +276,15 @@ impl App {
                     .unwrap_or_else(|| key.to_string())
             }
             None => {
-                // Default-Modell: über Registry auflösen, damit der Alias
-                // angezeigt wird (z.B. "zen/mimo-2.5" statt "zen/mimo-v2.5-free").
+                // Default-Modell: ZUERST als Alias interpretieren
+                // (`model = "prov/mod"` → Anzeige "prov/mod", auch wenn der
+                // Servername hinter dem Alias anders heißt).
+                if let Some(m) = self.config.resolve_default_alias() {
+                    return format!("{}/{}", m.provider, m.alias);
+                }
+                // Sonst als Servername über die Registry auflösen, damit der
+                // Alias angezeigt wird (z.B. "zen/mimo-2.5" statt
+                // "zen/mimo-v2.5-free").
                 let model_id = &self.config.model;
                 if let Some(entry) = self.model_registry.find_by_model_id(model_id) {
                     return entry.display_key();
@@ -426,7 +443,11 @@ impl App {
     /// - nur eine offene Session und beschäftigt → `busy` (ohne Zähler)
     /// - mehrere Sessions, davon `n` beschäftigt → `n/m busy`
     fn busy_status(&self) -> String {
-        let busy = self.sessions.iter().filter(|s| App::session_busy(s)).count();
+        let busy = self
+            .sessions
+            .iter()
+            .filter(|s| App::session_busy(s))
+            .count();
         match busy {
             0 => "idle".to_string(),
             _ if self.sessions.len() == 1 => "busy".to_string(),
@@ -859,9 +880,9 @@ impl App {
         self.channel_picker = None;
         self.model_picker = None;
         self.channel_builder = None;
-        // Zwei Optionen: Maus-Ein/Aus, Modell-Status.
+        // Drei Optionen: laufende Version (Info), Maus-Ein/Aus, Modell-Status.
         self.options_dialog = Some(OptionsDialog {
-            nav: ListNav::new(2),
+            nav: ListNav::new(3),
         });
     }
 
@@ -878,7 +899,9 @@ impl App {
                 // Ctrl+O schließt den Dialog wieder.
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if d.nav.cursor() == 0 {
+                // Version ist reine Info (Index 0); Maus-Toggle liegt auf
+                // Index 1 (Modell-Status index 2 ist ebenfalls nur Anzeige).
+                if d.nav.cursor() == 1 {
                     self.toggle_mouse();
                 }
                 // Dialog bleibt offen, damit der User den Status sieht.
@@ -896,8 +919,15 @@ impl App {
 
 pub fn run(config: Config) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
-    let channels = ChannelRegistry::new(&config);
+    let (channels, startup_warnings) = ChannelRegistry::new_with_warnings(&config);
     let mut app = App::new(config, channels, tx, rx);
+    // Nicht verfügbare Kanäle beim Start: Warnungen in der Statuszeile der
+    // ersten Session statt auf stderr – der Alt-Screen ist bereits aktiv und
+    // stderr-Ausgaben würden das Layout zerschießen.
+    if !startup_warnings.is_empty() {
+        let s = &mut app.sessions[app.active];
+        s.error = Some(startup_warnings.join(" · "));
+    }
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;

@@ -2,14 +2,12 @@
 //!
 //! Wie die Volltextsuche läuft `find` als Host-Prozess im (bereits gegen
 //! die Kanal-Wurzel geprüften) Verzeichnis – konsistent zu `rg`/`grep`
-//! in [`super::search`]. Symlinks werden nicht gefolgt (`find`-Default),
-//! Generator-/Cache-Verzeichnisse werden nachträglich ausgefiltert.
+//! in [`super::search`]. Symlinks werden nicht gefolgt (`find`-Default).
 
 use std::path::Path;
 use std::time::Duration;
 
 use super::run::run_with_timeout;
-use super::search::is_excluded_path;
 
 /// Liefert alle Dateien und Verzeichnisse unter `dir`, die auf das
 /// Glob-Muster passen.
@@ -61,16 +59,15 @@ pub(super) fn find_glob(
         return Err(format!("find error:\n{}", out.stderr));
     }
 
-    // Kanal-relative Form („./src/main.rs“ → „src/main.rs“), Generator- und
-    // Cache-Verzeichnisse raus, Duplikate vermeiden, stabil sortieren. Die
-    // Ergebnismenge begrenzt der Aufrufer (tools_exec) auf GLOB_RESULT_CAP.
-    // Verzeichnisse werden mit abschließendem „/“ markiert (z. B. „src/“), damit
-    // das Modell Dateien von Verzeichnissen unterscheiden kann.
+    // Kanal-relative Form („./src/main.rs“ → „src/main.rs“), Duplikate
+    // vermeiden, stabil sortieren. Die Ergebnismenge begrenzt der Aufrufer
+    // (tools_exec) auf GLOB_RESULT_CAP. Verzeichnisse werden mit abschließendem
+    // „/“ markiert (z. B. „src/“), damit das Modell Dateien von Verzeichnissen
+    // unterscheiden kann.
     let mut paths: Vec<String> = out
         .stdout
         .lines()
         .filter_map(|l| l.strip_prefix("./"))
-        .filter(|p| !is_excluded_path(p))
         .map(|p| {
             if dir.join(p).is_dir() {
                 format!("{p}/")
@@ -116,8 +113,12 @@ mod tests {
     fn name_ohne_slash_findet_jede_tiefe() {
         let dir = temp_tree("name");
         let hits = find_glob("*.rs", &dir, Duration::from_secs(10)).unwrap();
-        assert_eq!(hits, vec!["src/deep/nested.rs", "src/main.rs"]);
-        assert!(!hits.iter().any(|p| p.starts_with("target")), "Excludes");
+        // Kein Herausfiltern von .git/target/node_modules mehr: target/debug/x.rs
+        // taucht jetzt auf, .git/config ist kein .rs.
+        assert_eq!(
+            hits,
+            vec!["src/deep/nested.rs", "src/main.rs", "target/debug/x.rs"]
+        );
         cleanup(&dir);
     }
 

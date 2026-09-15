@@ -399,10 +399,15 @@ impl Session {
         }
         // `pending_usage` (aus dem `Usage`-Event des Turns) hat Vorrang; der
         // `usage`-Parameter deckt den direkt übergebenen Wert ab.
-        let usage = self.pending_usage.take().or(usage).unwrap_or_else(zero_usage);
+        let usage = self
+            .pending_usage
+            .take()
+            .or(usage)
+            .unwrap_or_else(zero_usage);
         // `num_tokens` werden nicht hier, sondern in `derive_last_turn_tokens`
         // über den ganzen Turn verteilt (§4.3). `0` bis dahin.
-        self.chat.finalize_assistant(aid, Instant::now(), usage, 0, 0, aborted);
+        self.chat
+            .finalize_assistant(aid, Instant::now(), usage, 0, 0, aborted);
         // Beim Streaming gemessene Completion-Token je Bereich an der Runde
         // festhalten (nur wenn tatsächlich Usage-Messung vorlag – sonst macht
         // `derive_last_turn_tokens` den proportionalen/Estimate-Fallback).
@@ -515,16 +520,11 @@ impl Session {
 
     /// `id` des zuletzt eingefügten UserPrompt (parent der Turn-Unterrunden).
     fn current_prompt_id(&self) -> Option<EventId> {
-        self.chat
-            .order()
-            .iter()
-            .rev()
-            .copied()
-            .find(|id| {
-                self.chat
-                    .event(*id)
-                    .is_some_and(|e| matches!(e.kind, EventKind::UserPrompt { .. }))
-            })
+        self.chat.order().iter().rev().copied().find(|id| {
+            self.chat
+                .event(*id)
+                .is_some_and(|e| matches!(e.kind, EventKind::UserPrompt { .. }))
+        })
     }
 
     /// Server-bestätigte Usage der letzten (abgeschlossenen) Assistant-Runde –
@@ -543,7 +543,9 @@ impl Session {
             )
         });
         for (i, id) in order.iter().enumerate().rev() {
-            let Some(ev) = self.chat.event(*id) else { continue };
+            let Some(ev) = self.chat.event(*id) else {
+                continue;
+            };
             if let EventKind::Assistant { reported_usage, .. } = &ev.kind {
                 if ev.time_end.is_some() {
                     let current = match last_arch {
@@ -777,7 +779,9 @@ pub(crate) fn prompt_tokens(s: &Session) -> u64 {
     let order = s.chat.order();
     let mut total = 0u64;
     for id in order {
-        let Some(ev) = s.chat.event(*id) else { continue };
+        let Some(ev) = s.chat.event(*id) else {
+            continue;
+        };
         if ev.time_end.is_none() {
             // offen → aktueller Stand obenauf
             total += s.chat.estimate_contribution(*id);

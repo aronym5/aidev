@@ -45,4 +45,3 @@ pub(crate) fn ensure_reasoning_for_tool_calls(msgs: &[WireMessage]) -> Vec<WireM
         })
         .collect()
 }
-

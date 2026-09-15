@@ -51,7 +51,7 @@ fn base_config() -> Config {
 
 fn app() -> App {
     let (tx, rx) = mpsc::channel();
-    App::new(base_config(), ChannelRegistry::new(&base_config()), tx, rx)
+    App::new(base_config(), ChannelRegistry::new_with_warnings(&base_config()).0, tx, rx)
 }
 
 fn alt_d() -> KeyEvent {
@@ -100,10 +100,14 @@ fn enter_waehrend_stream_model_befehl_wird_ausgefuehrt() {
     apply_refresh(&mut a, &[("test/fast", None)]);
     a.sessions[0].editor.set_text("erste nachricht");
     a.send_prompt(0); // phase → WaitingForLLM
-    // Während des Streams `/model` eingeben und mit Enter bestätigen.
+                      // Während des Streams `/model` eingeben und mit Enter bestätigen.
     a.sessions[0].editor.set_text("/model test/fast");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(a.sessions[0].phase, Phase::WaitingForLLM, "Stream läuft weiter");
+    assert_eq!(
+        a.sessions[0].phase,
+        Phase::WaitingForLLM,
+        "Stream läuft weiter"
+    );
     assert_eq!(
         a.sessions[0].model_alias.as_deref(),
         Some("test/fast"),
@@ -124,7 +128,11 @@ fn enter_waehrend_stream_theme_befehl_wird_ausgefuehrt() {
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(a.sessions[0].phase, Phase::WaitingForLLM);
     assert!(
-        a.sessions[0].error.as_deref().unwrap_or("").contains("theme → dark"),
+        a.sessions[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("theme → dark"),
         "/theme läuft trotz aktivem Stream"
     );
 }
@@ -134,16 +142,23 @@ fn enter_waehrend_stream_dialog_befehle_oeffnen_dialoge() {
     let mut a = app();
     a.sessions[0].editor.set_text("erste nachricht");
     a.send_prompt(0); // phase → WaitingForLLM
-    // `/options` öffnet trotz aktivem Stream den Options-Dialog.
+                      // `/options` öffnet trotz aktivem Stream den Options-Dialog.
     a.sessions[0].editor.set_text("/options");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(a.options_dialog.is_some(), "/options öffnet Dialog trotz Stream");
+    assert!(
+        a.options_dialog.is_some(),
+        "/options öffnet Dialog trotz Stream"
+    );
     // Dialog schließen, dann `/header` – ebenfalls ein Dialog-Befehl.
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     a.sessions[0].editor.set_text("/header");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(a.http_headers_dialog, "/header öffnet Dialog trotz Stream");
-    assert_eq!(a.sessions[0].phase, Phase::WaitingForLLM, "Stream läuft weiter");
+    assert_eq!(
+        a.sessions[0].phase,
+        Phase::WaitingForLLM,
+        "Stream läuft weiter"
+    );
 }
 
 #[test]
@@ -151,7 +166,7 @@ fn enter_waehrend_stream_normaler_text_wird_ignoriert() {
     let mut a = app();
     a.sessions[0].editor.set_text("erste nachricht");
     a.send_prompt(0); // phase → WaitingForLLM
-    // Neuen Text während des Streams eintippen und Enter drücken.
+                      // Neuen Text während des Streams eintippen und Enter drücken.
     a.sessions[0].editor.set_text("zweite nachricht");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let s = &a.sessions[0];
@@ -170,13 +185,17 @@ fn enter_waehrend_stream_run_und_kompaktierung_bleiben_gesperrt() {
     let mut a = app();
     a.sessions[0].editor.set_text("erste nachricht");
     a.send_prompt(0); // phase → WaitingForLLM
-    // `/run` während des Streams: kein zweiter Tool-Worker, Text bleibt stehen.
+                      // `/run` während des Streams: kein zweiter Tool-Worker, Text bleibt stehen.
     a.sessions[0].editor.set_text("/run echo hi");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let s = &a.sessions[0];
     assert_eq!(s.phase, Phase::WaitingForLLM, "kein neuer Tool-Lauf");
     assert!(s.error.is_none(), "user_run wird gar nicht erreicht");
-    assert_eq!(s.editor.text_string(), "/run echo hi", "Befehl bleibt stehen");
+    assert_eq!(
+        s.editor.text_string(),
+        "/run echo hi",
+        "Befehl bleibt stehen"
+    );
     // `/compact` während des Streams: bleibt ebenfalls gesperrt.
     a.sessions[0].editor.set_text("/compact");
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -271,7 +290,11 @@ fn shift_enter_fuegt_umbruch_ein_enter_sendet_mehrzeilig() {
         "Zeile eins\n",
         "Shift+Enter fügt einen Umbruch ein"
     );
-    assert_ne!(a.sessions[0].phase, Phase::WaitingForLLM, "Shift+Enter sendet nicht");
+    assert_ne!(
+        a.sessions[0].phase,
+        Phase::WaitingForLLM,
+        "Shift+Enter sendet nicht"
+    );
 
     // "Zeile zwei" in der zweiten Zeile tippen und mit Enter absenden.
     for c in "Zeile zwei".chars() {
@@ -284,7 +307,10 @@ fn shift_enter_fuegt_umbruch_ein_enter_sendet_mehrzeilig() {
     let ids: Vec<_> = a.sessions[0].chat.order().to_vec();
     match &a.sessions[0].chat.event(ids[0]).unwrap().kind {
         EventKind::UserPrompt { text, .. } => {
-            assert_eq!(text, "Zeile eins\nZeile zwei", "mehrzeiliger Text wird gesendet")
+            assert_eq!(
+                text, "Zeile eins\nZeile zwei",
+                "mehrzeiliger Text wird gesendet"
+            )
         }
         other => panic!("erwartet UserPrompt, bin {other:?}"),
     }
@@ -358,17 +384,18 @@ fn tool_round_wird_als_assistant_plus_tool_events_abgebildet() {
     let mut a = app();
     a.sessions[0].push_user_message("frage".into(), Some(Permission::Read), "m".into());
 
-    a.tx
-        .send(llm::WorkerEvent::ToolStart {
-            session: 0,
-            tool_call_id: "call_1".into(),
-            function_name: "read".into(),
-            arguments: "{\"path\":\"x\"}".into(),
-            label: "read x".into(),
-        })
+    a.tx.send(llm::WorkerEvent::ToolStart {
+        session: 0,
+        tool_call_id: "call_1".into(),
+        function_name: "read".into(),
+        arguments: "{\"path\":\"x\"}".into(),
+        label: "read x".into(),
+    })
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolOutput(0, "inhalt".into()))
         .unwrap();
-    a.tx.send(llm::WorkerEvent::ToolOutput(0, "inhalt".into())).unwrap();
-    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity())).unwrap();
+    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity()))
+        .unwrap();
     a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
     assert!(a.drain_events());
 
@@ -398,49 +425,47 @@ fn tool_round_wird_als_assistant_plus_tool_events_abgebildet() {
 fn tool_zwischenrunde_mit_usage_ableitet_text_tokens() {
     use crate::llm::Usage;
     let mut a = app();
-    a.sessions[0]
-        .push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    a.sessions[0].push_user_message("frage".into(), Some(Permission::Read), "m".into());
 
     // Zwischenrunde (assistant mit tool_calls): Text, dann DAS USAGE DIESER
     // RUNDE, dann Tool-Aufruf – Reihenfolge wie im Worker nach §4.3-Fix.
     a.tx.send(llm::WorkerEvent::Chunk(0, "Ich schaue nach.".into()))
         .unwrap();
-    a.tx
-        .send(llm::WorkerEvent::Usage(
-            0,
-            Usage {
-                prompt_tokens: 500,
-                completion_tokens: 40,
-                total_tokens: 540,
-                cached_tokens: None,
-            },
-            llm::CompletionParts::default(),
-        ))
+    a.tx.send(llm::WorkerEvent::Usage(
+        0,
+        Usage {
+            prompt_tokens: 500,
+            completion_tokens: 40,
+            total_tokens: 540,
+            cached_tokens: None,
+        },
+        llm::CompletionParts::default(),
+    ))
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolStart {
+        session: 0,
+        tool_call_id: "call_1".into(),
+        function_name: "read".into(),
+        arguments: "{\"path\":\"x\"}".into(),
+        label: "read x".into(),
+    })
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity()))
         .unwrap();
-    a.tx
-        .send(llm::WorkerEvent::ToolStart {
-            session: 0,
-            tool_call_id: "call_1".into(),
-            function_name: "read".into(),
-            arguments: "{\"path\":\"x\"}".into(),
-            label: "read x".into(),
-        })
-        .unwrap();
-    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity())).unwrap();
     // Finale Runde (ohne tool_calls), danach Done.
-    a.tx.send(llm::WorkerEvent::Chunk(0, "Antwort.".into())).unwrap();
-    a.tx
-        .send(llm::WorkerEvent::Usage(
-            0,
-            Usage {
-                prompt_tokens: 600,
-                completion_tokens: 30,
-                total_tokens: 630,
-                cached_tokens: None,
-            },
-            llm::CompletionParts::default(),
-        ))
+    a.tx.send(llm::WorkerEvent::Chunk(0, "Antwort.".into()))
         .unwrap();
+    a.tx.send(llm::WorkerEvent::Usage(
+        0,
+        Usage {
+            prompt_tokens: 600,
+            completion_tokens: 30,
+            total_tokens: 630,
+            cached_tokens: None,
+        },
+        llm::CompletionParts::default(),
+    ))
+    .unwrap();
     a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
     assert!(a.drain_events());
 
@@ -463,12 +488,20 @@ fn tool_zwischenrunde_mit_usage_ableitet_text_tokens() {
         _ => unreachable!(),
     };
     let fin = match &assistants[1].kind {
-        EventKind::Assistant { num_tokens_text, .. } => *num_tokens_text,
+        EventKind::Assistant {
+            num_tokens_text, ..
+        } => *num_tokens_text,
         _ => unreachable!(),
     };
     // Beide leiten ihre Text-Tokens aus dem Usage IHRER Runde ab (kein ~0).
-    assert!(mid > 0, "Zwischenantwort liefert abgeleitete Tokens, war {mid}");
-    assert!(fin > 0, "finale Antwort liefert abgeleitete Tokens, war {fin}");
+    assert!(
+        mid > 0,
+        "Zwischenantwort liefert abgeleitete Tokens, war {mid}"
+    );
+    assert!(
+        fin > 0,
+        "finale Antwort liefert abgeleitete Tokens, war {fin}"
+    );
 }
 
 #[test]
@@ -478,31 +511,29 @@ fn round_end_schliesst_tool_runde_sofort_ab() {
     // der Folge-Anfrage. Die Zwischenrunde muss danach sofort finalisiert sein
     // (`reported_usage` + `time_end`), ohne auf den ersten Chunk zu warten.
     let mut a = app();
-    a.sessions[0]
-        .push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    a.sessions[0].push_user_message("frage".into(), Some(Permission::Read), "m".into());
 
-    a.tx
-        .send(llm::WorkerEvent::Usage(
-            0,
-            Usage {
-                prompt_tokens: 500,
-                completion_tokens: 40,
-                total_tokens: 540,
-                cached_tokens: None,
-            },
-            llm::CompletionParts::default(),
-        ))
+    a.tx.send(llm::WorkerEvent::Usage(
+        0,
+        Usage {
+            prompt_tokens: 500,
+            completion_tokens: 40,
+            total_tokens: 540,
+            cached_tokens: None,
+        },
+        llm::CompletionParts::default(),
+    ))
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolStart {
+        session: 0,
+        tool_call_id: "call_1".into(),
+        function_name: "read".into(),
+        arguments: "{\"path\":\"x\"}".into(),
+        label: "read x".into(),
+    })
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity()))
         .unwrap();
-    a.tx
-        .send(llm::WorkerEvent::ToolStart {
-            session: 0,
-            tool_call_id: "call_1".into(),
-            function_name: "read".into(),
-            arguments: "{\"path\":\"x\"}".into(),
-            label: "read x".into(),
-        })
-        .unwrap();
-    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity())).unwrap();
     a.tx.send(llm::WorkerEvent::RoundEnd(0)).unwrap();
     assert!(a.drain_events());
 
@@ -527,7 +558,8 @@ fn round_end_schliesst_tool_runde_sofort_ab() {
     );
 
     // Der nächste Chunk öffnet eine NEUE Runde (kein Anhängen an die alte).
-    a.tx.send(llm::WorkerEvent::Chunk(0, "Antwort.".into())).unwrap();
+    a.tx.send(llm::WorkerEvent::Chunk(0, "Antwort.".into()))
+        .unwrap();
     a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
     assert!(a.drain_events());
     assert_eq!(
@@ -549,50 +581,50 @@ fn end_to_end_gemessene_parts_ueberleben_bis_zum_tool_event() {
     // bis in die Tool-Events durchkommen (und den zweiten derive-Lauf der
     // finalen Runde überleben).
     let mut a = app();
-    a.sessions[0]
-        .push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    a.sessions[0].push_user_message("frage".into(), Some(Permission::Read), "m".into());
 
-    a.tx.send(llm::WorkerEvent::Reasoning(0, "Gedanken.".into())).unwrap();
-    a.tx
-        .send(llm::WorkerEvent::Usage(
-            0,
-            Usage {
-                prompt_tokens: 987,
-                completion_tokens: 111,
-                total_tokens: 1098,
-                cached_tokens: None,
-            },
-            llm::CompletionParts {
-                reasoning: 38,
-                content: 0,
-                tool_calls: vec![36, 37],
-            },
-        ))
+    a.tx.send(llm::WorkerEvent::Reasoning(0, "Gedanken.".into()))
         .unwrap();
+    a.tx.send(llm::WorkerEvent::Usage(
+        0,
+        Usage {
+            prompt_tokens: 987,
+            completion_tokens: 111,
+            total_tokens: 1098,
+            cached_tokens: None,
+        },
+        llm::CompletionParts {
+            reasoning: 38,
+            content: 0,
+            tool_calls: vec![36, 37],
+        },
+    ))
+    .unwrap();
     // Tool 1 (call_8f…) und Tool 2 (call_042…) – der Worker sendet sie
     // VERSCHACHTELT: Start→End→Start→End (jedes Tool ausgeführt, dann End).
-    a.tx
-        .send(llm::WorkerEvent::ToolStart {
-            session: 0,
-            tool_call_id: "call_8f1dd6088e2d4f46a434135b".into(),
-            function_name: "glob".into(),
-            arguments: "{\"pattern\": \"*\"}".into(),
-            label: "glob *".into(),
-        })
+    a.tx.send(llm::WorkerEvent::ToolStart {
+        session: 0,
+        tool_call_id: "call_8f1dd6088e2d4f46a434135b".into(),
+        function_name: "glob".into(),
+        arguments: "{\"pattern\": \"*\"}".into(),
+        label: "glob *".into(),
+    })
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity()))
         .unwrap();
-    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity())).unwrap();
-    a.tx
-        .send(llm::WorkerEvent::ToolStart {
-            session: 0,
-            tool_call_id: "call_04276ce441d9441786fe240d".into(),
-            function_name: "glob".into(),
-            arguments: "{\"pattern\": \"**/*\"}".into(),
-            label: "glob **/*".into(),
-        })
+    a.tx.send(llm::WorkerEvent::ToolStart {
+        session: 0,
+        tool_call_id: "call_04276ce441d9441786fe240d".into(),
+        function_name: "glob".into(),
+        arguments: "{\"pattern\": \"**/*\"}".into(),
+        label: "glob **/*".into(),
+    })
+    .unwrap();
+    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity()))
         .unwrap();
-    a.tx.send(llm::WorkerEvent::ToolEnd(0, tool_activity())).unwrap();
     // Finale Antwort + Done (dritter derive-Lauf über den ganzen Turn).
-    a.tx.send(llm::WorkerEvent::Chunk(0, "Zusammenfassung.".into())).unwrap();
+    a.tx.send(llm::WorkerEvent::Chunk(0, "Zusammenfassung.".into()))
+        .unwrap();
     a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
     assert!(a.drain_events());
 
@@ -627,7 +659,10 @@ fn end_to_end_gemessene_parts_ueberleben_bis_zum_tool_event() {
         .expect("Tool-Runde");
     assert!(matches!(
         &assistant.kind,
-        EventKind::Assistant { num_tokens_reasoning: 38, .. }
+        EventKind::Assistant {
+            num_tokens_reasoning: 38,
+            ..
+        }
     ));
 }
 
@@ -635,7 +670,8 @@ fn end_to_end_gemessene_parts_ueberleben_bis_zum_tool_event() {
 fn abbruch_erzeugt_abort_event_und_phase_idle() {
     let mut a = app();
     a.sessions[0].push_user_message("frage".into(), Some(Permission::Read), "m".into());
-    a.tx.send(llm::WorkerEvent::Chunk(0, "halb".into())).unwrap();
+    a.tx.send(llm::WorkerEvent::Chunk(0, "halb".into()))
+        .unwrap();
     a.tx.send(llm::WorkerEvent::Cancelled(0)).unwrap();
     assert!(a.drain_events());
 
@@ -643,9 +679,7 @@ fn abbruch_erzeugt_abort_event_und_phase_idle() {
     assert_eq!(s.phase, Phase::Idle);
     assert!(s.aborted, "Abbruch markiert");
     assert!(
-        s.chat
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::Abort)),
+        s.chat.iter().any(|e| matches!(e.kind, EventKind::Abort)),
         "Abort-Event vorhanden"
     );
 }
@@ -686,7 +720,8 @@ fn prompt_tokens_nach_compaction_zaehlt_nur_aktuellen_kontext() {
     // Alter Turn (wird kompaktiert, bleibt im Chat erhalten, zählt nicht mehr).
     s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
     let a1 = s.open_assistant("gedanken alt".into(), "antwort alt".into());
-    s.chat.finalize_assistant(a1, std::time::Instant::now(), zero_usage(), 0, 0, false);
+    s.chat
+        .finalize_assistant(a1, std::time::Instant::now(), zero_usage(), 0, 0, false);
     // Summary mit exakter (vom Compaction-Aufruf gelieferter) Token-Zahl.
     let summary_tokens = 5;
     s.chat.compact(
@@ -697,7 +732,8 @@ fn prompt_tokens_nach_compaction_zaehlt_nur_aktuellen_kontext() {
     // Neuer Turn NACH der Summary.
     s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
     let a2 = s.open_assistant("gedanken neu".into(), "antwort neu".into());
-    s.chat.finalize_assistant(a2, std::time::Instant::now(), zero_usage(), 0, 0, false);
+    s.chat
+        .finalize_assistant(a2, std::time::Instant::now(), zero_usage(), 0, 0, false);
 
     let got = super::prompt_tokens(&s);
     // Nur Kontext ab der letzten Summary: exakte Summary-Tokens + Heuristik
@@ -736,14 +772,31 @@ fn should_compact_verwendet_nach_compaction_nicht_altes_usage() {
     // Turn 1 (wird archiviert): Kontext bis 100_000 – unter der Schwelle.
     s.push_user_message("frage eins".into(), Some(Permission::Read), "m".into());
     let a1 = s.open_assistant("gedanken eins".into(), "antwort eins".into());
-    s.chat.finalize_assistant(a1, std::time::Instant::now(), usage(90_000, 10_000), 0, 0, false);
+    s.chat.finalize_assistant(
+        a1,
+        std::time::Instant::now(),
+        usage(90_000, 10_000),
+        0,
+        0,
+        false,
+    );
     // Turn 2 (gerade über der Schwelle): sein Usage entscheidet über `should_compact`.
     s.push_user_message("frage zwei".into(), Some(Permission::Read), "m".into());
     let a2 = s.open_assistant("gedanken zwei".into(), "antwort zwei".into());
-    s.chat.finalize_assistant(a2, std::time::Instant::now(), usage(150_000, 20_000), 0, 0, false);
+    s.chat.finalize_assistant(
+        a2,
+        std::time::Instant::now(),
+        usage(150_000, 20_000),
+        0,
+        0,
+        false,
+    );
 
     // Vor der Kompaktierung: der letzte Usage (170_000) liegt über der Schwelle → kompaktieren.
-    assert!(should_compact(&s, &cfg, &ep), "letzter Usage über der Schwelle → Kompaktierung");
+    assert!(
+        should_compact(&s, &cfg, &ep),
+        "letzter Usage über der Schwelle → Kompaktierung"
+    );
 
     // Kompaktierung (via Session): Turn 1 wird archiviert, Turn 2 überlebt.
     s.apply_compaction("zusammenfassung".into(), 1_000, 0);
@@ -782,7 +835,10 @@ fn last_usage_current_verwirft_usage_vor_der_compaction() {
         0,
         false,
     );
-    assert!(s.last_usage_current().is_some(), "ohne Archive ist der Usage aktuell");
+    assert!(
+        s.last_usage_current().is_some(),
+        "ohne Archive ist der Usage aktuell"
+    );
     // Compaction: Archive NACH dem alten Turn einfügen – dessen Usage ist
     // jetzt veraltet (stammt aus der größeren Historie).
     s.chat.compact(2, "zusammenfassung".into(), 5);
@@ -832,7 +888,10 @@ fn zero_usage() -> llm::Usage {
 
 #[test]
 fn parse_run_line_extrahiert_ausdruck() {
-    assert_eq!(parse_run_line("/run cargo build && git status").as_deref(), Some("cargo build && git status"));
+    assert_eq!(
+        parse_run_line("/run cargo build && git status").as_deref(),
+        Some("cargo build && git status")
+    );
     assert_eq!(parse_run_line("/run"), Some(String::new()));
     assert_eq!(parse_run_line("/runfoo"), None);
     assert_eq!(parse_run_line("normal"), None);
@@ -862,12 +921,20 @@ fn slash_new_erzeugt_neue_session_wie_ctrl_n() {
         a.sessions[1].editor.text_string().is_empty(),
         "neue Session startet mit leerer Eingabe"
     );
-    assert_eq!(a.sessions[0].phase, Phase::Idle, "alte Session bleibt unangetastet");
+    assert_eq!(
+        a.sessions[0].phase,
+        Phase::Idle,
+        "alte Session bleibt unangetastet"
+    );
 
     // Vergleich mit Ctrl+N: gleicher Sessions-Endzustand (2 Sessions, aktive = 1).
     let mut b = app();
     b.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-    assert_eq!(b.sessions.len(), 2, "Ctrl+N erzeugt ebenfalls eine neue Session");
+    assert_eq!(
+        b.sessions.len(),
+        2,
+        "Ctrl+N erzeugt ebenfalls eine neue Session"
+    );
     assert_eq!(b.active, 1);
 }
 
@@ -885,17 +952,19 @@ fn http_headers_event_setzt_dialog_daten_der_session() {
     // Worker-Event `HttpHeaders` hinterlegt die Response-Header der letzten
     // LLM-Antwort in der Session (Datenquelle für den Alt+H-Dialog).
     let mut a = app();
-    a.tx
-        .send(llm::WorkerEvent::HttpHeaders(
-            0,
-            vec![
-                ("content-type".into(), "text/event-stream".into()),
-                ("date".into(), "Tue, 01 Jan 2025 00:00:00 GMT".into()),
-            ],
-        ))
-        .unwrap();
+    a.tx.send(llm::WorkerEvent::HttpHeaders(
+        0,
+        vec![
+            ("content-type".into(), "text/event-stream".into()),
+            ("date".into(), "Tue, 01 Jan 2025 00:00:00 GMT".into()),
+        ],
+    ))
+    .unwrap();
     assert!(a.drain_events());
-    let h = a.sessions[0].last_http_headers.as_ref().expect("Header gespeichert");
+    let h = a.sessions[0]
+        .last_http_headers
+        .as_ref()
+        .expect("Header gespeichert");
     assert_eq!(h.len(), 2);
     assert_eq!(h[0].0, "content-type");
     assert_eq!(h[0].1, "text/event-stream");
@@ -911,7 +980,10 @@ fn alt_h_oeffnet_http_header_dialog_und_esc_schliesst_ihn() {
     assert!(a.http_headers_dialog, "Alt+H öffnet den Header-Dialog");
     // Esc schließt ihn wieder; ein anderer Key schließt ihn nicht.
     a.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    assert!(a.http_headers_dialog, "andere Tasten behalten den Dialog offen");
+    assert!(
+        a.http_headers_dialog,
+        "andere Tasten behalten den Dialog offen"
+    );
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!a.http_headers_dialog, "Esc schließt den Header-Dialog");
 }
@@ -923,29 +995,47 @@ fn ctrl_o_oeffnet_options_dialog_mit_cursor_0() {
     let mut a = app();
     assert!(a.options_dialog.is_none(), "kein Options-Dialog zu Beginn");
     a.handle_key(ctrl_o());
-    let d = a.options_dialog.as_ref().expect("Ctrl+O öffnet den Options-Dialog");
+    let d = a
+        .options_dialog
+        .as_ref()
+        .expect("Ctrl+O öffnet den Options-Dialog");
     assert_eq!(d.nav.cursor(), 0);
-    assert_eq!(d.nav.len(), 2, "zwei Optionen: Maus, Modell");
+    assert_eq!(
+        d.nav.len(),
+        3,
+        "drei Optionen: Version (Info), Maus, Modell"
+    );
     // Der Dialog ist modal: auch ohne weitere Zustände bleibt er offen,
     // bis eine Schließ-Taste kommt.
     a.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-    assert!(a.options_dialog.is_some(), "fremde Tasten lassen den Dialog offen");
+    assert!(
+        a.options_dialog.is_some(),
+        "fremde Tasten lassen den Dialog offen"
+    );
 }
 
 #[test]
 fn options_dialog_navigation_bewegt_cursor_geklemmt() {
     let mut a = app();
     a.handle_key(ctrl_o());
-    // Runter: 0 → 1; weiter runter klemmt bei zwei Optionen (max 1).
+    // Runter: 0 → 1; weiter runter klemmt bei drei Optionen (max 2).
     a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert_eq!(a.options_dialog.as_ref().unwrap().nav.cursor(), 1);
     a.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-    assert_eq!(a.options_dialog.as_ref().unwrap().nav.cursor(), 1, "am Ende klemmt 'j'");
-    // Hoch: 1 → 0; weiter hoch klemmt am Anfang.
+    assert_eq!(
+        a.options_dialog.as_ref().unwrap().nav.cursor(),
+        2,
+        "am Ende klemmt 'j'"
+    );
+    // Hoch: 2 → 1; weiter hoch klemmt am Anfang.
     a.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-    assert_eq!(a.options_dialog.as_ref().unwrap().nav.cursor(), 0);
+    assert_eq!(a.options_dialog.as_ref().unwrap().nav.cursor(), 1);
     a.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
-    assert_eq!(a.options_dialog.as_ref().unwrap().nav.cursor(), 0, "am Anfang klemmt 'k'");
+    assert_eq!(
+        a.options_dialog.as_ref().unwrap().nav.cursor(),
+        0,
+        "am Anfang klemmt 'k'"
+    );
 }
 
 #[test]
@@ -954,7 +1044,10 @@ fn options_dialog_esc_und_ctrl_o_schliessen() {
     a.handle_key(ctrl_o());
     assert!(a.options_dialog.is_some());
     a.handle_key(ctrl_o());
-    assert!(a.options_dialog.is_none(), "Ctrl+O schließt den Dialog wieder");
+    assert!(
+        a.options_dialog.is_none(),
+        "Ctrl+O schließt den Dialog wieder"
+    );
 
     a.handle_key(ctrl_o());
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -962,26 +1055,84 @@ fn options_dialog_esc_und_ctrl_o_schliessen() {
 }
 
 #[test]
-fn options_dialog_enter_toggelt_maus_bei_cursor_0() {
+fn options_dialog_enter_toggelt_maus_bei_cursor_1() {
     let mut a = app();
     assert!(!a.mouse_enabled);
     a.handle_key(ctrl_o());
-    // Cursor 0 + Enter → Maus umschalten; Dialog bleibt offen (Status sichtbar).
+    // Cursor 1 (Maus-Option) + Enter → Maus umschalten; Dialog bleibt offen
+    // (Status sichtbar). Cursor 0 ist die reine Versions-Info.
+    a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     let before = a.mouse_enabled;
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_ne!(a.mouse_enabled, before, "Enter auf Maus-Option toggelt das Reporting");
+    assert_ne!(
+        a.mouse_enabled, before,
+        "Enter auf Maus-Option toggelt das Reporting"
+    );
     assert!(a.options_dialog.is_some(), "Dialog bleibt offen");
 }
 
 #[test]
-fn options_dialog_enter_bei_cursor_1_aendert_nicht_die_maus() {
+fn options_dialog_enter_bei_cursor_2_aendert_nicht_die_maus() {
     let mut a = app();
     a.handle_key(ctrl_o());
-    a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → Maus-Status (1)
+    a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → Maus (1)
+    a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → Modell (2)
     let before = a.mouse_enabled;
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(a.mouse_enabled, before, "Enter auf der Modell-Option toggelt nichts");
+    assert_eq!(
+        a.mouse_enabled, before,
+        "Enter auf der Modell-Option toggelt nichts"
+    );
     assert!(a.options_dialog.is_some(), "Dialog bleibt offen");
+}
+
+// ── Statuszeile: keine Haupt-Tastenkürzel, solange ein Dialog offen ist ────
+
+/// Text der linken Statuszeilen-Hälfte (ohne Styling) für Assertions.
+fn status_text(a: &App) -> String {
+    let line = crate::ui::status_left(a, 160);
+    line.spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[test]
+fn statuszeile_idle_ohne_dialog_zeigt_kurzeln() {
+    let a = app();
+    let text = status_text(&a);
+    assert!(
+        text.contains("new session") && text.contains("options"),
+        "Idle ohne Dialog: Tastenkürzel sichtbar – war: {text:?}"
+    );
+}
+
+#[test]
+fn statuszeile_leer_wenn_dialog_offen_und_idle() {
+    let mut a = app();
+    // Options-Dialog öffnen (Ctrl+O) → Idle + Dialog offen.
+    a.handle_key(ctrl_o());
+    assert!(a.any_dialog_open());
+    let text = status_text(&a);
+    assert!(
+        text.trim().is_empty(),
+        "Dialog offen + Session idlet → Statuszeile leer – war: {text:?}"
+    );
+}
+
+#[test]
+fn statuszeile_zeigt_thinking_trotz_dialog_bei_beschaeftigt() {
+    let mut a = app();
+    // Session beschäftigt (WaitingForLLM), dann Dialog öffnen.
+    a.sessions[0].phase = Phase::WaitingForLLM;
+    a.handle_key(ctrl_o());
+    assert!(a.any_dialog_open());
+    let text = status_text(&a);
+    assert!(
+        text.contains("thinking"),
+        "beschäftigt + Dialog offen → 'thinking…' bleibt – war: {text:?}"
+    );
 }
 
 // ── Bestätigungsdialoge (PreSend/Exec/Stop/ChannelClose) auf ListNav ────────
@@ -998,7 +1149,10 @@ fn exec_confirm_enter_sendet_ja_nein_ueber_reply() {
     });
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(rx.recv(), Ok(true), "Cursor 0 bestätigt die Ausführung");
-    assert!(a.exec_confirm.is_none(), "Dialog schließt nach der Entscheidung");
+    assert!(
+        a.exec_confirm.is_none(),
+        "Dialog schließt nach der Entscheidung"
+    );
 }
 
 #[test]
@@ -1071,7 +1225,11 @@ fn pre_send_confirm_default_abbrechen_und_bewegung_klemmt() {
     a.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(a.pre_send_confirm.as_ref().unwrap().nav.cursor(), 0);
     a.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-    assert_eq!(a.pre_send_confirm.as_ref().unwrap().nav.cursor(), 0, "am Anfang klemmt hoch");
+    assert_eq!(
+        a.pre_send_confirm.as_ref().unwrap().nav.cursor(),
+        0,
+        "am Anfang klemmt hoch"
+    );
     // Esc schließt den Dialog, ohne etwas abzuschicken.
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(a.pre_send_confirm.is_none());
@@ -1080,8 +1238,12 @@ fn pre_send_confirm_default_abbrechen_und_bewegung_klemmt() {
 // ── Model-Picker (Selection<ModelPick>, model_pick_list, Cursor) ──────────────
 
 fn apply_refresh(a: &mut App, ids: &[(&str, Option<u64>)]) {
-    a.model_registry
-        .apply_refresh(ids.iter().map(|(s, d)| (s.to_string(), *d)).collect::<Vec<_>>().as_slice());
+    a.model_registry.apply_refresh(
+        ids.iter()
+            .map(|(s, d)| (s.to_string(), *d))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
 }
 
 #[test]
@@ -1124,7 +1286,11 @@ fn open_model_picker_positioniert_cursor_auf_aktuelles_modell() {
     // Session ohne Alias → Cursor auf (Standard) (Pos 0).
     a.open_model_picker();
     let p = a.model_picker.as_ref().expect("Picker offen");
-    assert_eq!(p.items.nav.cursor(), 0, "ohne Alias → Cursor auf (Standard)");
+    assert_eq!(
+        p.items.nav.cursor(),
+        0,
+        "ohne Alias → Cursor auf (Standard)"
+    );
     assert!(matches!(p.items.selected(), Some(ModelPick::Default)));
     // Alias setzen → Cursor zeigt auf dieses Modell.
     a.sessions[0].model_alias = Some("test/fast".into());
@@ -1171,6 +1337,59 @@ fn model_picker_select_setzt_alias_und_esc_verwirft() {
 // ── Kanal-Picker (Selection<ChannelPick>) ────────────────────────────────────
 
 #[test]
+fn default_model_alias_vorrang_in_resolve_und_display() {
+    // Config: model = "prov/mod", [models.mod] id = "prov/bla" → der Default
+    // meint den Alias "mod", gesendet wird dessen Servername "bla".
+    let cfg: Config = toml::from_str(
+        r#"
+        model = "prov/mod"
+
+        [provider.prov]
+        base_url = "http://127.0.0.1:1"
+        api_key = "x"
+
+        [models.mod]
+        id = "prov/bla"
+        context_window = 4096
+
+        [models.other]
+        id = "prov/mod"
+        "#,
+    )
+    .expect("TOML lesbar");
+
+    let (tx, rx) = mpsc::channel();
+    let a = App::new(
+        cfg,
+        ChannelRegistry::new_with_warnings(&base_config()).0,
+        tx,
+        rx,
+    );
+
+    // Default-Session (kein Session-Alias): resolve_endpoint löst das Modellfeld
+    // ZUERST als Alias auf → Anzeige "prov/mod", gesendet "bla".
+    let ep = a.resolve_endpoint(0).expect("Default auflösbar");
+    assert_eq!(ep.model, "prov/mod", "Anzeige-Form provider/alias");
+    assert_eq!(ep.api_model, "bla", "Servername aus dem Alias");
+    assert_eq!(ep.context_window, 4096, "context_window aus dem Alias-Eintrag");
+
+    // display_model zeigt dieselbe Alias-Form.
+    assert_eq!(a.display_model(0), "prov/mod");
+
+    // Picker: Default-Key = Alias-Key "prov/mod" ist in der Liste enthalten,
+    // es wird kein zusätzlicher "(Standard)"-Eintrag eingefügt.
+    let list = a.model_pick_list();
+    assert!(
+        list.iter().any(|p| matches!(p, ModelPick::Model { key, .. } if key == "prov/mod")),
+        "Alias-Eintrag im Picker gelistet"
+    );
+    assert!(
+        !list.iter().any(|p| matches!(p, ModelPick::Default)),
+        "Default-Modell ist selbst gelistet → kein (Standard)-Eintrag"
+    );
+}
+
+#[test]
 fn open_channel_picker_baut_eintraege() {
     let mut a = app();
     a.open_channel_picker();
@@ -1197,7 +1416,10 @@ fn channel_select_verbindet_oder_trennt() {
     a.open_channel_picker();
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(a.channel_picker.is_none());
-    assert!(a.sessions[0].channel.is_none(), "Session hat keinen Kanal mehr");
+    assert!(
+        a.sessions[0].channel.is_none(),
+        "Session hat keinen Kanal mehr"
+    );
     // Esc schließt den Picker ohne Änderung.
     a.open_channel_picker();
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1223,7 +1445,12 @@ fn channel_picker_bewegung_klemmt() {
 }
 
 fn active_confirm_cursor(a: &App) -> usize {
-    match &a.channel_close.as_ref().expect("Kanal-Schließ-Dialog offen").phase {
+    match &a
+        .channel_close
+        .as_ref()
+        .expect("Kanal-Schließ-Dialog offen")
+        .phase
+    {
         ChannelClosePhase::ActiveConfirm { nav } => nav.cursor(),
         _ => panic!("erwartet ActiveConfirm-Phase"),
     }
@@ -1299,21 +1526,38 @@ fn builder_host_spalte_wrapt_und_spaltenwechsel_klemmt() {
     a.channel_builder = Some(builder_state());
     // Down: 0 → 1; weiter: 1 → 0 (Umlauf); Hoch: 0 → 1 (Umlauf zurück).
     a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(), 1);
+    assert_eq!(
+        a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(),
+        1
+    );
     a.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(), 0);
+    assert_eq!(
+        a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(),
+        0
+    );
     a.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-    assert_eq!(a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(), 1);
+    assert_eq!(
+        a.channel_builder.as_ref().unwrap().host_paths.nav.cursor(),
+        1
+    );
     // Links → Tunnel-Spalte; Rechte → Ordnung: bei Nicht-Repo nicht weiter
     // nach rechts als bis Host (links nicht unter 0).
     a.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
     assert_eq!(a.channel_builder.as_ref().unwrap().col, 0);
     a.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-    assert_eq!(a.channel_builder.as_ref().unwrap().col, 0, "links klemmt bei 0");
+    assert_eq!(
+        a.channel_builder.as_ref().unwrap().col,
+        0,
+        "links klemmt bei 0"
+    );
     a.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     assert_eq!(a.channel_builder.as_ref().unwrap().col, 1);
     a.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-    assert_eq!(a.channel_builder.as_ref().unwrap().col, 1, "bei Nicht-Repo klemmt rechts bei 1");
+    assert_eq!(
+        a.channel_builder.as_ref().unwrap().col,
+        1,
+        "bei Nicht-Repo klemmt rechts bei 1"
+    );
 }
 
 #[test]
@@ -1356,7 +1600,9 @@ fn builder_branch_enter_leer_zeigt_fehler_und_hält_offen() {
         "Feld bleibt bei Fehler offen"
     );
     assert!(
-        b.edit_error.as_deref().is_some_and(|e| e.contains("branch")),
+        b.edit_error
+            .as_deref()
+            .is_some_and(|e| e.contains("branch")),
         "Fehlermeldung gesetzt, war {:?}",
         b.edit_error
     );
@@ -1402,13 +1648,19 @@ fn builder_pfad_confirm_esc_kehrt_zur_eingabe_zurueck() {
     let missing = std::env::temp_dir()
         .join(format!("aidev-pec-{}", std::process::id()))
         .join("neu");
-    a.path_confirm = Some(PathConfirm { path: missing.clone() });
+    a.path_confirm = Some(PathConfirm {
+        path: missing.clone(),
+    });
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(a.path_confirm.is_none(), "Dialog geschlossen");
     let b = a.channel_builder.as_ref().unwrap();
     match &b.edit {
         Some(BuilderEdit::HostPath(ed)) => {
-            assert_eq!(ed.text_string(), missing.to_string_lossy(), "Eingabe behält den Pfad")
+            assert_eq!(
+                ed.text_string(),
+                missing.to_string_lossy(),
+                "Eingabe behält den Pfad"
+            )
         }
         other => panic!("erwartet Pfad-Editor, war offen={}", other.is_some()),
     }
@@ -1422,7 +1674,9 @@ fn builder_pfad_confirm_enter_legt_an_und_registriert() {
     let base = std::env::temp_dir().join(format!("aidev-mkdir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let missing = base.join("a/b/c");
-    a.path_confirm = Some(PathConfirm { path: missing.clone() });
+    a.path_confirm = Some(PathConfirm {
+        path: missing.clone(),
+    });
     a.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(a.path_confirm.is_none(), "Dialog geschlossen");
     assert!(missing.is_dir(), "Verzeichnis per mkdir -p angelegt");
@@ -1455,5 +1709,73 @@ fn channel_close_active_confirm_bewegt_und_esc_oeffnet_picker_wieder() {
     // Esc bei Picker-Ursprung → Dialog zu, Picker wieder offen.
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(a.channel_close.is_none());
-    assert!(a.channel_picker.is_some(), "Picker-Ursprung öffnet den Picker wieder");
+    assert!(
+        a.channel_picker.is_some(),
+        "Picker-Ursprung öffnet den Picker wieder"
+    );
+}
+
+#[test]
+fn reload_liefert_neue_config_und_baut_registries_um() {
+    let mut a = app();
+    // Ausgangszustand: keine Models, keine Kanäle.
+    assert_eq!(a.model_registry.len(), 0);
+    assert!(a.channels.names().is_empty());
+
+    // Frische Config mit Modell + Local-Kanal.
+    let mut models = indexmap::IndexMap::new();
+    models.insert(
+        "fast".to_string(),
+        crate::config::ModelConfig::Plain("test/neu".into()),
+    );
+    let mut channels = std::collections::HashMap::new();
+    channels.insert(
+        "testchannel".to_string(),
+        crate::config::ChannelConfig {
+            kind: "local".into(),
+            image: None,
+            container: None,
+            run_container: None,
+            workdir: "/app".into(),
+            host_root: Some(std::env::temp_dir().display().to_string()),
+            home: None,
+        },
+    );
+    let fresh = crate::config::Config {
+        model: "test/neu".into(),
+        default_channel: Some("testchannel".into()),
+        channels,
+        models,
+        theme: "light".into(),
+        mouse: true,
+        ..base_config()
+    };
+
+    // `apply_reloaded_config` schaltet über `set_theme` das GLOBALE Theme um
+    // (hier auf "light"). Im parallelen Testlauf würde das andere UI-Tests
+    // stören, die `theme().ok` als erwartete Farbe lesen (flaky „grün nicht
+    // gefunden" in der Kompaktierungs-Verifikation). Globalen Zustand daher
+    // nach dem Aufruf wiederherstellen.
+    let old_theme = crate::ui::theme();
+    a.apply_reloaded_config(fresh, Vec::new());
+    crate::ui::set_theme(old_theme);
+
+    assert_eq!(a.config.model, "test/neu");
+    assert_eq!(a.config.theme, "light");
+    assert!(a.mouse_enabled, "Maus aus neuer Config übernommen");
+    assert_eq!(
+        a.model_registry.get("test/fast").map(|e| e.display_key()),
+        Some("test/fast".to_string()),
+        "Modell-Registry neu aufgebaut"
+    );
+    assert!(
+        a.channels.get("testchannel").is_some(),
+        "Kanal neu registriert"
+    );
+    assert_eq!(a.channels.default_channel_name(), Some("testchannel"));
+    assert_eq!(
+        a.sessions[0].error.as_deref(),
+        Some("Config neu geladen."),
+        "Statusmeldung gesetzt"
+    );
 }

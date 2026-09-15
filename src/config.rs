@@ -17,19 +17,19 @@ pub struct PathEntry {
 #[serde(rename_all = "kebab-case")]
 pub enum PodmanUserMapping {
     /// Bisheriges Verhalten: `--userns=keep-id`.
-    #[default]
     KeepId,
     /// Explizite `--uidmap`/`--gidmap` statt `--userns=keep-id`. Die
     /// Gast-UID/-GID stammt aus dem Image (beim Kanal-Aufbau per
     /// `podman run --rm <image> id` erfragt) und wird für Container-Start
     /// und exec (`--user`) verwendet.
+    #[default]
     Uidmap,
 }
 
 /// Top-Level-Podman-Einstellungen.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 pub struct PodmanConfig {
-    /// UID/GID-Mapping beim Container-Start (Default: `keep-id`).
+    /// UID/GID-Mapping beim Container-Start (Default: `uidmap`).
     #[serde(default)]
     pub usermapping: PodmanUserMapping,
 }
@@ -128,19 +128,92 @@ pub(crate) fn is_opencode_base(base_url: &str) -> bool {
     host == "opencode.ai" || host.ends_with(".opencode.ai")
 }
 
-/// Ein benanntes Modell in `[models.<alias>]`. Die Modell-ID enthält immer
-/// den Provider-Prefix (`"openai/gpt-4o"`).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+/// Ein benanntes Modell in `[models.<alias>]`. Die ID muss immer genau ein `/`
+/// enthalten (Provider vor dem `/`, Servername dahinter) – Werte ohne `/`
+/// oder mit mehreren `/` sind ungültig und lassen die Config nicht laden.
+#[derive(Debug, Clone)]
 pub enum ModelConfig {
     /// `[models] fast = "openai/gpt-4o-mini"` – nur die Modell-ID.
     Plain(String),
     /// `[models.smart] id = "openai/gpt-4o"` mit optionalem context_window.
     Full {
         id: String,
-        #[serde(default)]
         context_window: Option<u64>,
     },
+}
+
+/// Prüft eine Modell-ID aus `[models]` auf das geforderte Format: genau ein
+/// `/` mit nicht-leerem Provider vor und nicht-leerem Servernamen dahinter.
+fn validate_model_id(id: &str) -> Result<&str, String> {
+    if id.matches('/').count() != 1 {
+        return Err(format!(
+            "Modell-ID '{id}' muss genau ein '/' enthalten (Format provider/name)"
+        ));
+    }
+    let (provider, name) = id.split_once('/').expect("genau ein '/' geprüft");
+    if provider.is_empty() || name.is_empty() {
+        return Err(format!(
+            "Modell-ID '{id}' braucht einen Provider und einen Namen"
+        ));
+    }
+    Ok(id)
+}
+
+impl<'de> Deserialize<'de> for ModelConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        struct ModelVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ModelVisitor {
+            type Value = ModelConfig;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a model: string \"provider/name\" or table \
+                     { id = \"provider/name\", context_window = N }",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                validate_model_id(v)
+                    .map(|id| ModelConfig::Plain(id.to_string()))
+                    .map_err(E::custom)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut id: Option<String> = None;
+                let mut context_window: Option<Option<u64>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => id = Some(map.next_value()?),
+                        "context_window" => context_window = Some(map.next_value()?),
+                        // Unbekannte Zusatzfelder wie bisher still ignorieren.
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                let id = id.ok_or_else(|| A::Error::missing_field("id"))?;
+                validate_model_id(&id).map_err(A::Error::custom)?;
+                Ok(ModelConfig::Full {
+                    id,
+                    context_window: context_window.flatten(),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(ModelVisitor)
+    }
 }
 
 impl ModelConfig {
@@ -199,6 +272,19 @@ pub struct ResolvedEndpoint {
     pub user_agent: String,
     /// Optionales Kontextfenster (nur für Kompaktierungsschwelle).
     pub context_window: u64,
+}
+
+/// Treffer der Alias-Auflösung des Default-Modellfelds (`config.model`).
+/// `provider` stammt aus dem ersten Teil des Modellfelds, `alias` ist der
+/// passende `[models.<alias>]`-Name, `server_model` der tatsächlich an den
+/// LLM-Server zu sendende Modellname (z.B. `"bla"` bei `[models.mod]
+/// id = "prov/bla"` oder `[models] mod = "bla"` mit `model = "prov/mod"`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DefaultModelAlias<'a> {
+    pub provider: &'a str,
+    pub alias: &'a str,
+    pub server_model: &'a str,
+    pub context_window: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,25 +459,35 @@ impl Config {
     /// Eine `config.toml` im aktuellen Verzeichnis wird bewusst NICHT geladen:
     /// fremde Repositories könnten sie einschleusen und so Endpunkt/Schlüssel
     /// und Kanäle (inkl. Host-Zugriff) unbemerkt umbiegen.
+    ///
+    /// Bewusst OHNE stderr-Logging: Beim `/reload` läuft diese Funktion im
+    /// TUI-Alt-Screen, und `eprintln!`-Ausgaben landen dort direkt im Layout
+    /// und zerschießen es (ratatui repainted fremde Terminal-Zellen nicht).
+    /// Meldungen liefert stattdessen [`Config::load_with_warnings`].
     pub fn load() -> Self {
+        Self::load_with_warnings().0
+    }
+
+    /// Wie [`Config::load`], liefert aber zusätzlich die beim Laden
+    /// gesammelten Warnungen (unlesbare/fehlerhafte `config.toml`, Fallback
+    /// auf Defaults) zurück, statt sie auf stderr zu schreiben.
+    pub fn load_with_warnings() -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
         for path in candidate_paths() {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
             match toml::from_str::<Self>(&content) {
-                Ok(cfg) => {
-                    eprintln!("[aidev] Config loaded: {}", path.display());
-                    return cfg.with_defaults();
-                }
-                Err(err) => eprintln!(
-                    "[aidev] Warning: {} unreadable ({}), trying next source…",
+                Ok(cfg) => return (cfg.with_defaults(), warnings),
+                Err(err) => warnings.push(format!(
+                    "{} unreadable ({}), trying next source…",
                     path.display(),
                     err
-                ),
+                )),
             }
         }
-        eprintln!("[aidev] Keine Config gefunden, nutze Defaults.");
-        Config::default()
+        warnings.push("Keine Config gefunden, nutze Defaults.".to_string());
+        (Config::default(), warnings)
     }
 
     /// Liste der konfigurierten Modell-Aliase in config.toml-Reihenfolge.
@@ -414,16 +510,76 @@ impl Config {
     /// `ResolvedEndpoint` auf. Der Provider-Name wird aus der Modell-ID
     /// extrahiert und die Verbindungsinformationen aus `[provider.<name>]`
     /// geholt.
+    ///
+    /// Für den Default (`alias = None`) wird `self.model` ZUERST als
+    /// Alias-Paar interpretiert (siehe [`Config::resolve_default_alias`]):
+    /// Erst wenn es kein passendes `[models.<alias>]` gibt, zählt der zweite
+    /// Teil als echter Servername.
     pub fn resolve(&self, alias: Option<&str>) -> Result<ResolvedEndpoint, String> {
-        let model_id = match alias {
-            Some(a) => self
-                .models
-                .get(a)
-                .ok_or_else(|| format!("Unbekannter Modell-Alias: {a}"))?
-                .id(),
-            None => &self.model,
-        };
-        self.resolve_id(model_id)
+        match alias {
+            None => match self.resolve_default_alias() {
+                Some(m) => self.resolve_from_default_alias(m),
+                None => self.resolve_id(&self.model),
+            },
+            Some(a) => {
+                let model_id = self
+                    .models
+                    .get(a)
+                    .ok_or_else(|| format!("Unbekannter Modell-Alias: {a}"))?
+                    .id();
+                self.resolve_id(model_id)
+            }
+        }
+    }
+
+    /// Interpretiert das Default-Modellfeld (`model = "prov/mod"`) ZUERST als
+    /// Alias-Paar. Dazu wird geprüft, ob der zweite Teil (`"mod"`) als Alias in
+    /// `[models.*]` definiert ist – die ID des Eintrags muss genau dem ersten
+    /// Teil (`"prov"`) als Provider entsprechen (jede `[models]`-ID hat exakt
+    /// ein `/`, Format `provider/name`).
+    ///
+    /// Liefert `Some(...)` mit dem echten Servernamen des Aliases, wenn es
+    /// einen passenden gibt; sonst `None` – dann ist der zweite Teil als
+    /// echter Servername von `[provider.<prov>]` zu verwenden.
+    pub(crate) fn resolve_default_alias(&self) -> Option<DefaultModelAlias<'_>> {
+        let (provider, alias) = self.model.split_once('/')?;
+        let mc = self.models.get(alias)?;
+        let (p, server_model) = mc.id().split_once('/')?;
+        if p != provider {
+            return None; // Alias existiert, gehört aber zu anderem Provider.
+        }
+        Some(DefaultModelAlias {
+            provider,
+            alias,
+            server_model,
+            context_window: mc.context_window(),
+        })
+    }
+
+    /// Baut aus einem Alias-Treffer des Default-Modellfelds den vollständigen
+    /// Endpunkt (Provider-Sektion muss existieren). Angezeigt wird die
+    /// Alias-Form `"provider/alias"`, gesendet der echte Servername.
+    pub(crate) fn resolve_from_default_alias(
+        &self,
+        m: DefaultModelAlias<'_>,
+    ) -> Result<ResolvedEndpoint, String> {
+        let provider_cfg = self.provider.get(m.provider).ok_or_else(|| {
+            format!(
+                "Unbekannter Provider '{}' in Modell '{}/{}'",
+                m.provider, m.provider, m.alias
+            )
+        })?;
+        Ok(ResolvedEndpoint {
+            model: format!("{}/{}", m.provider, m.alias),
+            api_model: m.server_model.to_string(),
+            base_url: provider_cfg.base_url.trim_end_matches('/').to_string(),
+            api_key: provider_cfg.api_key.clone().unwrap_or_default(),
+            user_agent: effective_user_agent(provider_cfg, m.provider),
+            context_window: m
+                .context_window
+                .filter(|w| *w > 0)
+                .unwrap_or(self.context_window),
+        })
     }
 
     /// Löst eine direkte Modell-ID (z.B. `"openai/gpt-4o"`) zu einem
@@ -682,11 +838,11 @@ mod tests {
 
     #[test]
     fn podman_usermapping_default_und_werte() {
-        // Kein [podman]-Block → Default keep-id.
+        // Kein [podman]-Block → Default uidmap.
         let cfg: Config = toml::from_str("").expect("leere TOML");
         assert_eq!(
             cfg.podman.usermapping,
-            crate::config::PodmanUserMapping::KeepId
+            crate::config::PodmanUserMapping::Uidmap
         );
         // Explizit uidmap.
         let cfg: Config = toml::from_str(
@@ -696,7 +852,10 @@ mod tests {
             "#,
         )
         .expect("TOML lesbar");
-        assert_eq!(cfg.podman.usermapping, crate::config::PodmanUserMapping::Uidmap);
+        assert_eq!(
+            cfg.podman.usermapping,
+            crate::config::PodmanUserMapping::Uidmap
+        );
         // Explizit keep-id.
         let cfg: Config = toml::from_str(
             r#"
@@ -831,6 +990,193 @@ mod tests {
     }
 
     #[test]
+    fn default_model_wird_erst_als_alias_aufgeloest_sektion() {
+        let toml_str = r#"
+            model = "prov/mod"
+
+            [provider.prov]
+            base_url = "https://prov.example.com/v1"
+            api_key = "key"
+
+            [models.fast]
+            id = "prov/other"
+
+            [models.mod]
+            id = "prov/bla"
+            context_window = 4096
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("TOML lesbar");
+
+        // Alias "mod" existiert für Provider "prov" → dessen Servername "bla".
+        let m = cfg
+            .resolve_default_alias()
+            .expect("Alias-Treffer für prov/mod");
+        assert_eq!(m.provider, "prov");
+        assert_eq!(m.alias, "mod");
+        assert_eq!(m.server_model, "bla");
+        assert_eq!(m.context_window, Some(4096));
+
+        // Aufgelöster Endpunkt: gesendet wird "bla", angezeigt "prov/mod".
+        let ep = cfg.resolve(None).expect("resolve Default");
+        assert_eq!(ep.model, "prov/mod", "Anzeige: provider/alias");
+        assert_eq!(ep.api_model, "bla", "Servername aus dem Alias");
+        assert_eq!(ep.base_url, "https://prov.example.com/v1");
+        assert_eq!(ep.api_key, "key");
+        assert_eq!(ep.context_window, 4096, "context_window aus dem Alias");
+    }
+
+    #[test]
+    fn default_model_als_alias_nur_mit_voller_id() {
+        // Kurzform ohne '/' ist NICHT erlaubt → Config lässt sich nicht laden.
+        let invalid: Result<Config, _> = toml::from_str(
+            r#"
+            model = "prov/mod"
+
+            [provider.prov]
+            base_url = "https://prov.example.com/v1"
+
+            [models]
+            mod = "bla"
+        "#,
+        );
+        assert!(
+            invalid.is_err(),
+            "`[models] mod = \"bla\"` ohne '/' muss abgelehnt werden"
+        );
+
+        // Korrekte Langform: id mit genau einem '/' → Alias wird Default.
+        let toml_str = r#"
+        model = "prov/mod"
+
+        [provider.prov]
+        base_url = "https://prov.example.com/v1"
+
+        [models.mod]
+        id = "prov/bla"
+    "#;
+        let cfg: Config = toml::from_str(toml_str).expect("TOML lesbar");
+        let m = cfg
+            .resolve_default_alias()
+            .expect("Alias-Treffer für prov/mod");
+        assert_eq!(m.server_model, "bla");
+        let ep = cfg.resolve(None).expect("resolve Default");
+        assert_eq!(ep.model, "prov/mod");
+        assert_eq!(ep.api_model, "bla");
+        assert_eq!(ep.base_url, "https://prov.example.com/v1");
+    }
+
+    #[test]
+    fn model_ids_brauchen_genau_ein_slash() {
+        // Ohne '/' → ungültig.
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+            [models]
+            a = "nur-name"
+        "#
+            )
+            .is_err()
+        );
+
+        // Mehr als ein '/' → ungültig.
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+            [models]
+            a = "prov/name/x"
+        "#
+            )
+            .is_err()
+        );
+
+        // Leerer Provider oder leerer Name → ungültig.
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+            [models]
+            a = "/name"
+        "#
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+            [models]
+            a = "prov/"
+        "#
+            )
+            .is_err()
+        );
+
+        // Genau ein '/' mit beiden Teilen → gültig (Kurz- und Langform).
+        let cfg: Config = toml::from_str(
+            r#"
+            [models]
+            a = "openai/gpt-4o-mini"
+
+            [models.b]
+            id = "ollama/llama3"
+            context_window = 8192
+        "#,
+        )
+        .expect("gültige IDs");
+        assert_eq!(cfg.models["a"].id(), "openai/gpt-4o-mini");
+        assert_eq!(cfg.models["b"].id(), "ollama/llama3");
+        assert_eq!(cfg.models["b"].context_window(), Some(8192));
+    }
+
+    #[test]
+    fn default_model_alias_fremder_provider_zaehlt_nicht() {
+        // Alias "mod" existiert, gehört aber zu Provider "other" → für den
+        // Provider "prov" aus dem Modellfeld gibt es keinen passenden Alias,
+        // also zählt "mod" als echter Servername von "prov".
+        let toml_str = r#"
+            model = "prov/mod"
+
+            [provider.prov]
+            base_url = "https://prov.example.com/v1"
+
+            [models.mod]
+            id = "other/bla"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("TOML lesbar");
+
+        assert!(
+            cfg.resolve_default_alias().is_none(),
+            "Alias eines anderen Providers wird ignoriert"
+        );
+        let ep = cfg.resolve(None).expect("resolve Default");
+        assert_eq!(ep.model, "prov/mod");
+        assert_eq!(ep.api_model, "mod", "Fallback: zweiter Teil ist Servername");
+        assert_eq!(ep.base_url, "https://prov.example.com/v1");
+    }
+
+    #[test]
+    fn default_model_ohne_alias_nutzt_servernamen_und_einstellungen() {
+        // Kein Alias "mod" → "mod" ist der echte Servername; Einstellungen/
+        // Anzeigename kommen ggf. von `[models.<alias>] id = "prov/mod"`.
+        let toml_str = r#"
+            model = "prov/mod"
+
+            [provider.prov]
+            base_url = "https://prov.example.com/v1"
+            api_key = "key"
+
+            [models.smart]
+            id = "prov/mod"
+            context_window = 131072
+        "#;
+        let cfg: Config = toml::from_str(toml_str).expect("TOML lesbar");
+
+        assert!(cfg.resolve_default_alias().is_none());
+        let ep = cfg.resolve(None).expect("resolve Default");
+        assert_eq!(ep.api_model, "mod", "echter Servername");
+        assert_eq!(ep.context_window, 131072, "Einstellungen von prov/mod-Eintrag");
+        // Anzeigename über die ID ermittelt in der Registry (prov/smart).
+    }
+
+    #[test]
     fn default_model_ist_provider_name斜线() {
         let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
         assert!(
@@ -923,5 +1269,121 @@ mod tests {
         );
         let ep = cfg.resolve(Some("c")).expect("auflösbar");
         assert_eq!(ep.user_agent, "speziell/2.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Config::load / load_with_warnings – Warnungen statt stderr-Logging
+    // -----------------------------------------------------------------------
+
+    /// Legt ein eindeutiges Temp-Verzeichnis unter `std::env::temp_dir()` an.
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Systemuhr vor 1970")
+            .as_nanos();
+        p.push(format!("aidev-test-{prefix}-{}-{}", std::process::id(), nanos));
+        p
+    }
+
+    /// Führt `f` mit den manipulierten Variablen aus und stellt den alten
+    /// Zustand danach wieder her. Nötig, weil `Candidate-Pfade` aus
+    /// `XDG_CONFIG_HOME`/`HOME` gelesen werden – der Test erzeugt also
+    /// temporäre Verzeichnisse und lenkt `Config::load*` dorthin.
+    fn with_env_vars(
+        vars: &[(&str, std::ffi::OsString)],
+        f: impl FnOnce(),
+    ) {
+        let old: Vec<_> = vars
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in vars {
+            std::env::set_var(name, value);
+        }
+        f();
+        for (name, old_value) in old {
+            match old_value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
+    #[test]
+    fn load_with_warnings_sammelt_warnungen_statt_stderr() {
+        // Alle Szenarien in EINEM Test: `XDG_CONFIG_HOME`/`HOME` sind global,
+        // parallel laufende Tests würden sich gegenseitig die Env überschreiben.
+
+        // (1) Kaputte config.toml → Warnung + Fallback auf Defaults.
+        let xdg_kaputt = unique_temp_dir("kaputt");
+        std::fs::create_dir_all(xdg_kaputt.join("aidev")).unwrap();
+        // Typfehler: `model` ist ein String, kein Integer → Parse-Fehler.
+        std::fs::write(xdg_kaputt.join("aidev/config.toml"), "model = 123").unwrap();
+        let home_leer = unique_temp_dir("leer");
+        let (cfg, warnings) = {
+            let mut result = None;
+            with_env_vars(
+                &[
+                    ("XDG_CONFIG_HOME", xdg_kaputt.clone().into_os_string()),
+                    ("HOME", home_leer.clone().into_os_string()),
+                ],
+                || result = Some(Config::load_with_warnings()),
+            );
+            result.expect("Verschachtelung lief durch")
+        };
+        // Auf den Defaults-Zustand gefallen.
+        assert_eq!(cfg.model, "zen/big-pickle");
+        assert_eq!(cfg.models["pig-pickle"].id(), "zen/big-pickle");
+        // Warnungen sind da, statt im Alt-Screen auf stderr zu landen.
+        assert_eq!(warnings.len(), 2, "unlesbar + kein Quelle mehr");
+        assert!(warnings[0].contains("unreadable"), "{}", warnings[0]);
+        assert!(warnings[0].contains("trying next source"), "{}", warnings[0]);
+        assert!(warnings[1].contains("Keine Config gefunden"), "{}", warnings[1]);
+
+        // (2) Gültige config.toml → keine Warnungen, Werte übernommen.
+        let xdg_gueltig = unique_temp_dir("gueltig");
+        std::fs::create_dir_all(xdg_gueltig.join("aidev")).unwrap();
+        std::fs::write(
+            xdg_gueltig.join("aidev/config.toml"),
+            "model = \"openai/gpt-4o\"\ntheme = \"light\"\n",
+        )
+        .unwrap();
+        let home_leer2 = unique_temp_dir("leer2");
+        let (cfg, warnings) = {
+            let mut result = None;
+            with_env_vars(
+                &[
+                    ("XDG_CONFIG_HOME", xdg_gueltig.clone().into_os_string()),
+                    ("HOME", home_leer2.clone().into_os_string()),
+                ],
+                || result = Some(Config::load_with_warnings()),
+            );
+            result.expect("Verschachtelung lief durch")
+        };
+        assert!(warnings.is_empty(), "Erfolgsfall sammelt keine Warnungen");
+        assert_eq!(cfg.model, "openai/gpt-4o");
+        assert_eq!(cfg.theme, "light");
+
+        // (3) Gar keine Config → Defaults + Hinweis-Warnung.
+        let xdg_ohne = unique_temp_dir("ohne");
+        let (cfg, warnings) = {
+            let mut result = None;
+            with_env_vars(
+                &[("XDG_CONFIG_HOME", xdg_ohne.clone().into_os_string())],
+                || result = Some(Config::load_with_warnings()),
+            );
+            result.expect("Verschachtelung lief durch")
+        };
+        assert_eq!(cfg.model, "zen/big-pickle");
+        assert_eq!(
+            warnings,
+            vec!["Keine Config gefunden, nutze Defaults.".to_string()]
+        );
+
+        // Aufräumen.
+        for dir in [xdg_kaputt, home_leer, xdg_gueltig, home_leer2, xdg_ohne] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

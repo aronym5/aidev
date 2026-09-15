@@ -43,7 +43,9 @@ fn logo_lines(width: usize) -> Vec<Line<'static>> {
                     spans.push(Span::raw(chars[..dot].iter().collect::<String>()));
                     spans.push(Span::styled(
                         chars[dot..dot + 1].iter().collect::<String>(),
-                        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme().accent)
+                            .add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
                         chars[dot + 1..].iter().collect::<String>(),
@@ -52,7 +54,10 @@ fn logo_lines(width: usize) -> Vec<Line<'static>> {
                     return Line::from(spans);
                 }
             }
-            spans.push(Span::styled(l.to_string(), Style::default().fg(theme().muted)));
+            spans.push(Span::styled(
+                l.to_string(),
+                Style::default().fg(theme().muted),
+            ));
             Line::from(spans)
         })
         .collect()
@@ -186,7 +191,6 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             bg: None,
             gap: logo_gap as u16,
             is_tool: false,
-
         };
         let (placed, total) = layout_blocks(&logo, &cache.blocks, &live);
 

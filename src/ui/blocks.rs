@@ -53,21 +53,13 @@ pub(crate) struct HistoryCache {
 
 /// Baut den Historie-Cache neu, falls Breite, Ansichtsebene, Historie oder
 /// Theme sich geändert haben.
-pub(crate) fn ensure_history_cache(
-    s: &mut Session,
-    width: usize,
-    model: &str,
-    window: u64,
-) {
-    let rebuild = s
-        .history_cache
-        .as_ref()
-        .is_none_or(|c| {
-            c.width != width
-                || c.view != s.view
-                || c.version != s.history_version
-                || c.theme_version != theme_version()
-        });
+pub(crate) fn ensure_history_cache(s: &mut Session, width: usize, model: &str, window: u64) {
+    let rebuild = s.history_cache.as_ref().is_none_or(|c| {
+        c.width != width
+            || c.view != s.view
+            || c.version != s.history_version
+            || c.theme_version != theme_version()
+    });
     if rebuild {
         let (blocks, end_ctx) = build_history_cache(s, width, model, window);
         s.history_cache = Some(HistoryCache {
@@ -137,39 +129,41 @@ pub(crate) fn build_history_cache(
                 ..
             } => {
                 if !m.is_empty() {
-                        turn_model = m.clone();
-                    }
-                    turn_begin = ev.time_begin;
-                    // Neuer Turn → akkumulierte Metriken neu beginnen.
-                    turn_ttft_ms = 0;
-                    turn_tokens = 0;
-                    turn_stream_ms = 0;
-                    turn_has_metrics = false;
-                    if view.is_overview() {
-                        // Abgeleitete Turn-Usage (`num_tokens`) vorziehen, solange
-                        // sie vorliegt (>0); während des Live-Turns bzw. ohne Usage
-                        // bleibt die Schätzung – so bleibt die Konto-Verbuchung
-                        // (Band + block_sum) im Live-Tail stabil und deckt sich
-                        // nach Turn-Ende mit der angezeigten Zahl.
-                        let tokens = (*num_tokens > 0)
-                            .then_some(*num_tokens)
-                            .unwrap_or_else(|| estimate_tokens(text));
-                        ctx.add_content(ContentKind::User, tokens);
-                        ctx.block_sum += tokens;
-                        blocks.push(overview_user_line(
-                            text,
-                            width,
-                            &ctx,
-                            window,
-                            Some(*permission),
-                            (tokens > 0).then_some(tokens),
-                        ));
-                    } else if text.trim().is_empty() {
-                        // leere Eingabe → nichts
-                    } else {
-                        blocks.push(user_input_block_chat(text, *permission, width));
-                    }
+                    turn_model = m.clone();
                 }
+                turn_begin = ev.time_begin;
+                // Neuer Turn → akkumulierte Metriken neu beginnen.
+                turn_ttft_ms = 0;
+                turn_tokens = 0;
+                turn_stream_ms = 0;
+                turn_has_metrics = false;
+                if view.is_overview() {
+                    // Abgeleitete Turn-Usage (`num_tokens`) vorziehen, solange
+                    // sie vorliegt (>0); während des Live-Turns bzw. ohne Usage
+                    // bleibt die Schätzung – so bleibt die Konto-Verbuchung
+                    // (Band + block_sum) im Live-Tail stabil und deckt sich
+                    // nach Turn-Ende mit der angezeigten Zahl.
+                    let tokens = if *num_tokens > 0 {
+                        *num_tokens
+                    } else {
+                        estimate_tokens(text)
+                    };
+                    ctx.add_content(ContentKind::User, tokens);
+                    ctx.block_sum += tokens;
+                    blocks.push(overview_user_line(
+                        text,
+                        width,
+                        &ctx,
+                        window,
+                        Some(*permission),
+                        (tokens > 0).then_some(tokens),
+                    ));
+                } else if text.trim().is_empty() {
+                    // leere Eingabe → nichts
+                } else {
+                    blocks.push(user_input_block_chat(text, *permission, width));
+                }
+            }
             EventKind::Assistant {
                 reasoning,
                 text,
@@ -205,17 +199,20 @@ pub(crate) fn build_history_cache(
                 // sobald die Runde abgeschlossen ist (Usage da), übernimmt hier
                 // die exakte Zahl. Runden mit Usage überschreibt der Resync
                 // ohnehin zusätzlich mit dem Serverwert.
-                let reasoning_tokens = (!reasoning.trim().is_empty() && view.is_overview()).then(|| {
-                    let r_tokens = (*num_tokens_reasoning > 0)
-                        .then_some(*num_tokens_reasoning)
-                        .unwrap_or_else(|| estimate_tokens(reasoning));
-                    ctx.add_content(ContentKind::Reasoning, r_tokens);
-                    // Auch die Gedanken tragen zur Context-Größe bei (Prompts inkl.
-                    // Reasoning); `block_sum` ist die Kontext-Schätzung zu diesem
-                    // Zeitpunkt, nicht die Summe gezeichneter Blocks.
-                    ctx.block_sum += r_tokens;
-                    r_tokens
-                });
+                let reasoning_tokens =
+                    (!reasoning.trim().is_empty() && view.is_overview()).then(|| {
+                        let r_tokens = if *num_tokens_reasoning > 0 {
+                            *num_tokens_reasoning
+                        } else {
+                            estimate_tokens(reasoning)
+                        };
+                        ctx.add_content(ContentKind::Reasoning, r_tokens);
+                        // Auch die Gedanken tragen zur Context-Größe bei (Prompts inkl.
+                        // Reasoning); `block_sum` ist die Kontext-Schätzung zu diesem
+                        // Zeitpunkt, nicht die Summe gezeichneter Blocks.
+                        ctx.block_sum += r_tokens;
+                        r_tokens
+                    });
                 if !text.trim().is_empty() {
                     if view.is_overview() {
                         let est = *num_tokens_text;
@@ -262,7 +259,13 @@ pub(crate) fn build_history_cache(
                 if tool_event_ids.is_empty() && !view.is_overview() {
                     let turn_metrics =
                         turn_has_metrics.then_some((turn_ttft_ms, turn_tokens, turn_stream_ms));
-                    blocks.push(chat_footer_block(&turn_model, ev, turn_begin, turn_metrics, width));
+                    blocks.push(chat_footer_block(
+                        &turn_model,
+                        ev,
+                        turn_begin,
+                        turn_metrics,
+                        width,
+                    ));
                 }
             }
             EventKind::Tool { .. } if ev.parent_id.is_none() => {
@@ -330,7 +333,6 @@ fn user_input_block_chat(text: &str, p: Permission, width: usize) -> ChatBlock {
         bg: Some(theme().band_bg),
         gap: 0,
         is_tool: false,
-
     }
 }
 
@@ -358,7 +360,10 @@ fn chat_footer_block(
     if let Some((ttft_ms, tokens, stream_ms)) = turn_metrics {
         if stream_ms > 0 {
             parts.push(format!("input processing {}", fmt_duration(ttft_ms)));
-            parts.push(format!("{} tps", fmt_tps(tokens as f64 / (stream_ms as f64 / 1000.0))));
+            parts.push(format!(
+                "{} tps",
+                fmt_tps(tokens as f64 / (stream_ms as f64 / 1000.0))
+            ));
         } else if ttft_ms > 0 {
             // Kein Streaming-Fenster gemessen (z. B. non-streaming-Fallback):
             // nur die TTFT anzeigen, keine sinnlose TPS.
@@ -370,12 +375,15 @@ fn chat_footer_block(
 
 /// Gedeckte, einzeilige Fuß-/Hinweiszeile.
 fn muted_footer_line(text: &str, width: usize) -> ChatBlock {
-    let line = Line::from(Span::styled(text.to_string(), Style::default().fg(theme().muted)));
+    let line = Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(theme().muted),
+    ));
     ChatBlock {
         lines: wrap_block(&[line], width, PAD),
         bg: None,
         gap: 0,
-        is_tool: false
+        is_tool: false,
     }
 }
 
@@ -385,7 +393,7 @@ fn def_tool_line(width: usize) -> ChatBlock {
         lines: wrap_block(&[line], width, PAD),
         bg: None,
         gap: 0,
-        is_tool: true
+        is_tool: true,
     }
 }
 
@@ -434,8 +442,13 @@ fn tool_kind_body(kind: &ToolKind) -> String {
             }
         }
         ToolKind::Write { path } => path.clone(),
-        ToolKind::Grep { pattern, path, num_results, .. } => {
-            let mut d = format!("\"{}\"",  pattern);
+        ToolKind::Grep {
+            pattern,
+            path,
+            num_results,
+            ..
+        } => {
+            let mut d = format!("\"{}\"", pattern);
             if !path.is_empty() && path != "." {
                 d.push(' ');
                 d.push_str(path);
@@ -445,8 +458,11 @@ fn tool_kind_body(kind: &ToolKind) -> String {
             }
             d
         }
-        ToolKind::Glob { pattern, num_results } => {
-            let mut d = format!("\"{}\"",  pattern);
+        ToolKind::Glob {
+            pattern,
+            num_results,
+        } => {
+            let mut d = format!("\"{}\"", pattern);
             if *num_results > 0 {
                 d.push_str(&format!(" - {num_results} results"));
             }
@@ -484,9 +500,13 @@ fn tool_kind_label(kind: &ToolKind) -> String {
 /// results`) – gemeinsame Zeile von Detail-Ansicht und Overview, ohne
 /// Ausgabe-Beitrag.
 pub(crate) fn tool_kind_detail(kind: &ToolKind) -> String {
-    format!("{} {}", tool_icon(tool_kind_name(kind)), tool_kind_label(kind))
-        .trim_end()
-        .to_string()
+    format!(
+        "{} {}",
+        tool_icon(tool_kind_name(kind)),
+        tool_kind_label(kind)
+    )
+    .trim_end()
+    .to_string()
 }
 
 /// Einzeiliger, kind-basierter Tool-Block in Kategoriefarbe (Detail-Ansicht).
@@ -545,7 +565,15 @@ fn overview_tool_line_chat(
         ..
     } = &ev.kind
     else {
-        return overview_row("⛭ tool".into(), Style::default().fg(theme().muted), width, ctx, window, true, None);
+        return overview_row(
+            "⛭ tool".into(),
+            Style::default().fg(theme().muted),
+            width,
+            ctx,
+            window,
+            true,
+            None,
+        );
     };
     let tool = tool_name(function_name);
     let call = *num_tokens_input;
@@ -571,14 +599,19 @@ pub(crate) fn summary_block(content: &str, width: usize) -> ChatBlock {
     let logical: Vec<Line> = logical_lines(content);
     let lines: Vec<Line> = wrap_markdown(&logical, width, PAD)
         .into_iter()
-        .map(|line| line.style(Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC)))
+        .map(|line| {
+            line.style(
+                Style::default()
+                    .fg(theme().muted)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        })
         .collect();
     ChatBlock {
         lines,
         bg: None,
         gap: 0,
         is_tool: false,
-
     }
 }
 
@@ -631,7 +664,9 @@ pub(crate) fn build_live_blocks(
                     live_ctx.block_sum += est;
                     live_ctx.add_used(est);
                     if view.is_overview() {
-                        blocks.push(overview_text_line(text, width, &live_ctx, window, None, None));
+                        blocks.push(overview_text_line(
+                            text, width, &live_ctx, window, None, None,
+                        ));
                     } else {
                         blocks.push(text_block(text, width));
                     }
@@ -652,9 +687,17 @@ pub(crate) fn build_live_blocks(
                                 live_ctx.add_tool(t, est);
                                 live_ctx.block_sum += est;
                                 live_ctx.add_used(est);
-                                blocks.push(overview_active_tool_line(&label, width, &live_ctx, window));
+                                blocks.push(overview_active_tool_line(
+                                    &label, width, &live_ctx, window,
+                                ));
                             } else if !out.is_empty() {
-                                blocks.push(live_run_block(&label, out, width, view.boxes_open(), true));
+                                blocks.push(live_run_block(
+                                    &label,
+                                    out,
+                                    width,
+                                    view.boxes_open(),
+                                    true,
+                                ));
                             } else {
                                 blocks.push(active_tool_line(&label, width));
                             }
@@ -713,7 +756,6 @@ pub(crate) fn build_live_blocks(
             bg: None,
             gap: 0,
             is_tool: false,
-
         });
     }
     (blocks, live_ctx.used)
@@ -823,7 +865,6 @@ pub(crate) fn line_to_anchor(tops: &[usize], heights: &[usize], line: usize) -> 
     }
 }
 
-
 /// Laufendes Werkzeug als Einzeiler („⚙ tool …“) – in der Übersicht statt der
 /// Live-Konsolen-Box, sonst solange noch keine Ausgabe anfällt.
 pub(crate) fn active_tool_line(tool: &str, width: usize) -> ChatBlock {
@@ -840,7 +881,6 @@ pub(crate) fn active_tool_line(tool: &str, width: usize) -> ChatBlock {
         bg: None,
         gap: 0,
         is_tool: true,
-
     }
 }
 
@@ -1117,7 +1157,6 @@ const BAR_SUB: usize = 8;
 /// „Streifen“) an ihn anschließt.
 const BAR_LEER: Color = Color::Rgb(29, 32, 40);
 
-
 /// Laufende Context-Schätzung für die Übersichts-Balken: kumulierte Token und
 /// ihre Aufteilung nach Kategorien (Inhalts-Anteile in `ContentKind`-Kategorien,
 /// je Tool-Kategorie ein eigener, farbiger Anteil – kumuliert über alle Aufrufe).
@@ -1215,7 +1254,10 @@ pub(crate) fn context_bar(ctx: &ContextEstimate, window: u64, cells: usize) -> V
     // damit beides in eine Zeile passt; bei noch 0 Tokens bleibt das Feld auf
     // voller Breite leer, damit die Spalte auch dann stabil bleibt.
     let block_sum_ann = if ctx.block_sum > 0 {
-        pad_ann(format!(" {}", fmt_ctx(ctx.block_sum)), CONTEXT_BLOCKSUM_CELLS)
+        pad_ann(
+            format!(" {}", fmt_ctx(ctx.block_sum)),
+            CONTEXT_BLOCKSUM_CELLS,
+        )
     } else {
         " ".repeat(CONTEXT_BLOCKSUM_CELLS)
     };
@@ -1330,7 +1372,10 @@ pub(crate) fn context_bar(ctx: &ContextEstimate, window: u64, cells: usize) -> V
     // Zweite Zahl direkt dahinter: kumulierte Context-Schätzung bis hierher
     // (dezent, grau) – inkl. nicht gezeichneter Anteile wie Reasoning. Immer
     // mit voller Budget-Breite (auch leer), damit die Spalte fix bleibt.
-    spans.push(Span::styled(block_sum_ann, Style::default().fg(theme().muted)));
+    spans.push(Span::styled(
+        block_sum_ann,
+        Style::default().fg(theme().muted),
+    ));
     spans
 }
 
@@ -1397,7 +1442,14 @@ pub(crate) fn overview_row(
     let ann = block_tokens.map(|a| format!(" {a}"));
     let ann_w = ann.as_ref().map(|a| disp_width(a)).unwrap_or(0);
     let text = fit_label(&label, left_w.saturating_sub(ann_w));
-    overview_line(vec![Span::styled(text, style)], ann, width, ctx, window, is_tool)
+    overview_line(
+        vec![Span::styled(text, style)],
+        ann,
+        width,
+        ctx,
+        window,
+        is_tool,
+    )
 }
 
 /// Einzeilige Äußerungs-Zeile der Übersicht – flacht den Text (Zeilen →
@@ -1505,7 +1557,9 @@ fn overview_summary_line(
     tokens: u64,
 ) -> ChatBlock {
     let flat = flatten_for_overview(text);
-    let style = Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC);
+    let style = Style::default()
+        .fg(theme().muted)
+        .add_modifier(Modifier::ITALIC);
     overview_row(
         flat,
         style,
@@ -1516,7 +1570,6 @@ fn overview_summary_line(
         Some(tokens.to_string()),
     )
 }
-
 
 /// Konsolen-Box für ein `run`-Werkzeug: erscheint, sobald die erste Ausgabe
 /// anfällt. Bei noch **laufendem** Kommando (`running`) wird die Box pro Frame
@@ -1534,9 +1587,13 @@ pub(crate) fn live_run_block(
     let box_width = width.saturating_sub(2 * BOX_MARGIN).max(6);
     let content_width = box_width.saturating_sub(2 + 2 * BOX_PAD).max(1);
 
-    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
+    let border = Style::default()
+        .fg(theme().surface_border)
+        .bg(theme().surface_bg);
     let header_style = Style::default().fg(theme().muted).bg(theme().surface_bg);
-    let content_style = Style::default().fg(theme().surface_fg).bg(theme().surface_bg);
+    let content_style = Style::default()
+        .fg(theme().surface_fg)
+        .bg(theme().surface_bg);
     let muted = Style::default().fg(theme().muted).bg(theme().surface_bg);
 
     let header = format!("⚙ {label}");
@@ -1572,7 +1629,6 @@ pub(crate) fn live_run_block(
         bg: None,
         gap: 0,
         is_tool: false,
-
     }
 }
 
@@ -1596,7 +1652,9 @@ pub(crate) fn box_edge(width: usize, box_width: usize, style: Style, top: bool) 
 pub(crate) fn box_line(width: usize, box_width: usize, text: &str, style: Style) -> Line<'static> {
     let content_width = box_width.saturating_sub(2 + 2 * BOX_PAD).max(1);
     let right = width.saturating_sub(BOX_MARGIN + box_width);
-    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
+    let border = Style::default()
+        .fg(theme().surface_border)
+        .bg(theme().surface_bg);
     let spans = vec![
         Span::styled(" ".repeat(BOX_MARGIN), Style::default().bg(CANVAS_BG)),
         Span::styled("│", border),
@@ -1713,7 +1771,6 @@ pub(crate) fn text_block(text: &str, width: usize) -> ChatBlock {
         bg: None,
         gap: 0,
         is_tool: false,
-
     }
 }
 
@@ -1757,7 +1814,6 @@ pub(crate) fn thoughts_block(
             bg: None,
             gap: 0,
             is_tool: false,
-
         }
     } else {
         // Komprimierter Einzeiler (Zoom 2+3): Icon U+1F5ED in Spalte 2, Inhalt
@@ -1772,7 +1828,6 @@ pub(crate) fn thoughts_block(
             bg: None,
             gap: 0,
             is_tool: false,
-
         }
     }
 }
@@ -1847,8 +1902,6 @@ pub(crate) fn fmt_duration(ms: u64) -> String {
     }
 }
 
-
-
 /// Umrandete Box für einen `edit`-Aufruf: Kopfzeile `✎ <label>` (z. B.
 /// `edit a.c +1 -1`) und darunter die Diff-Zeilenpaare zweispaltig (alte Zeilen
 /// links, neue rechts). Gelöschte Zeilen rot, hinzugefügte grün; die geänderten
@@ -1862,13 +1915,17 @@ pub(crate) fn diff_block(
     open: bool,
 ) -> ChatBlock {
     let box_width = width.saturating_sub(2 * BOX_MARGIN).max(6);
-    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
+    let border = Style::default()
+        .fg(theme().surface_border)
+        .bg(theme().surface_bg);
     let header_style = if ok {
         Style::default().fg(theme().muted).bg(theme().surface_bg)
     } else {
         Style::default().fg(theme().err_dim).bg(theme().surface_bg)
     };
-    let content_style = Style::default().fg(theme().surface_fg).bg(theme().surface_bg);
+    let content_style = Style::default()
+        .fg(theme().surface_fg)
+        .bg(theme().surface_bg);
 
     let max_num = diff
         .rows
@@ -1940,19 +1997,33 @@ pub(crate) fn diff_row_lines(
 ) -> Vec<Line<'static>> {
     let content_inner = box_width.saturating_sub(2 + 2 * BOX_PAD).max(2);
     let right = width.saturating_sub(BOX_MARGIN + box_width);
-    let border = Style::default().fg(theme().surface_border).bg(theme().surface_bg);
+    let border = Style::default()
+        .fg(theme().surface_border)
+        .bg(theme().surface_bg);
 
     let del = CellStyle {
         marker: '-',
-        base: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_bg),
-        mark: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_mark_bg),
-        num_style: Style::default().fg(theme().diff_del_fg).bg(theme().diff_del_bg),
+        base: Style::default()
+            .fg(theme().diff_del_fg)
+            .bg(theme().diff_del_bg),
+        mark: Style::default()
+            .fg(theme().diff_del_fg)
+            .bg(theme().diff_del_mark_bg),
+        num_style: Style::default()
+            .fg(theme().diff_del_fg)
+            .bg(theme().diff_del_bg),
     };
     let add = CellStyle {
         marker: '+',
-        base: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_bg),
-        mark: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_mark_bg),
-        num_style: Style::default().fg(theme().diff_add_fg).bg(theme().diff_add_bg),
+        base: Style::default()
+            .fg(theme().diff_add_fg)
+            .bg(theme().diff_add_bg),
+        mark: Style::default()
+            .fg(theme().diff_add_fg)
+            .bg(theme().diff_add_mark_bg),
+        num_style: Style::default()
+            .fg(theme().diff_add_fg)
+            .bg(theme().diff_add_bg),
     };
     let ctx = CellStyle {
         marker: ' ',
@@ -2175,4 +2246,3 @@ pub(crate) fn marked_wrapped(
     }
     lines
 }
-

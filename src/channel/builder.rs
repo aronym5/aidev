@@ -960,7 +960,14 @@ mod tests {
         // Worktree-Wurzel (anderer Ordnername als das Haupt-Repo) → ebenfalls
         // der Ordnername des Git-Haupt-Repos.
         let wt = base.join("wt");
-        run(&["-C", top_s, "worktree", "add", wt.to_str().unwrap(), "feature"]);
+        run(&[
+            "-C",
+            top_s,
+            "worktree",
+            "add",
+            wt.to_str().unwrap(),
+            "feature",
+        ]);
         assert_eq!(base_name_for(&wt), "repo");
         // Unterverzeichnis eines Repos → weiterhin der eigene Ordnername.
         let src = top.join("src");

@@ -16,9 +16,7 @@ use super::helpers::{
     dump_debug, error_chain, error_message, reasoning_contract_hint, server_error_summary,
     take_head, truncate, with_debug, ERROR_SUMMARY_MAX,
 };
-use super::tools_def::{
-    apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation,
-};
+use super::tools_def::{apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation};
 use super::wire::{WireFunction, WireMessage, WireToolCall};
 use super::{CompletionParts, RoundMetrics, Usage, WorkerEvent};
 
@@ -50,12 +48,15 @@ pub(crate) fn shared_client() -> &'static reqwest::blocking::Client {
 /// `data:`-Zeilen; jede einzelne ist dann kein gültiges JSON. Die übliche
 /// „eine Zeile = ein Event“-Form bleibt unverändert (ein solches Fragment ist
 /// sofort gültig und wird direkt geliefert).
-pub(crate) fn accumulate_sse_event(pending: &mut String, payload: &str) -> Option<serde_json::Value> {
+pub(crate) fn accumulate_sse_event(
+    pending: &mut String,
+    payload: &str,
+) -> Option<serde_json::Value> {
     if !pending.is_empty() {
         pending.push('\n');
     }
     pending.push_str(payload);
-    match serde_json::from_str::<serde_json::Value>(&pending) {
+    match serde_json::from_str::<serde_json::Value>(pending) {
         Ok(v) => {
             pending.clear();
             Some(v)
@@ -175,11 +176,10 @@ pub(crate) fn do_request(
     with_tools: bool,
     permission: Permission,
 ) -> Step {
-    // API-Shape ermitteln (Probe am Modell-Endpunkt + Cache). `determined`
-    // sagt, ob die Shape aus Metadaten stammt oder nur geraten wurde – bei
-    // einer geratenen Shape wird unten bei einem Server-Fehler (5xx) auch die
-    // andere API probiert.
-    let shape_info = api::resolve_shape_info(client, ep);
+    // API-Shape aus dem Cache ermitteln (Default Chat Completions). `determined`
+    // sagt, ob die Shape bestätigt oder nur geraten wurde – bei einer geratenen
+    // Shape wird unten bei einem Server-Fehler (5xx) auch die andere API probiert.
+    let shape_info = api::resolve_shape_info(ep);
     let mut shape = shape_info.shape;
     let (mut url, mut body) = api::build_body(ep, shape, msgs, with_tools, permission, true, None);
     let mut shape_flipped = false;
@@ -223,10 +223,7 @@ pub(crate) fn do_request(
             req
         };
         send_t0 = Instant::now();
-        let resp = match req
-            .json(&body)
-            .send()
-        {
+        let resp = match req.json(&body).send() {
             Ok(r) => r,
             Err(err) => {
                 let chain = error_chain(&err);
@@ -240,7 +237,11 @@ pub(crate) fn do_request(
                 }
                 let wait = jitter(retry_delay(attempt));
                 let retry_at = Instant::now() + wait;
-                let _ = tx.send(WorkerEvent::Retrying(session, truncate(&summary, 80), retry_at));
+                let _ = tx.send(WorkerEvent::Retrying(
+                    session,
+                    truncate(&summary, 80),
+                    retry_at,
+                ));
                 if !sleep_with_cancel(cancel, retry_at) {
                     return Step::Cancelled;
                 }
@@ -268,8 +269,8 @@ pub(crate) fn do_request(
 
         // Format-Fallback: Einmalig die ANDERE API-Shape probieren –
         // (a) bei einem eindeutigen Format-Hinweis in der Fehlermeldung, oder
-        // (b) wenn die Shape nur geraten wurde (keine Modell-Metadaten) und der
-        //     Server generisch mit 5xx antwortet (er könnte das gesendete
+        // (b) wenn die Shape nur geraten wurde (nicht bestätigt) und der Server
+        //     generisch mit 5xx antwortet (er könnte das gesendete
         //     Format schlicht nicht kennen, z. B. ein Responses-Server).
         // Der Wechsel wird NICHT sofort gecacht – nur ein späterer Erfolg
         // (`remember_shape`) bestätigt die neue Shape im Cache.
@@ -317,7 +318,11 @@ pub(crate) fn do_request(
             None => jitter(retry_delay(attempt)),
         };
         let retry_at = Instant::now() + wait;
-        let _ = tx.send(WorkerEvent::Retrying(session, truncate(&summary_line, 80), retry_at));
+        let _ = tx.send(WorkerEvent::Retrying(
+            session,
+            truncate(&summary_line, 80),
+            retry_at,
+        ));
         if !sleep_with_cancel(cancel, retry_at) {
             return Step::Cancelled;
         }
@@ -379,7 +384,7 @@ pub(crate) fn do_request(
         })
     };
 
-    // Responses-Streaming: getypte Events (output_text.delta, 
+    // Responses-Streaming: getypte Events (output_text.delta,
     // function_call_arguments.delta, response.completed) – komplett andere
     // Verarbeitung als Chat (choices/delta/tool_calls). Der vorhandene
     // Chat-Loop darunter ist der ChatCompletions-Zweig.
@@ -492,20 +497,41 @@ pub(crate) fn do_request(
             }
         }
         let Some(content_delta) = delta.get("content").and_then(|c| c.as_str()) else {
-            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
+            apply_tool_delta_stream(
+                &mut tool_accs,
+                delta,
+                &mut parts_acc,
+                &mut timer,
+                tx,
+                session,
+            );
             apply_usage_if_any(tx, session, &mut usage, &mut parts_acc, &mut timer, &json);
             continue; // Role-/Gedanken-Delta oder leere Chunks
         };
         if !content_delta.is_empty() {
             parts_acc.track_content(content_delta.len() as u64);
             content.push_str(content_delta);
-            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
+            apply_tool_delta_stream(
+                &mut tool_accs,
+                delta,
+                &mut parts_acc,
+                &mut timer,
+                tx,
+                session,
+            );
             timer.on_text(content_delta);
             timer.announce_first(tx, session);
             timer.send_progress(tx, session);
             let _ = tx.send(WorkerEvent::Chunk(session, content_delta.to_string()));
         } else {
-            apply_tool_delta_stream(&mut tool_accs, delta, &mut parts_acc, &mut timer, tx, session);
+            apply_tool_delta_stream(
+                &mut tool_accs,
+                delta,
+                &mut parts_acc,
+                &mut timer,
+                tx,
+                session,
+            );
         }
         // usage NACH dem Delta derselben Zeile: Das Inkrement gehört zu den
         // Deltas, die SEIT dem letzten usage erzeugt wurden (inkl. dieses).
@@ -650,6 +676,9 @@ pub(crate) fn do_request(
 /// `output`/`output_text`). Behandelt eine vorhandene Antwort wie eine
 /// einmalige Chunk-Nachricht für die UI. `send_t0` ist der Absende-Zeitpunkt
 /// des Requests (TTFT-Basis, siehe `do_request`).
+// Einzige Aufrufstelle (`do_request`); die Parameter sind die volle Request-
+// Kontext, ein Struct brächte hier keinen Gewinn.
+#[allow(clippy::too_many_arguments)]
 fn handle_nonstream(
     tx: &Sender<WorkerEvent>,
     session: usize,
@@ -668,14 +697,7 @@ fn handle_nonstream(
         Ok(json) => {
             if let Some(e) = json.get("error") {
                 let summary = take_head(&error_message(e), ERROR_SUMMARY_MAX);
-                let debug = dump_debug(
-                    "api-200",
-                    &ep.model,
-                    url,
-                    body,
-                    Some(raw),
-                    Some(&summary),
-                );
+                let debug = dump_debug("api-200", &ep.model, url, body, Some(raw), Some(&summary));
                 return Step::Err(with_debug(format!("API error (200): {summary}"), debug));
             }
             // Non-Streaming-Fallback: Antworttext als einmalige Runde behandeln.
@@ -831,9 +853,7 @@ fn stream_responses(
             }
             "response.output_item.added" => {
                 let item = json.get("item");
-                let is_function = item
-                    .and_then(|i| i.get("type"))
-                    .and_then(|t| t.as_str())
+                let is_function = item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                     == Some("function_call");
                 if is_function {
                     let index = json
@@ -842,10 +862,7 @@ fn stream_responses(
                         .map(|n| n as usize)
                         .unwrap_or(0);
                     let slot = ensure_tool_slot(&mut tool_accs, index);
-                    if let Some(id) = item
-                        .and_then(|i| i.get("call_id"))
-                        .and_then(|x| x.as_str())
-                    {
+                    if let Some(id) = item.and_then(|i| i.get("call_id")).and_then(|x| x.as_str()) {
                         if slot.id.is_empty() {
                             slot.id = id.to_string();
                         }

@@ -115,9 +115,7 @@ pub(super) fn podman_probe_status(
             PodmanMode::Run => ChannelStatus::Unknown,
             PodmanMode::Attach => ChannelStatus::Problem,
         },
-        ContainerState::Running { .. }
-            if reuse_container(state, bind, image, usermapping) =>
-        {
+        ContainerState::Running { .. } if reuse_container(state, bind, image, usermapping) => {
             ChannelStatus::Running
         }
         ContainerState::Running { .. } => ChannelStatus::Unknown,
@@ -128,10 +126,11 @@ pub(super) fn podman_probe_status(
 /// laufenden Run-Containers – also Zustand, der beim Stoppen des
 /// `--rm`-Containers verworfen würde. Basis ist `podman diff`; ausgefiltert
 /// werden die gemountete Arbeitskopie (`workdir`, lebt ohnehin auf dem Host),
-/// der konfigurierte `home` (Tool-Caches) und flüchtige Verzeichnisse
-/// (`/tmp`, `/var/tmp`, `/run`, …). Liefert eine Kurzbeschreibung samt
-/// Beispiel-Pfaden, `None` wenn nichts Wesentliches vorliegt oder das
-/// Werkzeug nicht läuft.
+/// deren Mount-Pfad samt Zwischenordnern (Vorfahren; bei `/home/work` also
+/// `/home` und `/`), der konfigurierte `home` (Tool-Caches) und flüchtige
+/// Verzeichnisse (`/tmp`, `/var/tmp`, `/run`, …). Liefert eine
+/// Kurzbeschreibung samt Beispiel-Pfaden, `None` wenn nichts Wesentliches
+/// vorliegt oder das Werkzeug nicht läuft.
 pub(super) fn container_layer_changes(
     container: &str,
     workdir: &str,
@@ -171,10 +170,12 @@ pub(super) fn container_layer_changes(
 
 /// Zerlegt die `podman diff`-Ausgabe (`<A|C|D|M> <pfad>`-Zeilen) und filtert
 /// die Pfade heraus, die beim Stoppen eines `--rm`-Containers **nicht**
-/// verloren gehen: die gemountete Arbeitskopie (`workdir`), der konfigurierte
-/// `home` sowie flüchtige Verzeichnisse. Liefert die übrigen „wesentlichen“
-/// Pfade – dedupliziert und sortiert. Reine Funktion, damit sie ohne podman
-/// testbar ist.
+/// verloren gehen: die gemountete Arbeitskopie (`workdir` samt Inhalt), deren
+/// Mount-Pfad selbst samt Vorfahren („Zwischenordner“; bei `/home/work` also
+/// `/home` und `/` – nur Artefakte des Mounts), der konfigurierte `home`
+/// sowie flüchtige Verzeichnisse. Liefert die übrigen „wesentlichen“ Pfade –
+/// dedupliziert und sortiert. Reine Funktion, damit sie ohne podman testbar
+/// ist.
 pub(super) fn essential_diff_paths(diff_out: &str, workdir: &str, home: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
     for line in diff_out.lines() {
@@ -189,6 +190,7 @@ pub(super) fn essential_diff_paths(diff_out: &str, workdir: &str, home: &str) ->
         let path = path.trim().trim_start_matches('/');
         if path.is_empty()
             || path_at_or_under(path, workdir)
+            || path_is_mountchain(path, workdir)
             || path_at_or_under(path, home)
             || volatile_diff_path(path)
         {
@@ -212,6 +214,19 @@ pub(super) fn path_at_or_under(path: &str, base: &str) -> bool {
         path.strip_prefix(base)
             .is_some_and(|rest| rest.starts_with('/'))
     }
+}
+
+/// Ist `path` (ohne führenden `/`) der Mount-Pfad der Arbeitskopie (`workdir`)
+/// selbst oder einer seiner Vorfahren („Zwischenordner“)? Bei einem Mount auf
+/// `/home/work` sind damit `/home/work` und `/home` (und `/`) „in Ordnung“ –
+/// sie sind nur Artefakte des Mounts, die beim Stoppen nicht verloren gehen.
+/// Anderes (Geschwister wie `/home/xy`, Unterpfade wie `/home/work/z` oder
+/// Fremdpfade wie `/tmp`) ist davon **nicht** abgedeckt.
+pub(super) fn path_is_mountchain(path: &str, workdir: &str) -> bool {
+    // `path` ist Vorfahr oder gleich `workdir` ⇔ `workdir` liegt bei/unter
+    // `path`. `workdir` wird hier betragslos (ohne `/`) übergeben, wie es
+    // `path_at_or_under` für sein `path`-Argument erwartet.
+    path_at_or_under(workdir.trim_matches('/'), path)
 }
 
 /// Gehört der Pfad (ohne führenden `/`) zu einem flüchtigen Verzeichnis,

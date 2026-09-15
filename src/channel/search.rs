@@ -239,9 +239,13 @@ pub(super) fn grep_search(
             m.path = stripped.to_string();
         }
     }
-    // Ohne --exclude-dir (portabler Pfad) können Verschachtelte .git/target/
-    // node_modules auftauchen – nachträglich ausfiltern (bei GNU redundant).
-    matches.retain(|m| !is_excluded_path(&m.path));
+    // Werden die Treffer per Gitignore-/Hidden-Regel unterdrückt? Bei GNU grep
+    // erledigen das bereits --exclude-dir; für den portablen Pfad (BusyBox/BSD)
+    // ist dieser Nachfilter nötig, damit das Ergebnis dem von rg entspricht:
+    // versteckte (`.`-Präfix) und über .gitignore/.ignore ignorierte Pfade.
+    // Die Dateien werden dynamisch aus dem Suchverzeichnis (aufsteigend) gelesen.
+    let filter = super::ignore::IgnoreFilter::load(&cwd, Path::new("/"));
+    matches.retain(|m| !filter.is_ignored(&m.path));
     Ok((matches, None))
 }
 
@@ -268,15 +272,6 @@ fn normalize_raw(s: &str) -> String {
         .map(|l| l.strip_prefix("./").unwrap_or(l))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Liegt der Treffer in einem der ausgelassenen Generator-/Cache-Verzeichnisse?
-/// Prüft jede Pfadkomponente (nicht nur die erste), damit auch verschachtelte
-/// `src/target/…`, `vendor/node_modules/…` etc. wie bei `rg`/`--exclude-dir`
-/// ausgeschlossen werden.
-pub(super) fn is_excluded_path(path: &str) -> bool {
-    path.split('/')
-        .any(|comp| matches!(comp, ".git" | "target" | "node_modules"))
 }
 
 /// Parst die `pfad:zeile:text`-Ausgabe von `rg`/`grep` in [`Match`]-Einträge.
@@ -375,7 +370,12 @@ mod tests {
 
         // `-E` (ERE) nötig: Alternation `cat|hat` matcht "cat", "cats" UND "hat"
         // (= 3 Zeilen). Ohne `-E` (BRE) wäre es eine Literal-Suche → 0 Treffer.
-        assert_eq!(matches.len(), 3, "`cat|hat` soll 3 Zeilen finden (nur mit -E): {:?}", matches);
+        assert_eq!(
+            matches.len(),
+            3,
+            "`cat|hat` soll 3 Zeilen finden (nur mit -E): {:?}",
+            matches
+        );
         assert_eq!(matches[0].path, "f.txt");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -409,19 +409,5 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `is_excluded_path` muss auch verschachtelte target/node_modules
-    /// ausfiltern (nicht nur solche auf oberster Ebene), damit der Fallback
-    /// denselben Satz wie `rg`/`--exclude-dir` ausschließt.
-    #[test]
-    fn excluded_path_filtert_auch_verschachtelte_pfade() {
-        assert!(is_excluded_path("target/x.rs"));
-        assert!(is_excluded_path(".git/config"));
-        assert!(is_excluded_path("node_modules/pkg/main.js"));
-        assert!(is_excluded_path("src/target/nested.rs"), "verschachteltes target muss raus");
-        assert!(is_excluded_path("vendor/node_modules/deep.txt"), "verschachteltes node_modules muss raus");
-        assert!(!is_excluded_path("src/main.rs"));
-        assert!(!is_excluded_path("targets/keep.rs"));
     }
 }

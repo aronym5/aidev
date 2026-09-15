@@ -191,7 +191,9 @@ fn wire_compact_boundary_zaehlt_turns_an_user_nachrichten() {
 
 #[test]
 fn context_length_fehler_wird_erkannt() {
-    assert!(looks_like_context_error("Request too large: maximum context length"));
+    assert!(looks_like_context_error(
+        "Request too large: maximum context length"
+    ));
     assert!(looks_like_context_error("prompt is too long for the model"));
     assert!(!looks_like_context_error("rate limit exceeded"));
 }
@@ -335,7 +337,10 @@ fn accumulator_nur_finales_usage_verteilt_ueber_ganze_runde() {
     acc.apply_usage(200);
     let parts = acc.parts();
     // 60:40:100 über 200 ⇒ 60|40|100.
-    assert_eq!((parts.reasoning, parts.content, parts.tool_calls.as_slice()), (60, 40, &[100][..]));
+    assert_eq!(
+        (parts.reasoning, parts.content, parts.tool_calls.as_slice()),
+        (60, 40, &[100][..])
+    );
 }
 
 #[test]
@@ -358,7 +363,7 @@ fn accumulator_tool_kopf_mit_null_bytes_geht_an_aktive_sektion() {
     let mut acc = RoundPartsAccumulator::default();
     acc.track_reasoning(100);
     acc.apply_usage(20); // reasoning + 20
-    // active = Reasoning; das Tool-Kopf-Delta überschreibt es auf Slot 0.
+                         // active = Reasoning; das Tool-Kopf-Delta überschreibt es auf Slot 0.
     acc.track_tool(0, 0);
     acc.apply_usage(38); // inc = 18, keine Bytes → komplett an Tool 0
     let parts = acc.parts();

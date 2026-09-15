@@ -17,6 +17,7 @@ pub(crate) mod builder;
 mod container;
 mod fsops;
 mod glob;
+mod ignore;
 pub(crate) mod local;
 pub(crate) mod podman;
 mod resolve;
@@ -176,26 +177,63 @@ pub struct ChannelRegistry {
 }
 
 impl ChannelRegistry {
-    pub fn new(cfg: &crate::config::Config) -> Self {
+    /// Erzeugt die Registry aus der Config und sammelt auftretende Warnungen
+    /// (nicht verfügbare Kanäle, fehlender Default-Kanal), statt sie auf
+    /// stderr zu schreiben – stderr würde im TUI-Alt-Screen das Layout
+    /// zerschießen (Startup und `/reload` laufen dort, siehe `App::run` und
+    /// `App::apply_reloaded_config` in `src/app`).
+    pub fn new_with_warnings(cfg: &crate::config::Config) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
         let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         for (name, cc) in &cfg.channels {
             match channel_from_config(name, cc, cfg.timeout_secs, None, cfg.podman.usermapping) {
                 Ok(ch) => {
                     map.insert(name.clone(), ch);
                 }
-                Err(err) => eprintln!("[aidev] Channel \"{name}\" not available: {err}"),
+                Err(err) => warnings.push(format!("Channel \"{name}\" not available: {err}")),
             }
         }
         if let Some(d) = &cfg.default_channel {
             if !map.contains_key(d) {
-                eprintln!("[aidev] default_channel \"{d}\" not available.");
+                warnings.push(format!("default_channel \"{d}\" not available."));
             }
         }
         let default = cfg.default_channel.clone().filter(|d| map.contains_key(d));
-        ChannelRegistry {
-            default,
-            map,
+        (ChannelRegistry { default, map }, warnings)
+    }
+
+    /// Baut die Registry aus einer **frisch geladenen** Config neu auf –
+    /// ersetzt also konfigurierte Kanäle durch deren neuen Zustand. Dabei
+    /// bleiben **nicht** konfigurierte, zur Laufzeit dynamisch erzeugte Kanäle
+    /// (Channel-Builder, `/branch`, Alt+D-Worktrees, `/reuse`) erhalten und
+    /// werden in die neue Registry übernommen. Konfigurierte Kanäle, deren
+    /// Name in der frischen Config fehlt, verfallen. Default-Kanal: bevorzugt
+    /// aus der frischen Config, sonst der bisherige, falls er weiterhin
+    /// existiert.
+    ///
+    /// Gibt die beim Neuaufbau gesammelten Warnungen (nicht verfügbare
+    /// konfigurierte Kanäle, fehlender Default-Kanal) zurück, statt sie auf
+    /// stderr zu schreiben – `/reload` läuft im TUI-Alt-Screen und stderr
+    /// würde das Layout zerschießen.
+    pub fn reload(&mut self, cfg: &crate::config::Config) -> Vec<String> {
+        let (mut fresh, warnings) = Self::new_with_warnings(cfg);
+        // Dynamische Kanäle (nicht Teil der Config) übernehmen – exakt unter
+        // ihrem registrierten Namen, ohne Suffix-Duplizierung.
+        for name in self.map.keys() {
+            if cfg.channels.contains_key(name) {
+                continue; // wird aus der frischen Config neu erzeugt
+            }
+            if let Some(ch) = self.map.get(name) {
+                fresh.map.insert(name.clone(), ch.clone());
+            }
         }
+        // Default: frisch bevorzugen, sonst bisherigen beibehalten (falls der
+        // Kanal weiterhin existiert).
+        fresh.default = fresh
+            .default
+            .or_else(|| self.default.clone().filter(|d| fresh.map.contains_key(d)));
+        *self = fresh;
+        warnings
     }
 
     pub fn names(&self) -> Vec<String> {

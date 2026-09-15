@@ -217,8 +217,14 @@ fn local_kanal_aus_config_via_channel_from_config() {
         host_root: Some(dir.display().to_string()),
         home: None,
     };
-    let ch = channel_from_config("sandbox", &cc, 60, None, crate::config::PodmanUserMapping::KeepId)
-        .expect("local-Kanal aus Config bauen");
+    let ch = channel_from_config(
+        "sandbox",
+        &cc,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("local-Kanal aus Config bauen");
     assert_eq!(ch.kind(), ChannelKind::Local);
     assert!(ch.root().starts_with("Local:"));
     ch.write(Path::new("datei.txt"), "inhalt\n").unwrap();
@@ -238,7 +244,14 @@ fn local_config_fehlerfaelle() {
         host_root: None,
         home: None,
     };
-    assert!(channel_from_config("x", &ohne, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config(
+        "x",
+        &ohne,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId
+    )
+    .is_err());
     let mit_img = ChannelConfig {
         kind: "local".into(),
         image: Some("node:22".into()),
@@ -248,7 +261,14 @@ fn local_config_fehlerfaelle() {
         host_root: Some("/tmp".into()),
         home: None,
     };
-    assert!(channel_from_config("x", &mit_img, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config(
+        "x",
+        &mit_img,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId
+    )
+    .is_err());
     let fremd = ChannelConfig {
         kind: "docker".into(),
         image: None,
@@ -258,7 +278,14 @@ fn local_config_fehlerfaelle() {
         host_root: Some("/tmp".into()),
         home: None,
     };
-    assert!(channel_from_config("x", &fremd, 60, None, crate::config::PodmanUserMapping::KeepId).is_err());
+    assert!(channel_from_config(
+        "x",
+        &fremd,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId
+    )
+    .is_err());
 }
 
 #[test]
@@ -274,8 +301,14 @@ fn managed_flags_werden_beim_erzeugen_gesetzt() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let run = podman::podman_from_config("run", &run_cfg, 60, None, crate::config::PodmanUserMapping::KeepId)
-        .expect("Run-Kanal bauen");
+    let run = podman::podman_from_config(
+        "run",
+        &run_cfg,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("Run-Kanal bauen");
     assert!(run.managed_container(), "Run-Container gehört aidev");
     assert!(!run.managed_worktree(), "kein Worktree angelegt");
 
@@ -289,14 +322,26 @@ fn managed_flags_werden_beim_erzeugen_gesetzt() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let attach = podman::podman_from_config("attach", &attach_cfg, 60, None, crate::config::PodmanUserMapping::KeepId)
-        .expect("Attach-Kanal bauen");
-    assert!(!attach.managed_container(), "Attach-Container gehört nicht aidev");
+    let attach = podman::podman_from_config(
+        "attach",
+        &attach_cfg,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("Attach-Kanal bauen");
+    assert!(
+        !attach.managed_container(),
+        "Attach-Container gehört nicht aidev"
+    );
     assert!(!attach.managed_worktree());
 
     // Local-Kanal ohne Worktree verwaltet nichts.
     let local = Local::new(PathBuf::from("/tmp/x"));
-    assert!(!local.managed_worktree(), "plain local → kein verwalteter Worktree");
+    assert!(
+        !local.managed_worktree(),
+        "plain local → kein verwalteter Worktree"
+    );
 }
 
 #[test]
@@ -317,10 +362,19 @@ fn managed_worktree_gesetzt_wenn_worktree_gebunden() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let ch = channel_from_config("feat", &cfg, 60, Some(wt.clone()), crate::config::PodmanUserMapping::KeepId)
-        .expect("local-Kanal mit Worktree bauen");
+    let ch = channel_from_config(
+        "feat",
+        &cfg,
+        60,
+        Some(wt.clone()),
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("local-Kanal mit Worktree bauen");
     assert!(ch.managed_worktree(), "gebundener Worktree ist verwaltet");
-    assert_eq!(ch.owned_worktree().map(|w| w.name.as_str()), Some("aidev-feature"));
+    assert_eq!(
+        ch.owned_worktree().map(|w| w.name.as_str()),
+        Some("aidev-feature")
+    );
 
     // Dasselbe gilt für Podman-Run-Kanäle (Picker-/branch-Pfad).
     let pod_cfg = ChannelConfig {
@@ -332,8 +386,14 @@ fn managed_worktree_gesetzt_wenn_worktree_gebunden() {
         host_root: Some("/tmp/aidev-proj".into()),
         home: None,
     };
-    let pod = channel_from_config("feat", &pod_cfg, 60, Some(wt), crate::config::PodmanUserMapping::KeepId)
-        .expect("podman-Kanal mit Worktree bauen");
+    let pod = channel_from_config(
+        "feat",
+        &pod_cfg,
+        60,
+        Some(wt),
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("podman-Kanal mit Worktree bauen");
     assert!(pod.managed_container(), "Run-Container verwaltet");
     assert!(pod.managed_worktree(), "gebundener Worktree verwaltet");
 
@@ -341,7 +401,10 @@ fn managed_worktree_gesetzt_wenn_worktree_gebunden() {
     // Ordner) → das Duplikat übernimmt die Verwaltung nicht, sonst würde das
     // Schließen des Duplikats den Worktree des Originals aufräumen.
     let dup = ch.dup().expect("dup");
-    assert!(!dup.managed_worktree(), "Local-Duplikat verwaltet keinen eigenen Worktree");
+    assert!(
+        !dup.managed_worktree(),
+        "Local-Duplikat verwaltet keinen eigenen Worktree"
+    );
 }
 
 #[test]
@@ -352,7 +415,11 @@ fn change_notes_nur_bei_verwaltetem_worktree_auch_arbeitskopie() {
     // managed_worktree = false: nur der Container-Diff, KEIN Arbeitskopie-Hinweis
     // (typischer Fall: normaler Host-Ordner, der zufällig ein Git-Checkout ist).
     let nur_container = podman::change_notes(false, layer.clone(), worktree.clone());
-    assert_eq!(nur_container, vec![layer.clone().unwrap()], "kein working-copy-Hinweis");
+    assert_eq!(
+        nur_container,
+        vec![layer.clone().unwrap()],
+        "kein working-copy-Hinweis"
+    );
 
     // managed_worktree = true: Container-Diff UND Arbeitskopie-Hinweis.
     let mit_worktree = podman::change_notes(true, layer.clone(), worktree.clone());
@@ -362,7 +429,10 @@ fn change_notes_nur_bei_verwaltetem_worktree_auch_arbeitskopie() {
 
     // Nur Arbeitskopie-Hinweis (kein Container-Diff) bei verwaltetem Worktree.
     let nur_worktree = podman::change_notes(true, None, worktree.clone());
-    assert_eq!(nur_worktree, vec![worktree.unwrap()]);
+    assert_eq!(
+        nur_worktree,
+        vec!["2 uncommitted changes in the working copy".to_string()]
+    );
 
     // Beides leer → leere Liste, unbeeinflusst vom Flag.
     assert!(podman::change_notes(true, None, None).is_empty());
@@ -465,13 +535,21 @@ fn grep_fallback_folgt_keinen_symlinks_nach_aussen() {
 }
 
 #[test]
-fn is_excluded_path_erkennt_ausgeschlossene_verzeichnisse() {
-    assert!(search::is_excluded_path(".git/HEAD"));
-    assert!(search::is_excluded_path("target/debug/aidev"));
-    assert!(search::is_excluded_path("node_modules/x/index.js"));
-    assert!(!search::is_excluded_path("src/lib.rs"));
-    assert!(!search::is_excluded_path("targets.md"));
-    assert!(!search::is_excluded_path(""));
+fn ignore_filter_erkennt_hidden_und_gitignore_pfade() {
+    // Versteckte Pfade (rg-Standard) + dynamisch aus .gitignore geladene Regeln.
+    let dir = std::env::temp_dir().join(format!("aidev-ignore-int-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".gitignore"), "target\nbuild/\n").unwrap();
+
+    let filter = super::ignore::IgnoreFilter::load(&dir, &dir);
+    assert!(filter.is_ignored(".git/HEAD"), "Hidden-Regel (.git)");
+    assert!(filter.is_ignored("src/.cache/x"));
+    assert!(filter.is_ignored("target/debug/aidev"), ".gitignore-Regel");
+    assert!(filter.is_ignored("build/output"));
+    assert!(!filter.is_ignored("src/lib.rs"));
+    assert!(!filter.is_ignored("targets.md"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -502,6 +580,72 @@ fn essential_diff_paths_liest_podman_diff_und_filtert_ueberfluessiges() {
     );
     assert!(paths.is_empty(), "{paths:?}");
     assert!(container::essential_diff_paths("", "/app", "/tmp").is_empty());
+}
+
+#[test]
+fn worktree_mountchain_ist_in_ordnung_und_oeffnet_keinen_dialog() {
+    // Mountpunkt `/home/work`: Änderungen an `/home/work` selbst sowie den
+    // „Zwischenordnern“ `/home` (und `/`) sind nur Mount-Artefakte → herausfiltern.
+    // Ausschließlich solche Pfade ⇒ Ergebnis leer ⇒ kein Dialog.
+    let paths = container::essential_diff_paths(
+        "C /home/work\nA /home\n",
+        "/home/work",
+        "/tmp",
+    );
+    assert!(paths.is_empty(), "nur Mount-Artefakte: {paths:?}");
+
+    let paths = container::essential_diff_paths("A /home\n", "/home/work", "/tmp");
+    assert!(paths.is_empty(), "nur Zwischenordner: {paths:?}");
+
+    let paths = container::essential_diff_paths("C /home/work\n", "/home/work", "/tmp");
+    assert!(paths.is_empty(), "nur Mountpunkt selbst: {paths:?}");
+}
+
+#[test]
+fn worktree_mountchain_wird_aus_dem_dialog_herausgefiltert() {
+    // Neben einem „echten“ Befund wird der Mount-Pfad samt Zwischenordnern
+    // aus der Liste entfernt – dort bleibt nur `/home/xy` und `/opt/data` übrig.
+    let paths = container::essential_diff_paths(
+        "A /home\nC /home/work\nA /home/xy\nA /opt/data\n",
+        "/home/work",
+        "/tmp",
+    );
+    assert_eq!(
+        paths,
+        vec!["home/xy".to_string(), "opt/data".to_string()],
+        "{paths:?}"
+    );
+
+    // Geschwister (`/home/xy`) werden NICHT als „in Ordnung“ behandelt.
+    let paths = container::essential_diff_paths("A /home/xy\n", "/home/work", "/tmp");
+    assert_eq!(paths, vec!["home/xy".to_string()], "{paths:?}");
+}
+
+#[test]
+fn worktree_mountchain_unterscheidet_echte_vorfahren_von_teilprefixen() {
+    // `homework` ist kein Vorfahr von `/home/work`, nur ein gemeinsamer
+    // Text-Prefix – muss also gemeldet bleiben.
+    let paths = container::essential_diff_paths("A /homework\nA /home\n", "/home/work", "/tmp");
+    assert_eq!(paths, vec!["homework".to_string()], "{paths:?}");
+
+    // Tief verschachtelter Unterpfad des Mounts bleibt (wie bisher) verworfen –
+    // er lebt im gemounteten Host-Ordner und geht beim Stoppen nicht verloren.
+    let paths = container::essential_diff_paths("A /home/work/z\nC /home/work\n", "/home/work", "/tmp");
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+#[test]
+fn path_is_mountchain_erkennt_self_und_vorfahren() {
+    use container::path_at_or_under;
+    assert!(container::path_is_mountchain("home", "/home/work"));
+    assert!(container::path_is_mountchain("home/work", "/home/work"));
+    assert!(!container::path_is_mountchain("home/xy", "/home/work"));
+    assert!(!container::path_is_mountchain("home/work/z", "/home/work"));
+    assert!(!container::path_is_mountchain("tmp", "/home/work"));
+    assert!(!container::path_is_mountchain("homework", "/home/work"));
+    // Direkte at_or_under-Beziehung bleibt unverändert.
+    assert!(path_at_or_under("home/frei", "home"));
+    assert!(!path_at_or_under("home", "home/work"));
 }
 
 #[test]
@@ -601,7 +745,14 @@ fn run_from_config_loest_host_identitaet_auf() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let ch = podman::podman_from_config("node", &cc, 60, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
+    let ch = podman::podman_from_config(
+        "node",
+        &cc,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("Run-Kanal bauen");
     let (uid, gid) = run::host_uid_gid().unwrap();
     assert_eq!(ch.uid, uid, "UID == Host");
     assert_eq!(ch.gid, gid, "GID == Host");
@@ -695,8 +846,9 @@ fn running_uid_gid_uidmap_braucht_image() {
         "uidmap ohne Image → Fehler"
     );
     // keep-id liefert weiterhin die Host-Identität.
-    let (uid, gid) = podman::running_uid_gid(Some("node:22"), crate::config::PodmanUserMapping::KeepId)
-        .expect("Host-Identität");
+    let (uid, gid) =
+        podman::running_uid_gid(Some("node:22"), crate::config::PodmanUserMapping::KeepId)
+            .expect("Host-Identität");
     let (huid, hgid) = run::host_uid_gid().unwrap();
     assert_eq!((uid, gid), (huid, hgid));
 }
@@ -731,7 +883,12 @@ fn reuse_container_nur_bei_passendem_laufenden_container() {
     };
     let keep_id = crate::config::PodmanUserMapping::KeepId;
     let uidmap = crate::config::PodmanUserMapping::Uidmap;
-    assert!(container::reuse_container(&running(), bind, Some("node:22"), keep_id));
+    assert!(container::reuse_container(
+        &running(),
+        bind,
+        Some("node:22"),
+        keep_id
+    ));
     assert!(!container::reuse_container(
         &container::ContainerState::Running {
             userns: "host".into(),
@@ -756,14 +913,24 @@ fn reuse_container_nur_bei_passendem_laufenden_container() {
     ));
     // uidmap-Modus: ein keep-id-Container ist NICHT wiederverwendbar (anderes
     // Mapping)…
-    assert!(!container::reuse_container(&running(), bind, Some("node:22"), uidmap));
+    assert!(!container::reuse_container(
+        &running(),
+        bind,
+        Some("node:22"),
+        uidmap
+    ));
     // …aber ein privates (nicht keep-id) Userns passt.
     let private_ns = container::ContainerState::Running {
         userns: "private".into(),
         binds: "[/host/x:/app]".into(),
         image: "node:22".into(),
     };
-    assert!(container::reuse_container(&private_ns, bind, Some("node:22"), uidmap));
+    assert!(container::reuse_container(
+        &private_ns,
+        bind,
+        Some("node:22"),
+        uidmap
+    ));
 }
 
 #[test]
@@ -783,7 +950,14 @@ fn podman_kanal_start_unknown() {
         host_root: Some("/tmp/x".into()),
         home: None,
     };
-    let ch = podman::podman_from_config("node", &cc, 60, None, crate::config::PodmanUserMapping::KeepId).expect("Run-Kanal bauen");
+    let ch = podman::podman_from_config(
+        "node",
+        &cc,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .expect("Run-Kanal bauen");
     assert_eq!(ch.status(), ChannelStatus::Unknown);
 }
 
@@ -902,7 +1076,14 @@ fn find_by_container_findet_passenden_run_kanal() {
         host_root: Some("/tmp/aidev-proj".into()),
         home: None,
     };
-    let ch = channel_from_config("alpine /tmp/aidev-proj", &cfg, 60, None, crate::config::PodmanUserMapping::KeepId).unwrap();
+    let ch = channel_from_config(
+        "alpine /tmp/aidev-proj",
+        &cfg,
+        60,
+        None,
+        crate::config::PodmanUserMapping::KeepId,
+    )
+    .unwrap();
     let name = registry.register("alpine /tmp/aidev-proj".into(), ch);
     // Über den Containernamen eines Run-Kanals wiederfinden (wie es der
     // Channel Builder beim Wiederverwenden tut).
@@ -1090,4 +1271,78 @@ fn proc_is_sleep(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .map(|c| c.trim() == "sleep")
         .unwrap_or(false)
+}
+
+/// `ChannelRegistry::new_with_warnings` muss kaputte Kanäle und fehlende
+/// Default-Kanäle als Warnungen sammeln, statt sie auf stderr zu schreiben
+/// (stderr würde im TUI-Alt-Screen das Layout zerschießen).
+#[test]
+fn registry_sammelt_warnungen_statt_stderr() {
+    let kaputt = crate::config::ChannelConfig {
+        kind: "bogus".into(),
+        image: None,
+        container: None,
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: None,
+        home: None,
+    };
+    let ok = crate::config::ChannelConfig {
+        kind: "local".into(),
+        image: None,
+        container: None,
+        run_container: None,
+        workdir: "/app".into(),
+        host_root: Some(std::env::temp_dir().display().to_string()),
+        home: None,
+    };
+    let mut channels = std::collections::HashMap::new();
+    channels.insert("kaputt".to_string(), kaputt);
+    channels.insert("ok".to_string(), ok);
+
+    let cfg = crate::config::Config {
+        channels,
+        default_channel: Some("fehlt".to_string()),
+        ..crate::config::Config::default()
+    };
+
+    let (reg, warnings) = ChannelRegistry::new_with_warnings(&cfg);
+
+    // Kaputter Kanal ist nicht registriert, der gültige schon.
+    assert!(reg.get("kaputt").is_none());
+    assert!(reg.get("ok").is_some());
+    // default_channel zeigt ins Leere → kein Default.
+    assert!(reg.default_channel_name().is_none());
+
+    assert_eq!(
+        warnings,
+        vec![
+            "Channel \"kaputt\" not available: Unknown channel type: bogus".to_string(),
+            "default_channel \"fehlt\" not available.".to_string(),
+        ]
+    );
+
+    // Ohne Warnungen ist die Zusammenführung leer (Erfolgsfall).
+    let (reg_ok, warnings_ok) = {
+        let mut nur_ok = std::collections::HashMap::new();
+        nur_ok.insert(
+            "ok".to_string(),
+            crate::config::ChannelConfig {
+                kind: "local".into(),
+                image: None,
+                container: None,
+                run_container: None,
+                workdir: "/app".into(),
+                host_root: Some(std::env::temp_dir().display().to_string()),
+                home: None,
+            },
+        );
+        ChannelRegistry::new_with_warnings(&crate::config::Config {
+            default_channel: Some("ok".to_string()),
+            channels: nur_ok,
+            ..crate::config::Config::default()
+        })
+    };
+    assert!(warnings_ok.is_empty());
+    assert_eq!(reg_ok.default_channel_name(), Some("ok"));
 }

@@ -186,12 +186,7 @@ impl App {
         // Cursor positionieren: auf das aktuell gewählte Modell bzw. auf
         // „(Standard)"/das Default-Modell. Mit `ModelPick::Default` als echtem
         // Eintrag entfällt der frühere `show_default`-Offset.
-        let default_id = self.config.model.clone();
-        let default_key = self
-            .model_registry
-            .find_by_model_id(&default_id)
-            .map(|e| e.key())
-            .unwrap_or_else(|| default_id.clone());
+        let default_key = self.default_model_key();
         let target = self.sessions[self.active]
             .model_alias
             .clone()
@@ -213,12 +208,7 @@ impl App {
     /// Refresh (Worker) neu aufgebaut, damit Reihenfolge/Display konsistent
     /// bleiben.
     pub(crate) fn model_pick_list(&self) -> Vec<ModelPick> {
-        let default_id = self.config.model.clone();
-        let default_key = self
-            .model_registry
-            .find_by_model_id(&default_id)
-            .map(|e| e.key())
-            .unwrap_or_else(|| default_id.clone());
+        let default_key = self.default_model_key();
         let mut list: Vec<ModelPick> = Vec::new();
         let mut has_default = false;
         for entry in self.model_registry.all() {
@@ -240,6 +230,21 @@ impl App {
     /// (inkl. Refresh-Status).
     fn sync_config_to_registry(&mut self) {
         self.model_registry.sync_from_config(&self.config.models);
+    }
+
+    /// Interner Registry-Key des Default-Modells für Cursor-Position und
+    /// „(Standard)“-Entscheidung im Modell-Picker. Beachtet die
+    /// Alias-Vorrang-Auflösung: `model = "prov/mod"` → Key `"prov/mod"`, wenn
+    /// es dafür einen passenden `[models.*]`-Eintrag gibt; sonst der
+    /// (Server-)Registry-Key bzw. das rohe Modellfeld.
+    fn default_model_key(&self) -> String {
+        if let Some(m) = self.config.resolve_default_alias() {
+            return format!("{}/{}", m.provider, m.alias);
+        }
+        self.model_registry
+            .find_by_model_id(&self.config.model)
+            .map(|e| e.key())
+            .unwrap_or_else(|| self.config.model.clone())
     }
 
     pub(crate) fn handle_model_picker_key(&mut self, key: event::KeyEvent) {
@@ -1062,6 +1067,14 @@ impl App {
             self.user_end();
             return;
         }
+        // `/reload` → Config von der Platte neu einlesen, Modelle und
+        // Kanäle aus der frischen Config neu aufbauen. Funktioniert
+        // jederzeit – auch mitten im Streaming, da kein LLM-Turn
+        // gestartet wird.
+        if content == "/reload" {
+            self.user_reload();
+            return;
+        }
 
         // ── Braucht eine freie LLM-Runde ─────────────────────────────────
         // Alles Weitere fügt einen neuen Chat-Beitrag ein (`send_prompt`),
@@ -1199,6 +1212,66 @@ impl App {
 
     fn user_end(&mut self) {
         self.close_session();
+    }
+
+    /// `/reload` – liest `config.toml` neu ein und wendet den frischen
+    /// Zustand an (siehe [`App::apply_reloaded_config`]).
+    fn user_reload(&mut self) {
+        let active = self.active;
+        let s = &mut self.sessions[active];
+        s.push_history("/reload");
+        s.editor.clear();
+        s.error = None;
+        s.error_debug = None;
+        // Ohne stderr-Logging laden (im Alt-Screen würde das ins UI schreiben
+        // und das Layout zerschießen); auftretende Warnungen erscheinen
+        // stattdessen in der Statuszeile (überschreiben die Erfolgsmeldung).
+        let (fresh, warnings) = crate::config::Config::load_with_warnings();
+        self.apply_reloaded_config(fresh, warnings);
+    }
+
+    /// Wendet eine frisch geladene Config an: Maus-Reporting, Theme, Modell-
+    /// und Kanal-Registry neu aufbauen. Bestehende Sessions behalten ihre
+    /// (noch gültigen) Kanal-Arcs – nur künftige Sessions/Channel-Building
+    /// nutzen den neuen Config-Zustand. `warnings` (Config- und
+    /// Kanal-Warnungen) landen in der Statusmeldung der aktiven Session,
+    /// sonst erscheint die Erfolgsmeldung „Config neu geladen."
+    pub(crate) fn apply_reloaded_config(
+        &mut self,
+        fresh: crate::config::Config,
+        mut warnings: Vec<String>,
+    ) {
+        // Maus-Reporting an neue Config anpassen.
+        if fresh.mouse != self.mouse_enabled {
+            self.toggle_mouse();
+        }
+
+        // Theme anwenden (wie beim Start).
+        let theme_choice = crate::ui::ThemeChoice::parse(&fresh.theme).unwrap_or_default();
+        crate::ui::set_theme(crate::ui::resolve(theme_choice));
+
+        // Modell-Registry komplett neu aufbauen (entfernte Models
+        // verschwinden, Refresh-Status wird verworfen).
+        self.model_registry = models::ModelRegistry::new(&fresh.models);
+
+        // Kanal-Registry aus der frischen Config neu aufbauen; nicht
+        // konfigurierte, dynamisch gebaute Kanäle (Builder, `/branch`,
+        // Alt+D-Worktrees, `/reuse`) bleiben erhalten. Bestehende Sessions
+        // behalten ihre Arc-Referenzen auf den alten Kanal; nur neue Einträge
+        // im Picker stammen aus der frischen Config + den übernommenen
+        // dynamischen Kanälen. Warnungen landen in der Statusmeldung.
+        warnings.extend(self.channels.reload(&fresh));
+
+        self.config = fresh;
+        self.refresh_tab_labels();
+
+        let active = self.active;
+        let s = &mut self.sessions[active];
+        s.error = Some(if warnings.is_empty() {
+            "Config neu geladen.".to_string()
+        } else {
+            warnings.join(" · ")
+        });
     }
 
     pub(crate) fn handle_esc(&mut self) {

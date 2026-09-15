@@ -15,17 +15,14 @@ use super::resolve::join_workdir;
 use super::resolve::resolve;
 use super::run::{host_uid_gid, run_with_timeout, run_with_timeout_live, sanitize};
 use super::search::search_files;
-use super::{
-    Channel, ChannelKind, ChannelStatus, PodmanMode, RunOut, SearchResult,
-};
+use super::{Channel, ChannelKind, ChannelStatus, PodmanMode, RunOut, SearchResult};
 use crate::config::{ChannelConfig, PodmanUserMapping};
 use std::sync::atomic::AtomicBool;
 
 /// Podman-Kanal. Befehle laufen per `podman exec …` (argv, ohne Shell).
 /// Datei-Operationen laufen über den Host-Mount (`host_root`, sofern gesetzt).
 /// Run-Container werden mit `--init` gestartet; das UID-/GID-Mapping wird über
-/// `PodmanUserMapping` gewählt (Default `keep-id`, alternativ explizite
-/// `--uidmap`/`--gidmap`).
+/// `PodmanUserMapping` gewählt (Default `uidmap`, alternativ `keep-id`).
 ///
 /// Als exec-Identität (und als Anker des UID-Mappings) dient bei `keep-id` die
 /// Host-UID/-GID des Aufrufers, bei `uidmap` die im Image konfigurierte
@@ -175,12 +172,7 @@ pub(crate) fn running_uid_gid(
 fn image_default_uid_gid(image: &str) -> Result<(u32, u32), String> {
     let st = run_with_timeout(
         "podman",
-        &[
-            "run".into(),
-            "--rm".into(),
-            image.into(),
-            "id".into(),
-        ],
+        &["run".into(), "--rm".into(), image.into(), "id".into()],
         Path::new("."),
         Duration::from_secs(120),
     )?;
@@ -562,7 +554,10 @@ impl Channel for PodmanChannel {
     /// selbst gestartete Run-Container wesentliche, ungesicherte Änderungen
     /// enthält – und meldet sie als Kurzbeschreibung:
     /// - Dateien im Container-Dateisystem außerhalb der gemounteten
-    ///   Arbeitskopie (würden beim Stoppen des `--rm`-Containers verworfen),
+    ///   Arbeitskopie (würden beim Stoppen des `--rm`-Containers verworfen);
+    ///   Änderungen nur am Mount-Pfad der Arbeitskopie selbst bzw. dessen
+    ///   Zwischenordnern (z. B. `/home/work` und `/home` bei Mount auf
+    ///   `/home/work`) sind Mount-Artefakte und lösen keinen Dialog aus,
     /// - nicht committete Änderungen in der Git-Arbeitskopie (`host_root`).
     ///
     /// Nur für tatsächlich verwaltete (beim Beenden stoppt aidev nur diese:
@@ -717,6 +712,7 @@ impl Channel for PodmanChannel {
 /// - die Arbeitskopie-Änderungen (`worktree`) nur, wenn der Kanal einen von
 ///   aidev verwalteten Worktree hat (`managed_worktree`); ein normaler
 ///   Host-Ordner, der zufällig ein Git-Checkout ist, wird nicht angemeckert.
+///
 /// Reine Funktion, damit die Bedingung ohne podman/git testbar ist.
 pub(super) fn change_notes(
     managed_worktree: bool,

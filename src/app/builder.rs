@@ -269,7 +269,8 @@ impl App {
                         }
                         1 if !b.host_paths.nav.is_empty() => {
                             let old = b.host_paths.nav.cursor();
-                            b.host_paths.handle_move(&key, b.host_paths.nav.len() as u16);
+                            b.host_paths
+                                .handle_move(&key, b.host_paths.nav.len() as u16);
                             moved = true;
                             changed = old != b.host_paths.nav.cursor();
                         }
@@ -621,11 +622,7 @@ impl App {
             let Some(b) = &mut self.channel_builder else {
                 return;
             };
-            let existing_idx = b
-                .host_paths
-                .items
-                .iter()
-                .position(|hp| hp.path == path);
+            let existing_idx = b.host_paths.items.iter().position(|hp| hp.path == path);
             let new_idx = if let Some(idx) = existing_idx {
                 // Bereits vorhanden → direkt auswählen
                 idx
@@ -754,8 +751,7 @@ impl App {
                 if let Some(b) = &mut self.channel_builder {
                     b.edit = None;
                     b.edit_error = None;
-                    let wt =
-                        crate::channel::builder::git_list_worktrees_and_branches(&repo);
+                    let wt = crate::channel::builder::git_list_worktrees_and_branches(&repo);
                     let idx = wt.iter().position(|w| w.branch == name).unwrap_or(0);
                     b.worktrees = Selection::wrap_at(wt, idx);
                 }

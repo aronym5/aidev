@@ -12,7 +12,7 @@ use super::helpers::{
 };
 use super::http::shared_client;
 use super::wire::WireMessage;
-use super::{WorkerEvent};
+use super::WorkerEvent;
 use crate::config::{Config, ResolvedEndpoint};
 
 /// System-Prompt für den separaten Kompaktierungs-Aufruf: fasst den ältesten
@@ -119,10 +119,10 @@ pub(crate) fn request_summary(
         tool_call_id: None,
     });
 
-    // API-Shape des Endpunkts ermitteln; der Fallback schaltet bei einem
-    // eindeutigen Format-Hinweis ODER einer geratenen Shape mit Server-Fehler
-    // einmalig um (analog zum Chat-Pfad).
-    let shape_info = super::api::resolve_shape_info(client, ep);
+    // API-Shape aus dem Cache ermitteln (Default Chat Completions); der
+    // Fallback schaltet bei einem eindeutigen Format-Hinweis ODER einer
+    // geratenen Shape mit Server-Fehler einmalig um (analog zum Chat-Pfad).
+    let shape_info = super::api::resolve_shape_info(ep);
     let mut shape = shape_info.shape;
     let mut attempts = 0;
     loop {
@@ -164,9 +164,8 @@ pub(crate) fn request_summary(
             let v: Value = resp
                 .json()
                 .map_err(|err| format!("invalid response: {err}"))?;
-            let content = super::api::content_from_nonstream(shape, &v).ok_or_else(|| {
-                "Zusammenfassung: kein Antworttext in der Antwort.".to_string()
-            })?;
+            let content = super::api::content_from_nonstream(shape, &v)
+                .ok_or_else(|| "Zusammenfassung: kein Antworttext in der Antwort.".to_string())?;
             // `completion_tokens` = Länge der Summary (die Ausgabe des
             // Kompaktierungs-Aufrufs wird später als User-Nachricht Teil des
             // Kontexts). Falls der Endpunkt kein `usage` liefert, wird als

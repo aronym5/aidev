@@ -43,7 +43,10 @@ impl App {
                 .and_then(|ch| self.channels.find_name(ch))
                 .as_deref()
                 == Some(name);
-            matches && (s.phase == Phase::WaitingForLLM || s.phase == Phase::WaitingForTool || !s.open_tool_ids.is_empty())
+            matches
+                && (s.phase == Phase::WaitingForLLM
+                    || s.phase == Phase::WaitingForTool
+                    || !s.open_tool_ids.is_empty())
         });
         if active {
             self.channel_close = Some(ChannelClose {
@@ -97,9 +100,9 @@ impl App {
                             return;
                         }
                         Ok(false) => {
-                            let summary = repo
-                                .status_summary(&wt.path)
-                                .unwrap_or_else(|_| "Worktree has uncommitted changes.".to_string());
+                            let summary = repo.status_summary(&wt.path).unwrap_or_else(|_| {
+                                "Worktree has uncommitted changes.".to_string()
+                            });
                             self.channel_close = Some(ChannelClose {
                                 name: name.to_string(),
                                 kind,

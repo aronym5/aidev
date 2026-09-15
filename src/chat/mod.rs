@@ -139,6 +139,9 @@ impl Chat {
 
     /// Öffnet ein Tool-Event als Kind einer Assistant-Runde (OFFEN bis Output
     /// abgeschlossen). `manual` (parent_id = None) = User `/run`.
+    // Parameter sind die vollständige Tool-Identität aus dem Worker-/Wire-Paket;
+    // ein Struct würde die ~12 Aufrufstellen nur unleserlicher machen.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_tool(
         &mut self,
         parent_id: Option<EventId>,
@@ -464,8 +467,11 @@ impl Chat {
     pub fn derive_last_turn_tokens(&mut self) {
         // 1) Turn-Grenze: letzter UserPrompt in der Chronologie.
         let Some(upos) = self.order.iter().enumerate().rev().find_map(|(i, id)| {
-            matches!(&self.events.get(id).map(|e| &e.kind), Some(EventKind::UserPrompt { .. }))
-                .then_some(i)
+            matches!(
+                &self.events.get(id).map(|e| &e.kind),
+                Some(EventKind::UserPrompt { .. })
+            )
+            .then_some(i)
         }) else {
             return; // keine Turns (z. B. nur manuelle /run) → Schätzung bleibt
         };
@@ -1006,11 +1012,27 @@ pub enum ToolKind {
         path: String,
         rows: Vec<crate::diff::DiffRow>,
     },
-    Read { path: String, range: String },
-    Grep { pattern: String, path: String, include: String, num_results:u32 },
-    Glob { pattern: String, num_results:u32 },
-    Webfetch { url: String, prompt: String },
-    Write {path: String },
+    Read {
+        path: String,
+        range: String,
+    },
+    Grep {
+        pattern: String,
+        path: String,
+        include: String,
+        num_results: u32,
+    },
+    Glob {
+        pattern: String,
+        num_results: u32,
+    },
+    Webfetch {
+        url: String,
+        prompt: String,
+    },
+    Write {
+        path: String,
+    },
 }
 
 // ── Projection: `api_messages` ────────────────────────────────────────────
@@ -1037,7 +1059,12 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
     let start = chat
         .order
         .iter()
-        .rposition(|id| matches!(chat.events.get(id).map(|ev| &ev.kind), Some(EventKind::Archive { .. })))
+        .rposition(|id| {
+            matches!(
+                chat.events.get(id).map(|ev| &ev.kind),
+                Some(EventKind::Archive { .. })
+            )
+        })
         .unwrap_or(0);
     let mut out = Vec::new();
     for id in &chat.order[start..] {
@@ -1162,7 +1189,13 @@ mod tests {
     #[test]
     fn api_messages_projiziert_user_und_assistant() {
         let mut chat = Chat::new();
-        chat.push_user_prompt("hallo".into(), Permission::Read, "m".into(), 0, Instant::now());
+        chat.push_user_prompt(
+            "hallo".into(),
+            Permission::Read,
+            "m".into(),
+            0,
+            Instant::now(),
+        );
         let aid = chat.open_assistant(None, String::new(), "hi".into(), Instant::now());
         chat.finalize_assistant(aid, Instant::now(), zero(), 0, 0, false);
 
@@ -1196,9 +1229,7 @@ mod tests {
         let sum_id = chat.order()[2];
         // Summary trägt die übergebene Token-Zahl.
         match &chat.event(sum_id).map(|e| &e.kind) {
-            Some(EventKind::Archive {
-                num_tokens, ..
-            }) => assert_eq!(*num_tokens, 42),
+            Some(EventKind::Archive { num_tokens, .. }) => assert_eq!(*num_tokens, 42),
             other => panic!("unerwartet: {other:?}"),
         }
         // previous_id-Verkettung: Summary hängt an b, c hängt an der Summary.
@@ -1225,7 +1256,12 @@ mod tests {
             0,
             Instant::now(),
         );
-        let aid = chat.open_assistant(Some(uid), "gedanke".into(), "antwort".into(), Instant::now());
+        let aid = chat.open_assistant(
+            Some(uid),
+            "gedanke".into(),
+            "antwort".into(),
+            Instant::now(),
+        );
         let tid = chat.open_tool(
             Some(aid),
             "call_1".into(),
@@ -1396,13 +1432,8 @@ mod tests {
     #[test]
     fn tool_output_ist_prompt_differenz_zur_total_der_vorrunde() {
         let mut chat = Chat::new();
-        let uid = chat.push_user_prompt(
-            "p".into(),
-            Permission::Read,
-            "m".into(),
-            0,
-            Instant::now(),
-        );
+        let uid =
+            chat.push_user_prompt("p".into(), Permission::Read, "m".into(), 0, Instant::now());
         // Runde A: reine Tool-Runde, prompt 100 + completion 60 = total 160.
         let a = chat.open_assistant(Some(uid), String::new(), String::new(), Instant::now());
         let t = chat.open_tool(
@@ -1472,13 +1503,8 @@ mod tests {
     #[test]
     fn tool_output_ohne_usage_der_vorrunde_fallt_auf_schaetzung_zurueck() {
         let mut chat = Chat::new();
-        let uid = chat.push_user_prompt(
-            "p".into(),
-            Permission::Read,
-            "m".into(),
-            0,
-            Instant::now(),
-        );
+        let uid =
+            chat.push_user_prompt("p".into(), Permission::Read, "m".into(), 0, Instant::now());
         // Runde A: Tool, aber KEIN Usage (Server liefert nichts) → Basis der
         // Differenz unbekannt, Schätzung bleibt (8 Zeichen ≈ 3 Tokens).
         let a = chat.open_assistant(Some(uid), String::new(), String::new(), Instant::now());

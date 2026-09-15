@@ -2,7 +2,8 @@
 //! vs **Responses API** (`/responses`, `input`).
 //!
 //! Beide sind Draht-inkompatible OpenAI-APIs; dieses Modul kümmert sich um
-//! - das Erkennen der richtigen Shape (Modell-Endpunkt-Probe + enger Fallback),
+//! - die Shape-Bestimmung (gecacht pro Endpunkt, sonst Default Chat Completions
+//!   + enger Fehler-Fallback),
 //! - den Request-Body in beiden Formaten,
 //! - das Lesen nicht-streamender Antworten in beiden Formaten.
 //!
@@ -46,15 +47,15 @@ impl ApiShape {
 }
 
 // ---------------------------------------------------------------------------
-// Shape-Erkennung (Probe über den Modell-Endpunkt, gecacht pro Endpunkt)
+// Shape-Bestimmung (gecacht pro Endpunkt, sonst Default Chat Completions)
 // ---------------------------------------------------------------------------
 
 /// Ergebnis der Shape-Erkennung.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShapeInfo {
     pub(crate) shape: ApiShape,
-    /// `true`, wenn die Shape aus Modell-Metadaten (oder einem bestätigten
-    /// Request) stammt; `false`, wenn sie nur ein Default ohne Signal ist.
+    /// `true`, wenn die Shape durch einen erfolgreichen Request bestätigt
+    /// wurde; `false`, wenn sie nur geraten (Default) ist.
     pub(crate) determined: bool,
 }
 
@@ -68,27 +69,17 @@ fn shape_cache() -> &'static Mutex<HashMap<(String, String), ShapeInfo>> {
 /// Ermittelt die API-Shape für einen Endpunkt (gecacht):
 ///
 /// 1. Cache-Treffer → sofort.
-/// 2. Probe `GET {base}/models/{model}` (bzw. `GET {base}/models`): Liefert der
-///    Server explizit `supports_responses` (bzw. `supported_uses` ⇒ responses)
-///    UND NICHT zugleich Chat Completions, wird Responses gewählt.
-/// 3. Alles andere (Feld fehlt / Probe schlägt fehl / OSS-Server) → Default
-///    Chat Completions (breiteste Kompatibilität) – mit `determined = false`,
-///    damit bei einem server-seitigen Fehler noch die andere Shape probiert
-///    werden kann.
-pub(crate) fn resolve_shape_info(
-    client: &reqwest::blocking::Client,
-    ep: &ResolvedEndpoint,
-) -> ShapeInfo {
+/// 2. Kein Cache-Eintrag → Default **Chat Completions** (breiteste
+///    Kompatibilität) – mit `determined = false`, damit bei einem
+///    server-seitigen Fehler noch die andere Shape probiert werden kann.
+pub(crate) fn resolve_shape_info(ep: &ResolvedEndpoint) -> ShapeInfo {
     let key = (ep.base_url.clone(), ep.api_model.clone());
     if let Some(info) = shape_cache().lock().ok().and_then(|m| m.get(&key).copied()) {
         return info;
     }
-    let info = match probe_shape(client, ep) {
-        Some(shape) => ShapeInfo { shape, determined: true },
-        None => ShapeInfo {
-            shape: ApiShape::ChatCompletions,
-            determined: false,
-        },
+    let info = ShapeInfo {
+        shape: ApiShape::ChatCompletions,
+        determined: false,
     };
     if let Ok(mut m) = shape_cache().lock() {
         m.insert(key, info);
@@ -101,7 +92,10 @@ pub(crate) fn resolve_shape_info(
 /// Requests gehen dann direkt in dieses Format, ohne erneut zu raten.
 pub(crate) fn remember_shape(ep: &ResolvedEndpoint, shape: ApiShape) {
     let key = (ep.base_url.clone(), ep.api_model.clone());
-    let info = ShapeInfo { shape, determined: true };
+    let info = ShapeInfo {
+        shape,
+        determined: true,
+    };
     if let Ok(mut m) = shape_cache().lock() {
         m.insert(key, info);
     }
@@ -113,7 +107,7 @@ pub(crate) fn remember_shape(ep: &ResolvedEndpoint, shape: ApiShape) {
 /// - **Eindeutiger Format-Fehler** (`looks_like_wrong_api`): explizites Signal
 ///   des Servers, dass er das andere Format will.
 /// - **Default ohne Signal + Server-Fehler (5xx)**: Wir haben nur geraten
-///   (keine Modell-Metadaten) und der Server antwortet generisch – dann kann
+///   (kein Bestätigung im Cache) und der Server antwortet generisch – dann kann
 ///   ein Responses-/Chat-Server dahinterstehen, der das gesendete Format nicht
 ///   kennt. Ein Versuch in der anderen Shape ist ein günstiger, einmaliger
 ///   Test. Bewusst NICHT bei Auth-/Rate-Limit-/bereits-eindeutigen Fehlern.
@@ -127,88 +121,6 @@ pub(crate) fn should_try_other_shape(
         return true;
     }
     !determined && status.is_server_error()
-}
-
-fn probe_shape(client: &reqwest::blocking::Client, ep: &ResolvedEndpoint) -> Option<ApiShape> {
-    let base = ep.base_url.trim_end_matches('/');
-
-    // 1) Single-Model-Abruf ist am genauesten.
-    let single_url = format!("{base}/models/{}", ep.api_model);
-    if let Some(v) = probe_one(client, ep, &single_url) {
-        return Some(v);
-    }
-    // 2) Fallback: Modell-Liste nach unserem Modell durchsuchen.
-    let list_url = format!("{base}/models");
-    if let Some(v) = probe_list(client, ep, &list_url) {
-        return Some(v);
-    }
-    None
-}
-
-fn probe_one(client: &reqwest::blocking::Client, ep: &ResolvedEndpoint, url: &str) -> Option<ApiShape> {
-    let resp = client
-        .get(url)
-        .bearer_auth(&ep.api_key)
-        .header("user-agent", &ep.user_agent)
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().ok()?;
-    decide_from_meta(&v)
-}
-
-fn probe_list(client: &reqwest::blocking::Client, ep: &ResolvedEndpoint, url: &str) -> Option<ApiShape> {
-    let resp = client
-        .get(url)
-        .bearer_auth(&ep.api_key)
-        .header("user-agent", &ep.user_agent)
-        .send()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let v: Value = resp.json().ok()?;
-    let data = v.get("data").and_then(|d| d.as_array())?;
-    let entry = data
-        .iter()
-        .find(|m| m.get("id").and_then(|i| i.as_str()) == Some(ep.api_model.as_str()))?;
-    decide_from_meta(entry)
-}
-
-/// Konservativ: Nur dann Responses, wenn die Modell-Metadaten das **explizit**
-/// sagen UND Chat Completions nicht ausdrücklich angegeben sind. Liefert
-/// `None`, wenn die Antwort KEINE Fähigkeitsangaben enthält (z. B. ein
-/// schlichter Modell-Listen-Eintrag ohne `supports_*`/`supported_uses`) – das
-/// bedeutet „unbekannt“ und aktiviert den Unknown-Fallback (5xx → andere API
-/// probieren), statt Chat als gesichert anzunehmen.
-fn decide_from_meta(v: &Value) -> Option<ApiShape> {
-    let supports_responses = v.get("supports_responses").and_then(|x| x.as_bool());
-    let supports_chat = v.get("supports_chat_completions").and_then(|x| x.as_bool());
-    let has_uses = v.get("supported_uses").is_some();
-    let used: Vec<&str> = v
-        .get("supported_uses")
-        .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
-        .unwrap_or_default();
-
-    // Keine einzige Fähigkeits-Angabe → unbekannt (kein eindeutiges Signal).
-    if supports_responses.is_none() && supports_chat.is_none() && !has_uses {
-        return None;
-    }
-
-    let uses_responses = used.contains(&"responses");
-    let uses_chat = used.iter().any(|u| *u == "chat.completions" || *u == "chat_completions");
-
-    if supports_responses == Some(true) && supports_chat == Some(false) {
-        return Some(ApiShape::Responses);
-    }
-    if uses_responses && !uses_chat {
-        return Some(ApiShape::Responses);
-    }
-    // Eindeutig Chat genannt (oder beides) → Chat Completions (Default).
-    Some(ApiShape::ChatCompletions)
 }
 
 /// Erkennt an der Roh-Fehlermeldung eines HTTP-Fehlers, dass der Endpunkt die
@@ -268,8 +180,12 @@ pub(crate) fn build_body(
     let base = ep.base_url.trim_end_matches('/');
     let url = format!("{base}{}", shape.endpoint_path());
     let body = match shape {
-        ApiShape::ChatCompletions => chat_body(ep, msgs, with_tools, permission, stream, max_output_tokens),
-        ApiShape::Responses => responses_body(ep, msgs, with_tools, permission, stream, max_output_tokens),
+        ApiShape::ChatCompletions => {
+            chat_body(ep, msgs, with_tools, permission, stream, max_output_tokens)
+        }
+        ApiShape::Responses => {
+            responses_body(ep, msgs, with_tools, permission, stream, max_output_tokens)
+        }
     };
     (url, body)
 }
@@ -650,7 +566,9 @@ mod tests {
         assert_eq!(u2.cached_tokens, Some(5));
 
         // Ohne usage → None (kein Fehl-/Null-Ereignis).
-        assert_eq!(parse_usage(&json!({"type":"response.output_text.delta"})), None);
+        assert_eq!(
+            parse_usage(&json!({"type":"response.output_text.delta"})),
+            None
+        );
     }
 }
-

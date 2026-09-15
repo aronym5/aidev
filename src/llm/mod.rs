@@ -3,7 +3,6 @@
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-
 /// Eine ausgeführte Werkzeug-Option – für den Abschluss im Event-Log.
 ///
 /// Trägt nur noch das, was das Event-Log beim Abschluss braucht: den vollen
@@ -250,9 +249,7 @@ pub(crate) use helpers::{
     civil_from_days, reasoning_contract_hint, server_error_summary, truncate, with_debug,
 };
 #[cfg(test)]
-pub(crate) use http::{
-    accumulate_sse_event, distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator,
-};
+pub(crate) use http::{distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator};
 #[cfg(test)]
 pub(crate) use tools_def::{apply_tool_delta, sanitize_arguments, tool_definitions, ToolCallAcc};
 #[cfg(test)]

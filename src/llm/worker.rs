@@ -240,10 +240,7 @@ pub fn spawn_worker(
                                 },
                             }
                         };
-                        let _ = tx.send(WorkerEvent::ToolEnd(
-                            session,
-                            tool_activity(&result),
-                        ));
+                        let _ = tx.send(WorkerEvent::ToolEnd(session, tool_activity(&result)));
                         round.push(WireMessage {
                             role: "tool".into(),
                             content: Some(result.text),
@@ -355,10 +352,7 @@ pub(crate) fn spawn_user_run(
             Some(&cancel),
         );
         sink.flush();
-        let _ = tx.send(WorkerEvent::ToolEnd(
-            session,
-            tool_activity(&result),
-        ));
+        let _ = tx.send(WorkerEvent::ToolEnd(session, tool_activity(&result)));
         let _ = tx.send(WorkerEvent::Done(session));
     })
 }

@@ -148,11 +148,7 @@ fn scroll_hint(range: &std::ops::Range<usize>, total: usize) -> String {
 
 /// Tasten-Hilfszeile – mit rechtsbündig angehängtem Scroll-Hinweis, falls
 /// übergeben und noch Platz vorhanden.
-fn footer_line(
-    bindings: &[(&str, &str)],
-    max_width: usize,
-    hint: Option<String>,
-) -> Line<'static> {
+fn footer_line(bindings: &[(&str, &str)], max_width: usize, hint: Option<String>) -> Line<'static> {
     let kh = key_help(bindings, max_width);
     let Some(h) = hint else {
         return kh;
@@ -239,7 +235,9 @@ pub(crate) fn draw_model_picker(f: &mut Frame, app: &mut App) {
     let extras: Vec<Line<'static>> = if picker.loading {
         vec![Line::from(Span::styled(
             " … fetching models …",
-            Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme().muted)
+                .add_modifier(Modifier::ITALIC),
         ))]
     } else {
         Vec::new()
@@ -293,7 +291,11 @@ fn model_picker_row(display: &str, cursor: bool, status_color: Option<Color>) ->
         Some((m, d)) => (m.trim_end(), Some(d)),
         None => (display, None),
     };
-    let base_fg = if display == "(default)" { theme().muted } else { theme().highlight };
+    let base_fg = if display == "(default)" {
+        theme().muted
+    } else {
+        theme().highlight
+    };
     let gray = Style::default().fg(theme().muted);
     // Nur das "provider/alias"-Kürzel ist der markierte Text; ein dahinter-
     // stehender Modellname in Klammern und die Demand-Angabe sind grau.
@@ -341,7 +343,9 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     };
 
     // Spalten-Header
-    let header_style = Style::default().fg(theme().muted).add_modifier(Modifier::BOLD);
+    let header_style = Style::default()
+        .fg(theme().muted)
+        .add_modifier(Modifier::BOLD);
     let tunnel_header = Line::from(Span::styled(
         format!(" {:<width$}", "Tunnel", width = tunnel_w as usize - 1),
         header_style,
@@ -406,7 +410,10 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     }
     // Lade-Indikator solange Podman-Images noch nicht geladen sind
     let tunnel_extra = if !builder.images_loaded {
-        Some(Line::from(Span::styled("  …", Style::default().fg(theme().muted))))
+        Some(Line::from(Span::styled(
+            "  …",
+            Style::default().fg(theme().muted),
+        )))
     } else {
         None
     };
@@ -539,7 +546,9 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     // Titel
     let title = Line::from(Span::styled(
         " New channel ",
-        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme().accent)
+            .add_modifier(Modifier::BOLD),
     ));
 
     // Spalten-Inhalte: Titel über den Spalten (Platz ist reserviert:
@@ -690,15 +699,7 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
             let edit_row = cols[1].y + 1 + builder.host_paths.items.len() as u16 + 1;
             let entry_y = edit_row.min(footer_y.saturating_sub(2));
             if entry_y + 1 < footer_y {
-                draw_builder_input_inline(
-                    f,
-                    input_x,
-                    entry_y,
-                    input_w,
-                    editor,
-                    "Add path",
-                    None,
-                );
+                draw_builder_input_inline(f, input_x, entry_y, input_w, editor, "Add path", None);
             }
         }
         Some(BuilderEdit::Branch(editor)) => {
@@ -744,7 +745,9 @@ fn draw_builder_input_inline(
     // Label
     let label = Line::from(Span::styled(
         format!(" {label}:"),
-        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme().accent)
+            .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(
         Paragraph::new(label).style(Style::default().bg(theme().status_bg)),
@@ -757,7 +760,7 @@ fn draw_builder_input_inline(
         width: content_width + indent,
         indent,
         content: content_width,
-        ranges: vec![0..editor.text().len()],
+        ranges: std::iter::once(0..editor.text().len()).collect(),
         total: editor.text().len(),
     };
 
@@ -840,7 +843,11 @@ pub(crate) fn channel_picker_row(
         if status.is_some() { "⬢" } else { " " },
         Style::default().fg(status.map(channel_status_color).unwrap_or(theme().muted)),
     );
-    let base_fg = if name == "(kein Kanal)" { theme().muted } else { theme().highlight };
+    let base_fg = if name == "(kein Kanal)" {
+        theme().muted
+    } else {
+        theme().highlight
+    };
     let extra = if usage.is_empty() {
         Vec::new()
     } else {
@@ -866,11 +873,7 @@ pub(crate) fn channel_picker_new_channel_row(cursor: bool) -> Line<'static> {
 
 /// Kurzer Hinweis, welche Sessions einen Kanal gerade nutzen – für die
 /// Anzeige im Channel-Picker (z. B. „ · Session 1, 3 (aktiv)").
-fn channel_usage(
-    sessions: &[Session],
-    channels: &ChannelRegistry,
-    name: &str,
-) -> String {
+fn channel_usage(sessions: &[Session], channels: &ChannelRegistry, name: &str) -> String {
     let mut nums: Vec<usize> = Vec::new();
     let mut active = false;
     for (i, s) in sessions.iter().enumerate() {
@@ -882,7 +885,10 @@ fn channel_usage(
             == Some(name);
         if matches {
             nums.push(i + 1);
-            if s.phase == Phase::WaitingForLLM || s.phase == Phase::WaitingForTool || !s.open_tool_ids.is_empty() {
+            if s.phase == Phase::WaitingForLLM
+                || s.phase == Phase::WaitingForTool
+                || !s.open_tool_ids.is_empty()
+            {
                 active = true;
             }
         }
@@ -1317,7 +1323,9 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
             )),
             Line::from(Span::styled(
                 format!("   {}", d.label),
-                Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme().muted)
+                    .add_modifier(Modifier::ITALIC),
             )),
             Line::from(Span::raw(" ")),
         ];
@@ -1327,13 +1335,14 @@ pub(crate) fn draw_confirmation(f: &mut Frame, app: &App) {
         confirmation_dialog(f, "Run command?", theme().err, lines, &EXEC_KEYS);
     }
     if let Some(d) = &app.options_dialog {
+        let version_label = format!("Version: {}", crate::config::VERSION);
         let mouse_label = if app.mouse_enabled {
             "Mouse capture: ON"
         } else {
             "Mouse capture: OFF"
         };
         let status_label = format!("Model: {}", app.display_model(app.active),);
-        let options = [mouse_label, &status_label];
+        let options = [&version_label, mouse_label, &status_label];
         let mut lines = vec![Line::from(Span::raw(" "))];
         for (i, text) in options.iter().enumerate() {
             lines.push(option_row(text, d.nav.cursor() == i));
@@ -1362,7 +1371,9 @@ pub(crate) fn draw_http_headers_dialog(f: &mut Frame, app: &App) {
         _ => {
             lines.push(Line::from(Span::styled(
                 " (no HTTP response captured yet for this session)",
-                Style::default().fg(theme().muted).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme().muted)
+                    .add_modifier(Modifier::ITALIC),
             )));
         }
     }
