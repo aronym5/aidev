@@ -56,7 +56,7 @@ fn tool_definitions_enthalten_alle_werkzeuge() {
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
         .collect();
-    for want in ["grep", "read", "glob", "webfetch", "write", "run", "edit"] {
+    for want in ["grep", "read", "glob", "webfetch", "write", "bash", "edit"] {
         assert!(names.contains(&want), "Werkzeug fehlt: {want}");
     }
 }
@@ -76,7 +76,7 @@ fn tool_definitions_folgen_der_berechtigung() {
     );
     assert_eq!(
         defs(Permission::Execute),
-        ["grep", "read", "glob", "webfetch", "edit", "write", "run"]
+        ["grep", "read", "glob", "webfetch", "edit", "write", "bash"]
     );
 }
 

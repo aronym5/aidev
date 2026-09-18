@@ -12,7 +12,7 @@ pub enum Permission {
     Read,
     /// Zusätzlich `write` und `edit`.
     Write,
-    /// Zusätzlich `run` – volle Werkzeugmenge (Default beim Podman-Kanal).
+    /// Zusätzlich `bash` – volle Werkzeugmenge (Default beim Podman-Kanal).
     Execute,
 }
 
@@ -22,7 +22,7 @@ impl Permission {
         match self {
             Permission::Read => &["grep", "read", "glob", "webfetch"],
             Permission::Write => &["grep", "read", "glob", "webfetch", "write", "edit"],
-            Permission::Execute => &["grep", "read", "glob", "webfetch", "write", "edit", "run"],
+            Permission::Execute => &["grep", "read", "glob", "webfetch", "write", "edit", "bash"],
         }
     }
 
@@ -34,7 +34,7 @@ impl Permission {
     /// Mindest-Berechtigung, die ein Werkzeug benötigt.
     pub fn required_for(tool: &str) -> Permission {
         match tool {
-            "run" => Permission::Execute,
+            "bash" => Permission::Execute,
             "write" | "edit" => Permission::Write,
             _ => Permission::Read,
         }

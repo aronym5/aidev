@@ -400,7 +400,7 @@ fn def_tool_line(width: usize) -> ChatBlock {
 /// Tool-Name eines `ToolKind` (für `tool_icon`/`tool_color`).
 fn tool_kind_name(kind: &ToolKind) -> &'static str {
     match kind {
-        ToolKind::Run { .. } => "run",
+        ToolKind::Run { .. } => "bash",
         ToolKind::Edit { .. } => "edit",
         ToolKind::Read { .. } => "read",
         ToolKind::Write { .. } => "write",
@@ -727,7 +727,7 @@ pub(crate) fn build_live_blocks(
                 let out = ev_tool_output(ev);
                 if view.is_overview() {
                     let est = estimate_tokens(&label) + estimate_tokens(out);
-                    live_ctx.add_tool("run", est);
+                    live_ctx.add_tool("bash", est);
                     live_ctx.block_sum += est;
                     live_ctx.add_used(est);
                     blocks.push(overview_active_tool_line(&label, width, &live_ctx, window));
@@ -769,7 +769,7 @@ fn ev_tool_label(ev: &ChatEvent, s: &Session) -> String {
         return l.clone();
     }
     let EventKind::Tool { kind, .. } = &ev.kind else {
-        return "run".into();
+        return "bash".into();
     };
     tool_kind_label(kind)
 }
@@ -915,7 +915,7 @@ pub(crate) fn tool_name(label: &str) -> &str {
 /// zurück.
 pub(crate) fn tool_icon(tool: &str) -> &'static str {
     match tool {
-        "run" => "⚙",
+        "bash" => "⚙",
         "read" => "←",
         "write" => "→",
         "edit" => "✎",
@@ -931,7 +931,7 @@ pub(crate) fn tool_icon(tool: &str) -> &'static str {
 /// glob (grün) und webfetch (violett). Unbekanntes fällt auf theme().muted zurück.
 pub(crate) fn tool_color(tool: &str) -> Color {
     match tool {
-        "run" => Color::Rgb(232, 138, 138),
+        "bash" => Color::Rgb(232, 138, 138),
         "read" => Color::Rgb(121, 182, 242),
         "write" | "edit" => Color::Rgb(238, 198, 93),
         "grep" => Color::Rgb(94, 200, 186),
@@ -952,7 +952,7 @@ fn tool_rank(tool: &str) -> usize {
         "grep" => 2,
         "read" => 3,
         "write" | "edit" => 4,
-        "run" => 5,
+        "bash" => 5,
         _ => 6,
     }
 }

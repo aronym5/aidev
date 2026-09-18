@@ -699,7 +699,7 @@ pub(crate) fn tool_kind_from_activity(
             .to_string()
     };
     match name {
-        "run" => ToolKind::Run {
+        "bash" => ToolKind::Run {
             cwd: a.run.as_ref().map(|r| r.cwd.clone()).unwrap_or_default(),
             command: a
                 .run

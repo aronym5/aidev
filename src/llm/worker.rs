@@ -174,14 +174,14 @@ pub fn spawn_worker(
                         // gefilterten Definitionen hinaus aufgerufenes Werkzeug
                         // wird abgewiesen, ohne den Kanal zu berühren.
                         let allowed = permission.allows(&t.name);
-                        // Local-Kanal + `run` im ConfirmEach-Modus: vor der
+                        // Local-Kanal + `bash` im ConfirmEach-Modus: vor der
                         // Ausführung einzeln beim User nachfragen. Der Worker
                         // blockiert, bis die UI über den Reply-Kanal antwortet
                         // (oder der Sender weggefallen ist → ablehnen).
                         let confirmed = if allowed {
                             match live_ch.as_deref() {
                                 Some(ch)
-                                    if t.name == "run"
+                                    if t.name == "bash"
                                         && ch.kind() == ChannelKind::Local
                                         && local_exec_mode == LocalExecMode::ConfirmEach =>
                                 {
@@ -328,7 +328,7 @@ pub(crate) fn spawn_user_run(
         }
         let inv = ToolInvocation {
             id: "user_run".to_string(),
-            name: "run".to_string(),
+            name: "bash".to_string(),
             // Der manuelle `/run`-Weg liefert den kompletten Shell-Ausdruck als
             // `command` – identisch zum Modell-Tool, daher läuft er über dieselbe
             // Shell-Auswertung (`shell -c`).

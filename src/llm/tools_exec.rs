@@ -281,7 +281,7 @@ pub(crate) fn run_tool_live(
                 ..Default::default()
             })
         }
-        "run" => {
+        "bash" => {
             // Das Modell liefert den kompletten Shell-Ausdruck als `command` –
             // mit voller Shell-Auswertung (Pipes, Umleitungen, Variablen,
             // Verkettungen, Logik).
@@ -408,7 +408,7 @@ pub(crate) fn tool_label(t: &ToolInvocation) -> String {
     let args: Vec<String> = match t.name.as_str() {
         "grep" | "glob" => brief("pattern").map(|q| vec![q]).unwrap_or_default(),
         "read" | "write" | "edit" => brief("path").map(|p| vec![p]).unwrap_or_default(),
-        "run" => brief("command").map(|c| vec![c]).unwrap_or_default(),
+        "bash" => brief("command").map(|c| vec![c]).unwrap_or_default(),
         "webfetch" => {
             // Host (+ Pfadanfang) der URL plus gekürzter Prompt – so sieht
             // der User im Verlauf, WOHIN und WOZU abgerufen wurde.

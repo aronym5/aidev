@@ -95,8 +95,8 @@ pub(crate) fn tool_definitions(permission: Permission) -> Vec<Value> {
             },"required":["path","content"]}),
         ),
         tool(
-            "run",
-            "Runs a shell command in your working directory with full shell (bash if available, else sh) evaluation (pipes, redirections, variables, chaining like \"&&\"/\";\" and logic).",
+            "bash",
+            "Runs a shell command in your working directory via bash (fallback sh) with full shell evaluation (pipes, redirections, variables, chaining like \"&&\"/\";\" and logic).",
             json!({"type":"object","properties":{
                 "command":{"type":"string","description":"Full shell expression, e.g. \"cargo build -j2 && cargo test\"."}
             },"required":["command"]}),

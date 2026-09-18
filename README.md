@@ -39,11 +39,11 @@ curl -sSL https://aronym5.github.io/aidev/install.sh | sh
 aidev is a full-screen chat harness for driving a coding model against a real project.
 Each conversation ("session") lives in its own tab and can be bound to a **channel** — a
 sandboxed working directory with a shell. From that point the model can invoke tools
-(`grep`, `glob`, `read`, `webfetch`, `edit`, `write`, `run`), every call gated by the
+(`grep`, `glob`, `read`, `webfetch`, `edit`, `write`, `bash`), every call gated by the
 permission you grant for that turn.
 
 - Markdown rendering — bold, inline code, lists, and fenced code with syntax highlighting.
-- Tool calls and their results are logged inline; `run`/`edit` produce console/diff boxes with
+- Tool calls and their results are logged inline; `bash`/`edit` produce console/diff boxes with
   live progress.
 - Streaming answers, context-length handling, and automatic retries with backoff.
 - Full-screen TUI: status line, tab bar, channel indicator, and a zoomable overview ↔ dialog
@@ -104,7 +104,7 @@ execute). The levels build on each other:
 |-----------|----------------------------------------|
 | `read`    | `grep`, `glob`, `read`, `webfetch`     |
 | `write`   | + `write`, `edit`                      |
-| `execute` | + `run`                                |
+| `execute` | + `bash`                              |
 
 The prompt, input, and sent message are tinted by the permission color. Local channels
 default to `read`, podman channels to `execute`; your last choice is remembered.

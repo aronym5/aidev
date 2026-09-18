@@ -1068,7 +1068,7 @@ fn tool_kind_detail_baut_kompakte_kurzform_aus_strukturierten_feldern() {
             command: "cargo test".into(),
             exit_code: None,
         }),
-        "⚙ run cargo test"
+        "⚙ bash cargo test"
     );
 }
 
