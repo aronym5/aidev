@@ -253,6 +253,8 @@ pub(crate) use http::{distribute_weights, parse_usage, retry_delay, RoundPartsAc
 #[cfg(test)]
 pub(crate) use tools_def::{apply_tool_delta, sanitize_arguments, tool_definitions, ToolCallAcc};
 #[cfg(test)]
+pub(crate) use tools_def::dummy_tool;
+#[cfg(test)]
 pub(crate) use wire::ensure_reasoning_for_tool_calls;
 
 #[cfg(test)]

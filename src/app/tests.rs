@@ -25,6 +25,7 @@ fn test_provider(base_url: &str) -> HashMap<String, ProviderConfig> {
             base_url: base_url.to_string(),
             api_key: Some("x".into()),
             user_agent: None,
+            force_tools: Vec::new(),
         },
     );
     m
@@ -761,6 +762,7 @@ fn should_compact_verwendet_nach_compaction_nicht_altes_usage() {
         api_key: "x".into(),
         user_agent: String::new(),
         context_window: 200_000,
+        force_tools: Vec::new(),
     };
     let mut s = Session::new(0);
     let usage = |p: u64, c: u64| llm::Usage {

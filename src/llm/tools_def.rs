@@ -33,15 +33,24 @@ pub(crate) const MAX_GREP_CONTEXT: usize = 10;
 /// Provider-Kontext). Die eigentlichen LLM-API-Requests (Chat + Kompaktierung)
 /// verwenden den provider-spezifischen User-Agent aus der Config
 /// (`ResolvedEndpoint::user_agent`).
-pub(crate) const USER_AGENT: &str =
-    "opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+pub(crate) const USER_AGENT: &str = crate::config::AIDEV_USER_AGENT;
 
 /// Beschreibt die Werkzeuge, die das Modell über den Kanal aufrufen darf.
-/// Nur gesendet, wenn die Session einen Kanal gebunden hat; gefiltert nach der
-/// gewählten Berechtigung (`Permission::tools`) – so bekommt das Modell bei
-/// `read` nur `grep`/`read`/`glob`/`webfetch` zu sehen.
-pub(crate) fn tool_definitions(permission: Permission) -> Vec<Value> {
-    vec![
+/// Nur gesendet, wenn die Session einen Kanal gebunden hat (oder der Provider
+/// `force_tools` gesetzt hat); gefiltert nach der gewählten Berechtigung
+/// (`Permission::tools`) – so bekommt das Modell bei `read` nur
+/// `grep`/`read`/`glob`/`webfetch` zu sehen.
+///
+/// Tools aus `force_tools`, die nicht bereits durch die Berechtigung abgedeckt
+/// sind, werden als minimalistische Dummy-Definitionen angeboten (Name +
+/// erforderlicher Parameter + Hinweis "disabled"). Ein Aufruf eines solchen
+/// Dummy-Tools wird in der Ausführung mit einer Fehlermeldung abgelehnt.
+pub(crate) fn tool_definitions(
+    permission: Permission,
+    force_tools: &[String],
+) -> Vec<Value> {
+    let allowed: Vec<&str> = permission.tools().iter().copied().collect();
+    let mut tools: Vec<Value> = vec![
         tool(
             "grep",
             "Full-text search in the project via ripgrep. With content>0 (default 1) it adds N context lines around each match as raw match output. content=0 returns per file only the match count (\"path:count\"). Use include to filter by file pattern.",
@@ -108,11 +117,45 @@ pub(crate) fn tool_definitions(permission: Permission) -> Vec<Value> {
             .as_str()
             .is_some_and(|name| permission.allows(name))
     })
-    .collect()
+    .collect();
+
+    // Force-Tools hinzufügen, die nicht bereits durch die Berechtigung
+    // abgedeckt sind – als minimalistische Dummy-Definitionen.
+    for ft in force_tools {
+        if !allowed.iter().any(|a| *a == ft.as_str()) {
+            tools.push(dummy_tool(ft));
+        }
+    }
+
+    tools
 }
 
 pub(crate) fn tool(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
+}
+
+/// Erzeugt eine minimalistische Dummy-Tool-Definition für ein nicht-permissions-
+/// erlaubtes Tool, das per `force_tools` immer angeboten werden soll. Die
+/// Definition enthält nur den Funktionsnamen, einen nicht-optionalen Parameter
+/// und einen Hinweis, dass das Tool deaktiviert ist.
+pub(crate) fn dummy_tool(name: &str) -> Value {
+    let (param_name, param_desc) = match name {
+        "read" => ("path", "Path to read"),
+        "bash" => ("command", "Shell command to execute"),
+        "edit" => ("path", "Path to edit"),
+        "write" => ("path", "Path to write"),
+        "grep" => ("pattern", "Search pattern"),
+        "glob" => ("pattern", "Glob pattern"),
+        "webfetch" => ("url", "URL to fetch"),
+        _ => ("input", "Input parameter"),
+    };
+    tool(
+        name,
+        "This tool is disabled.",
+        json!({"type":"object","properties":{
+            param_name: {"type":"string","description": param_desc}
+        }, "required": [param_name]}),
+    )
 }
 
 /// Akkumulierter Werkzeug-Aufruf aus den `delta.tool_calls`-Fragmenten.

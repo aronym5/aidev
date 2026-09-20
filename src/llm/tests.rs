@@ -51,7 +51,7 @@ fn mehrere_tool_indizes_werden_getrennt_gesammelt() {
 
 #[test]
 fn tool_definitions_enthalten_alle_werkzeuge() {
-    let defs = tool_definitions(Permission::Execute);
+    let defs = tool_definitions(Permission::Execute, &[]);
     let names: Vec<&str> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
@@ -64,7 +64,7 @@ fn tool_definitions_enthalten_alle_werkzeuge() {
 #[test]
 fn tool_definitions_folgen_der_berechtigung() {
     let defs = |p: Permission| {
-        tool_definitions(p)
+        tool_definitions(p, &[])
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
             .collect::<Vec<String>>()
@@ -87,6 +87,150 @@ fn sanitize_arguments_normalisiert_auf_gueltiges_json() {
     // Ungültiges/leeres → {} (keine naive Quote-Umschreibung).
     assert_eq!(sanitize_arguments(""), "{}");
     assert_eq!(sanitize_arguments("{'path':'Cargo.toml'}"), "{}");
+}
+
+// ── Force-Tools (tools_def) ────────────────────────────────────────────────
+
+#[test]
+fn tool_definitions_mit_force_tools_fuegt_dummies_hinzu() {
+    // Bei Read-Permission: read ist erlaubt, bash nicht → bash als Dummy.
+    let defs = tool_definitions(Permission::Read, &["read".into(), "bash".into()]);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    // read ist ein normales (vollständiges) Tool.
+    assert!(names.contains(&"read"), "read muss als normales Tool vorhanden sein");
+    // bash ist als Dummy vorhanden.
+    assert!(names.contains(&"bash"), "bash muss als Dummy vorhanden sein");
+    // grep/glob/webfetch sind ebenfalls vorhanden (Permission::Read).
+    assert!(names.contains(&"grep"));
+    assert!(names.contains(&"glob"));
+    assert!(names.contains(&"webfetch"));
+    // write/edit sind NICHT vorhanden (keine Write-Permission, kein force_tools).
+    assert!(!names.contains(&"write"));
+    assert!(!names.contains(&"edit"));
+}
+
+#[test]
+fn tool_definitions_force_tools_bereits_erlaubt_kein_duplikat() {
+    // Bei Execute-Permission: bash ist bereits erlaubt → kein Dummy.
+    let defs = tool_definitions(Permission::Execute, &["bash".into()]);
+    let bash_count = defs
+        .iter()
+        .filter(|d| d["function"]["name"].as_str() == Some("bash"))
+        .count();
+    assert_eq!(bash_count, 1, "bash darf nur EINMAL vorkommen (nicht als Dummy)");
+}
+
+#[test]
+fn tool_definitions_ohne_force_tools_gleich_wie_bisher() {
+    // Ohne force_tools: identisches Verhalten wie vorher.
+    let defs = tool_definitions(Permission::Read, &[]);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["grep", "read", "glob", "webfetch"]);
+}
+
+#[test]
+fn dummy_tool_hat_minimale_definion_mit_pflichtparameter() {
+    let d = super::dummy_tool("bash");
+    assert_eq!(d["function"]["name"], "bash");
+    assert_eq!(d["function"]["description"], "This tool is disabled.");
+    // required-Array muss den Parameter enthalten.
+    let required = d["function"]["parameters"]["required"]
+        .as_array()
+        .expect("required ist ein Array");
+    assert_eq!(required.len(), 1);
+    assert_eq!(required[0], "command");
+    // Properties muss den Parameter enthalten.
+    let props = d["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("properties ist ein Objekt");
+    assert!(props.contains_key("command"));
+}
+
+#[test]
+fn config_parse_force_tools_aus_toml() {
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [provider.test]
+        base_url = "https://example.com/v1"
+        force_tools = ["read", "bash"]
+        "#,
+    )
+    .expect("TOML lesbar");
+    let p = &cfg.provider["test"];
+    assert_eq!(p.force_tools, vec!["read", "bash"]);
+}
+
+#[test]
+fn config_parse_force_tools_default_ist_leer() {
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        [provider.test]
+        base_url = "https://example.com/v1"
+        "#,
+    )
+    .expect("TOML lesbar");
+    let p = &cfg.provider["test"];
+    assert!(p.force_tools.is_empty(), "Default muss leer sein");
+}
+
+#[test]
+fn resolved_endpoint_uebernimmt_force_tools() {
+    let cfg: crate::config::Config = toml::from_str(
+        r#"
+        model = "test/m"
+
+        [provider.test]
+        base_url = "https://example.com/v1"
+        force_tools = ["read", "bash"]
+        "#,
+    )
+    .expect("TOML lesbar");
+    let ep = cfg.resolve(None).expect("resolve");
+    assert_eq!(ep.force_tools, vec!["read", "bash"]);
+}
+
+#[test]
+fn default_provider_zen_hat_force_tools() {
+    let cfg = crate::config::Config::default();
+    let zen = cfg.provider.get("zen").expect("zen-Provider");
+    assert_eq!(zen.force_tools, vec!["read", "bash"]);
+}
+
+#[test]
+fn tool_definitions_alle_force_tools_als_dummies() {
+    // Read-Permission + alle 7 Tools als force → write/edit/bash als Dummies.
+    let force: Vec<String> = ["read", "bash", "write", "edit", "grep", "glob", "webfetch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let defs = tool_definitions(Permission::Read, &force);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    // Alle 7 müssen vorhanden sein.
+    assert_eq!(names.len(), 7);
+    for want in &["grep", "read", "glob", "webfetch", "write", "edit", "bash"] {
+        assert!(names.contains(want), "{want} fehlt");
+    }
+    // Die 3 nicht-permissions-erlaubten müssen Dummies sein (Beschreibung = "disabled").
+    for dummy_name in &["write", "edit", "bash"] {
+        let d = defs
+            .iter()
+            .find(|d| d["function"]["name"].as_str() == Some(*dummy_name))
+            .expect(&format!("{dummy_name} muss vorhanden sein"));
+        assert_eq!(
+            d["function"]["description"].as_str(),
+            Some("This tool is disabled."),
+            "{dummy_name} muss Dummy-Beschreibung haben"
+        );
+    }
 }
 
 // ── Wire-Verträge (wire) ──────────────────────────────────────────────────
@@ -382,6 +526,7 @@ fn test_config(base_url: &str) -> Config {
             base_url: base_url.to_string(),
             api_key: Some("test".into()),
             user_agent: None,
+            force_tools: Vec::new(),
         },
     );
     Config {

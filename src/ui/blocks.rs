@@ -248,7 +248,7 @@ pub(crate) fn build_history_cache(
                                 );
                                 blocks.push(overview_tool_line_chat(tev, width, &mut ctx, window));
                             } else {
-                                blocks.push(tool_block_chat(tev, width, view.boxes_open()));
+                                blocks.push(tool_block_chat(tev, width, view));
                             }
                         }
                     }
@@ -273,7 +273,7 @@ pub(crate) fn build_history_cache(
                 if view.is_overview() {
                     blocks.push(overview_tool_line_chat(ev, width, &mut ctx, window));
                 } else {
-                    blocks.push(tool_block_chat(ev, width, view.boxes_open()));
+                    blocks.push(tool_block_chat(ev, width, view));
                 }
             }
             EventKind::Archive {
@@ -523,28 +523,146 @@ fn tool_kind_row(kind: &ToolKind, width: usize) -> ChatBlock {
     }
 }
 
+/// Kompakte Spaltenansicht der grep/glob-Vorkommen im Detail-Modus.
+/// Zeigt das Label (z. B. `⌕ grep "TODO" src - 5 results`) und darunter
+/// sämtliche Treffer in mehreren Spalten, falls der Platz reicht. Jeder
+/// Eintrag bleibt auf einer physischen Zeile (kein Umbruch).
+fn grep_result_block(kind: &ToolKind, output: &str, width: usize) -> ChatBlock {
+    let label = tool_kind_detail(kind);
+    let color = tool_color(tool_kind_name(kind));
+    let color_style = Style::default().fg(color);
+
+    // Nicht-leere Zeilen extrahieren (leere Abschlusszeilen filtern).
+    let entries: Vec<&str> = output.lines().filter(|l| !l.is_empty()).collect();
+
+    let pad = " ".repeat(PAD);
+    let budget = width.saturating_sub(PAD + PAD_R).max(1);
+
+    // Ohne Einträge → nur das Label (Einzeiler).
+    if entries.is_empty() {
+        let line = Line::from(Span::styled(
+            format!("{pad}{label}"),
+            color_style,
+        ));
+        return ChatBlock {
+            lines: wrap_block(&[line], width, PAD),
+            bg: None,
+            gap: 0,
+            is_tool: true,
+        };
+    }
+
+    // Maximale Display-Breite eines Eintrags (für die Spaltenbreite).
+    let max_w = entries
+        .iter()
+        .map(|e| e.chars().map(char_w).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    // Spaltenbreite: Maximalwert, aber nicht breiter als der verfügbare Platz.
+    let col_w = max_w.min(budget);
+    // Spaltenanzahl: wie oft passen col_w + Lücke in den verfügbaren Platz?
+    const COL_GAP: usize = 2;
+    let cols = if col_w + COL_GAP >= budget {
+        1
+    } else {
+        (budget + COL_GAP) / (col_w + COL_GAP)
+    }
+    .max(1)
+    .min(entries.len());
+
+    // Zeilen aufbauen: erst Label, dann Einträge in Spalten.
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(1 + entries.len().div_ceil(cols));
+
+    lines.push(Line::from(Span::styled(
+        format!("{pad}{label}"),
+        color_style,
+    )));
+
+    let rows = entries.len().div_ceil(cols);
+    for row in 0..rows {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols * 2);
+        spans.push(Span::raw(pad.clone()));
+        for col in 0..cols {
+            let idx = row + col * rows;
+            if idx < entries.len() {
+                let cell = truncate_to_width(entries[idx], col_w);
+                // Auf Spaltenbreite auffüllen (außer in der letzten Spalte).
+                let cell_w: usize = cell.chars().map(char_w).sum();
+                if col < cols - 1 && cell_w < col_w {
+                    let padded = format!("{cell}{}", " ".repeat(col_w - cell_w));
+                    spans.push(Span::styled(padded, Style::default()));
+                } else {
+                    spans.push(Span::styled(cell, Style::default()));
+                }
+            }
+            if col < cols - 1 {
+                spans.push(Span::raw(" ".repeat(COL_GAP)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    ChatBlock {
+        lines,
+        bg: None,
+        gap: 0,
+        is_tool: true,
+    }
+}
+
+/// Kürzt einen String auf `max_w` Display-Zellen; hängt `…` an, wenn
+/// abgeschnitten wird. Für die Spalten-Anzeige der grep/glob-Ergebnisse.
+fn truncate_to_width(s: &str, max_w: usize) -> String {
+    // Prüfe ob der String passt.
+    let total_w: usize = s.chars().map(char_w).sum();
+    if total_w <= max_w {
+        return s.to_string();
+    }
+    // Zu lang: auf max_w − 1 Zeichen kürzen und `…` anhängen.
+    let budget = max_w.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let cw = char_w(c);
+        if used + cw > budget {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
 /// Zeigt ein abgeschlossenes Tool-Event im Detail-Modus. `run` mit Ausgabe
 /// bekommt eine Konsolen-Box (Kopf: `⚙ run <kommando>`); ab dem Dialog-Level
-/// (Detailed/Dialog) `edit` die Diff-Box aus `diff_block`; alle anderen
-/// Kategorien einen Log-Einzeiler aus `tool_kind_detail`.
-fn tool_block_chat(ev: &ChatEvent, width: usize, run_open: bool) -> ChatBlock {
+/// (Detailed/Dialog) `edit` die Diff-Box aus `diff_block`; grep/glob im
+/// Detail-Modus zeigen sämtliche Vorkommen in kompakter Spaltenansicht;
+/// alle anderen Kategorien einen Log-Einzeiler aus `tool_kind_detail`.
+fn tool_block_chat(ev: &ChatEvent, width: usize, view: ViewLevel) -> ChatBlock {
     let EventKind::Tool { output, kind, .. } = &ev.kind else {
         return def_tool_line(width);
     };
     match kind {
         ToolKind::Run { .. } if !output.trim().is_empty() => {
-            live_run_block(&tool_kind_label(kind), output, width, run_open, false)
+            live_run_block(&tool_kind_label(kind), output, width, view.boxes_open(), false)
         }
         // Ab dem Dialog-Level (Detailed/Dialog) → die Diff-Box aus `diff_block`;
         // Compact bleibt die Einzeiler-Zusammenfassung (`✎ edit <pfad> +N -M`).
-        ToolKind::Edit { path, rows } if run_open => {
+        ToolKind::Edit { path, rows } if view.boxes_open() => {
             let diff = crate::diff::DiffInfo {
                 path: path.clone(),
                 rows: rows.clone(),
             };
             // Im neuen Event-Log ist der Erfolg (`ok`) nicht persistiert; ein
             // Edit mit Diff-Zeilen ist in der Praxis erfolgreich ausgeführt.
-            diff_block(&tool_kind_label(kind), true, &diff, width, run_open)
+            diff_block(&tool_kind_label(kind), true, &diff, width, view.boxes_open())
+        }
+        // grep/glob im Detail-Modus: alle Vorkommen in kompakter Spaltenansicht.
+        ToolKind::Grep { .. } | ToolKind::Glob { .. }
+            if view == ViewLevel::Detailed && !output.trim().is_empty() =>
+        {
+            grep_result_block(kind, output, width)
         }
         _ => tool_kind_row(kind, width),
     }
@@ -716,7 +834,7 @@ pub(crate) fn build_live_blocks(
                                 live_ctx.add_used(num_tokens_input + num_tokens_output);
                             }
                         } else {
-                            blocks.push(tool_block_chat(tev, width, view.boxes_open()));
+                            blocks.push(tool_block_chat(tev, width, view));
                         }
                     }
                 }

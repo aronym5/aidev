@@ -3,7 +3,7 @@
 //! bewusst nicht mehr eingehend getestet – sie ändert sich noch (siehe Plan).
 
 use super::*;
-use crate::app::Session;
+use crate::app::{Session, ViewLevel};
 use crate::chat::EventKind;
 use crate::llm::Usage;
 use crate::perm::Permission;
@@ -1225,5 +1225,227 @@ fn gedanken_detail_voller_text_mit_ikon_nur_in_erster_zeile() {
     assert!(
         repr.iter().any(|l| l.contains("Detailansicht")),
         "voller Text bleibt: {repr:?}"
+    );
+}
+
+// ── grep/glob Detail-Spaltenansicht ────────────────────────────────────────
+
+/// Detail-Modus für grep: Vorkommen werden in kompakter Spaltenansicht
+/// statt nur als "N results" angezeigt.
+#[test]
+fn grep_detail_zeigt_vorkommen_in_spalten() {
+    use crate::chat::ToolKind;
+    let mut s = Session::new(0);
+    s.view = ViewLevel::Detailed;
+    s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant(String::new(), String::new());
+    let t = s.open_tool(
+        Some(aid),
+        "c1".into(),
+        "grep".into(),
+        r#"{"pattern":"TODO","path":"src","content":0}"#.into(),
+        ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 3,
+        },
+    );
+    s.chat.set_tool_final(
+        t,
+        "src/main.rs:1: // TODO: fix\nsrc/lib.rs:5: TODO: handle\nsrc/config.rs:10: // TODO\n"
+            .into(),
+        ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 3,
+        },
+        0,
+        0,
+        std::time::Instant::now(),
+    );
+    s.open_tool_ids.retain(|&id| id != t);
+    s.finish_assistant(false, None);
+
+    let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
+    let text: Vec<String> = blocks
+        .iter()
+        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
+        .collect();
+    // Label-Zeile ist vorhanden.
+    assert!(
+        text.iter().any(|l| l.contains("grep") && l.contains("TODO")),
+        "Label mit Tool-Name und Query: {text:?}"
+    );
+    // Alle drei Treffer sind sichtbar.
+    assert!(
+        text.iter().any(|l| l.contains("main.rs:1")),
+        "Treffer 1: {text:?}"
+    );
+    assert!(
+        text.iter().any(|l| l.contains("lib.rs:5")),
+        "Treffer 2: {text:?}"
+    );
+    assert!(
+        text.iter().any(|l| l.contains("config.rs:10")),
+        "Treffer 3: {text:?}"
+    );
+}
+
+/// Detail-Modus für glob: Dateipfade werden in Spalten angezeigt.
+#[test]
+fn glob_detail_zeigt_dateien_in_spalten() {
+    use crate::chat::ToolKind;
+    let mut s = Session::new(0);
+    s.view = ViewLevel::Detailed;
+    s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant(String::new(), String::new());
+    let t = s.open_tool(
+        Some(aid),
+        "c1".into(),
+        "glob".into(),
+        r#"{"pattern":"src/**/*.rs"}"#.into(),
+        ToolKind::Glob {
+            pattern: "src/**/*.rs".into(),
+            num_results: 4,
+        },
+    );
+    s.chat.set_tool_final(
+        t,
+        "src/main.rs\nsrc/lib.rs\nsrc/config.rs\nsrc/app.rs\n".into(),
+        ToolKind::Glob {
+            pattern: "src/**/*.rs".into(),
+            num_results: 4,
+        },
+        0,
+        0,
+        std::time::Instant::now(),
+    );
+    s.open_tool_ids.retain(|&id| id != t);
+    s.finish_assistant(false, None);
+
+    let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
+    let text: Vec<String> = blocks
+        .iter()
+        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
+        .collect();
+    // Alle vier Pfade sind sichtbar.
+    for path in &["src/main.rs", "src/lib.rs", "src/config.rs", "src/app.rs"] {
+        assert!(
+            text.iter().any(|l| l.contains(path)),
+            "Pfad {path} muss sichtbar sein: {text:?}"
+        );
+    }
+}
+
+/// Ohne Detail-Modus (Compact/Dialog) bleibt grep/glob ein Einzeiler.
+#[test]
+fn grep_compact_bleibt_einzeiler() {
+    use crate::chat::ToolKind;
+    let mut s = Session::new(0);
+    // ViewLevel::Compact (Default)
+    s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant(String::new(), String::new());
+    let t = s.open_tool(
+        Some(aid),
+        "c1".into(),
+        "grep".into(),
+        r#"{"pattern":"TODO","path":"src"}"#.into(),
+        ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 3,
+        },
+    );
+    s.chat.set_tool_final(
+        t,
+        "src/main.rs:1: // TODO\nsrc/lib.rs:5: TODO\nsrc/config.rs:10: // TODO\n".into(),
+        ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 3,
+        },
+        0,
+        0,
+        std::time::Instant::now(),
+    );
+    s.open_tool_ids.retain(|&id| id != t);
+    s.finish_assistant(false, None);
+
+    let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
+    let text: Vec<String> = blocks
+        .iter()
+        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
+        .collect();
+    // Im Compact-Modus: Keine individuellen Trefferzeilen, nur das Label.
+    assert!(
+        !text.iter().any(|l| l.contains("main.rs:1")),
+        "Compact: keine individuellen Treffer: {text:?}"
+    );
+    assert!(
+        text.iter().any(|l| l.contains("grep") && l.contains("TODO")),
+        "Compact: Label bleibt: {text:?}"
+    );
+}
+
+/// Detail-Ansicht mit vielen Treffern: Spaltenanzahl passt sich dem Platz an.
+#[test]
+fn grep_detail_spaltenanzahl_passt_sich_an() {
+    use crate::chat::ToolKind;
+    let mut s = Session::new(0);
+    s.view = ViewLevel::Detailed;
+    s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
+    let aid = s.open_assistant(String::new(), String::new());
+    // 20 Dateinamen, bei 200 Zellen Breite → viele Spalten möglich.
+    let output: String = (0..20)
+        .map(|i| format!("file_{i:02}.txt"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let t = s.open_tool(
+        Some(aid),
+        "c1".into(),
+        "glob".into(),
+        r#"{"pattern":"*.txt"}"#.into(),
+        ToolKind::Glob {
+            pattern: "*.txt".into(),
+            num_results: 20,
+        },
+    );
+    s.chat.set_tool_final(
+        t,
+        output,
+        ToolKind::Glob {
+            pattern: "*.txt".into(),
+            num_results: 20,
+        },
+        0,
+        0,
+        std::time::Instant::now(),
+    );
+    s.open_tool_ids.retain(|&id| id != t);
+    s.finish_assistant(false, None);
+
+    let (blocks, _) = build_history_cache(&s, 200, "m", 8192);
+    let text: Vec<String> = blocks
+        .iter()
+        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
+        .collect();
+    // Alle 20 Pfade sichtbar.
+    for i in 0..20 {
+        let name = format!("file_{i:02}.txt");
+        assert!(
+            text.iter().any(|l| l.contains(&name)),
+            "Datei {name} muss sichtbar sein: {text:?}"
+        );
+    }
+    // Mehrere Dateien pro Zeile (Spalten) → weniger Zeilen als Dateien.
+    // (Label + mindestens 1 Ergebniszeile, aber nicht 20 Einzelzeilen)
+    assert!(
+        text.len() < 22,
+        "Mehrere Spalten → nicht jede Datei in eigener Zeile: {} Zeilen",
+        text.len()
     );
 }

@@ -87,25 +87,59 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     /// Optionaler HTTP `User-Agent` für Requests an diesen Provider. Fehlt er,
     /// wird ein generischer Default verwendet (für den zen-Provider
-    /// `opencode-compatible aidev/{version}`, sonst `aidev/{version}`).
+    /// [`ZEN_USER_AGENT`], sonst `aidev/{version}`).
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Tools, die unabhängig von den Kanal-Permissions immer als
+    /// Dummy-Definitionen angeboten werden (z.B. `["read", "bash"]` für den
+    /// zen-Provider). Die Tool-Definitionen sind minimalistisch (Name +
+    /// erforderlicher Parameter + Hinweis "disabled"); ein Aufruf eines
+    /// solchen Dummy-Tools wird mit einer Fehlermeldung abgelehnt.
+    #[serde(default)]
+    pub force_tools: Vec<String>,
 }
 
 /// App-Version, automatisch aus Cargo übernommen (`package.version` in
 /// Cargo.toml; aktuell z. B. `0.1.0`).
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Default-`User-Agent` für den zen-Provider (statisch, opencode-kompatibel).
+/// Wird verwendet, wenn in der Config kein expliziter `user_agent` gesetzt ist.
+pub(crate) const ZEN_USER_AGENT: &str =
+    "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14";
+
+/// Generischer aidev-`User-Agent` `aidev/{VERSION}` – die eine Quelle für
+/// alle nicht-zen-Stellen: der Default für nicht-zen-Provider (LLM-API) und
+/// das `webfetch`-Werkzeug.
+pub(crate) const AIDEV_USER_AGENT: &str = concat!("aidev/", env!("CARGO_PKG_VERSION"));
+
 /// Effektiver HTTP `User-Agent` für Requests an einen Provider:
 /// - expliziter `user_agent` aus der Config (falls gesetzt),
-/// - sonst für den zen-Provider `opencode-compatible aidev/{VERSION}`,
-/// - sonst generisch `aidev/{VERSION}`.
+/// - sonst für den zen-Provider [`ZEN_USER_AGENT`],
+/// - sonst generisch [`AIDEV_USER_AGENT`].
 pub(crate) fn effective_user_agent(provider: &ProviderConfig, provider_name: &str) -> String {
     match &provider.user_agent {
         Some(ua) if !ua.trim().is_empty() => ua.trim().to_string(),
-        _ if provider_name == "zen" => format!("opencode-compatible aidev/{VERSION}"),
-        _ => format!("aidev/{VERSION}"),
+        _ if provider_name == "zen" => ZEN_USER_AGENT.to_string(),
+        _ => AIDEV_USER_AGENT.to_string(),
     }
+}
+
+/// Effektive `force_tools` für einen Provider – analog zu
+/// [`effective_user_agent`]:
+/// - explizit in der Config gesetzte Tools (nicht leer) werden übernommen,
+/// - sonst (nicht gesetzt oder leer) für den zen-Provider der Default
+///   `["read", "bash"]` (Dummy-Definitionen, damit das Modell read/bash
+///   auch ohne gebundenen Kanal angeboten bekommt),
+/// - sonst leer (keine Force-Tools).
+pub(crate) fn effective_force_tools(provider: &ProviderConfig, provider_name: &str) -> Vec<String> {
+    if !provider.force_tools.is_empty() {
+        return provider.force_tools.clone();
+    }
+    if provider_name == "zen" {
+        return vec!["read".to_string(), "bash".to_string()];
+    }
+    Vec::new()
 }
 
 /// True, wenn die Request-Ziel-URL (Provider `base_url`) auf `opencode.ai`
@@ -272,6 +306,9 @@ pub struct ResolvedEndpoint {
     pub user_agent: String,
     /// Optionales Kontextfenster (nur für Kompaktierungsschwelle).
     pub context_window: u64,
+    /// Provider-spezifische Force-Tools (Dummy-Definitionen für nicht-
+    /// permissions-erlaubte Tools, die trotzdem immer angeboten werden).
+    pub force_tools: Vec<String>,
 }
 
 /// Treffer der Alias-Auflösung des Default-Modellfelds (`config.model`).
@@ -417,6 +454,7 @@ fn default_provider() -> HashMap<String, ProviderConfig> {
             base_url: "https://opencode.ai/zen/v1".to_string(),
             api_key: Some("public".to_string()),
             user_agent: None,
+            force_tools: vec!["read".to_string(), "bash".to_string()],
         },
     );
     m
@@ -569,6 +607,7 @@ impl Config {
                 m.provider, m.provider, m.alias
             )
         })?;
+        let force_tools = effective_force_tools(provider_cfg, m.provider);
         Ok(ResolvedEndpoint {
             model: format!("{}/{}", m.provider, m.alias),
             api_model: m.server_model.to_string(),
@@ -579,6 +618,7 @@ impl Config {
                 .context_window
                 .filter(|w| *w > 0)
                 .unwrap_or(self.context_window),
+            force_tools,
         })
     }
 
@@ -595,6 +635,8 @@ impl Config {
 
         let model_cfg = self.models.values().find(|m| m.id() == model_id);
 
+        let force_tools = effective_force_tools(provider, provider_name);
+
         Ok(ResolvedEndpoint {
             model: model_id.to_string(),
             api_model: model_name.to_string(),
@@ -605,6 +647,7 @@ impl Config {
                 .and_then(|m| m.context_window())
                 .filter(|w| *w > 0)
                 .unwrap_or(self.context_window),
+            force_tools,
         })
     }
 
@@ -1217,26 +1260,29 @@ mod tests {
             base_url: "x".into(),
             api_key: None,
             user_agent: None,
+            force_tools: Vec::new(),
         };
         assert_eq!(
             effective_user_agent(&zen, "zen"),
-            format!("opencode-compatible aidev/{VERSION}")
+            ZEN_USER_AGENT.to_string()
         );
         // anderer Provider ohne Config-User-Agent → generischer Default.
         let other = ProviderConfig {
             base_url: "x".into(),
             api_key: None,
             user_agent: None,
+            force_tools: Vec::new(),
         };
         assert_eq!(
             effective_user_agent(&other, "openai"),
-            format!("aidev/{VERSION}")
+            AIDEV_USER_AGENT.to_string()
         );
         // expliziter Config-User-Agent hat Vorrang (auch bei zen).
         let custom = ProviderConfig {
             base_url: "x".into(),
             api_key: None,
             user_agent: Some("mein-agent/1.0".into()),
+            force_tools: Vec::new(),
         };
         assert_eq!(effective_user_agent(&custom, "zen"), "mein-agent/1.0");
         // leerer/whitespace-Config-Wert fällt auf den Default zurück.
@@ -1244,11 +1290,101 @@ mod tests {
             base_url: "x".into(),
             api_key: None,
             user_agent: Some("   ".into()),
+            force_tools: Vec::new(),
         };
         assert_eq!(
             effective_user_agent(&blank, "zen"),
-            format!("opencode-compatible aidev/{VERSION}")
+            ZEN_USER_AGENT.to_string()
         );
+    }
+
+    #[test]
+    fn force_tools_defaults_zen_und_generisch() {
+        // zen ohne Config-force_tools → zen-spezifischer Default.
+        let zen = ProviderConfig {
+            base_url: "x".into(),
+            api_key: None,
+            user_agent: None,
+            force_tools: Vec::new(),
+        };
+        assert_eq!(
+            effective_force_tools(&zen, "zen"),
+            vec!["read".to_string(), "bash".to_string()]
+        );
+        // anderer Provider ohne Config-force_tools → leer (keine Force-Tools).
+        let other = ProviderConfig {
+            base_url: "x".into(),
+            api_key: None,
+            user_agent: None,
+            force_tools: Vec::new(),
+        };
+        assert!(effective_force_tools(&other, "openai").is_empty());
+        // explizite Config-force_tools haben Vorrang (auch bei zen).
+        let custom = ProviderConfig {
+            base_url: "x".into(),
+            api_key: None,
+            user_agent: None,
+            force_tools: vec!["glob".into()],
+        };
+        assert_eq!(effective_force_tools(&custom, "zen"), vec!["glob".to_string()]);
+        // leerer/Value hat keinen Vorrang → fällt auf den Default zurück.
+        assert_eq!(
+            effective_force_tools(&zen, "zen"),
+            vec!["read".to_string(), "bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn force_tools_resolution_zen_default_andere_leer() {
+        // zen-Provider in der Config OHNE force_tools → Default ["read","bash"].
+        // Anderer Provider ohne force_tools → leer.
+        let cfg: Config = toml::from_str(
+            r#"
+            model = "zen/m"
+
+            [provider.zen]
+            base_url = "https://zen.example.com/v1"
+
+            [provider.ollama]
+            base_url = "http://localhost:11434/v1"
+        "#,
+        )
+        .expect("TOML lesbar");
+        let ep = cfg.resolve(None).expect("resolve zen");
+        assert_eq!(ep.force_tools, vec!["read", "bash"]);
+
+        // Externer Provider ohne force_tools → keine Force-Tools.
+        let cfg: Config = toml::from_str(
+            r#"
+            model = "ollama/m"
+
+            [provider.zen]
+            base_url = "https://zen.example.com/v1"
+
+            [provider.ollama]
+            base_url = "http://localhost:11434/v1"
+        "#,
+        )
+        .expect("TOML lesbar");
+        let ep = cfg.resolve(None).expect("resolve ollama");
+        assert!(ep.force_tools.is_empty(), "nicht-zen ohne force_tools bleibt leer");
+    }
+
+    #[test]
+    fn force_tools_resolution_zen_explizit_setzt_sich_durch() {
+        // Explizites force_tools im zen-Provider ersetzt den Default.
+        let cfg: Config = toml::from_str(
+            r#"
+            model = "zen/m"
+
+            [provider.zen]
+            base_url = "https://zen.example.com/v1"
+            force_tools = ["glob"]
+        "#,
+        )
+        .expect("TOML lesbar");
+        let ep = cfg.resolve(None).expect("resolve zen");
+        assert_eq!(ep.force_tools, vec!["glob"]);
     }
 
     #[test]
@@ -1261,6 +1397,7 @@ mod tests {
                 base_url: "https://example.org".into(),
                 api_key: None,
                 user_agent: Some("speziell/2.0".into()),
+                force_tools: Vec::new(),
             },
         );
         cfg.models.insert(

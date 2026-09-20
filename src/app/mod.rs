@@ -251,6 +251,7 @@ impl App {
             .context_window
             .filter(|w| *w > 0)
             .unwrap_or(self.config.context_window);
+        let force_tools = crate::config::effective_force_tools(provider_cfg, &entry.provider);
         Ok(crate::config::ResolvedEndpoint {
             model: entry.display_key(),
             api_model: entry.api_model().to_string(),
@@ -258,6 +259,7 @@ impl App {
             api_key: provider_cfg.api_key.clone().unwrap_or_default(),
             user_agent: crate::config::effective_user_agent(provider_cfg, &entry.provider),
             context_window: cw,
+            force_tools,
         })
     }
 

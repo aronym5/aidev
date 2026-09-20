@@ -47,11 +47,11 @@ pub fn spawn_worker(
 
         // Wire-Format ist bereits die Chat-Projektion (`api_messages(&chat)`).
         let mut msgs = messages;
-        // Tools sind verfügbar, wenn beim Absenden ein Kanal gebunden war.
-        // Ob der Satz an toten Werkzeugen der Tool-Loop live den (ggf. neu
-        // gebundenen) Kanal nutzt, entscheidet `live_channel()` unten – der
-        // Startwert bleibt hier für die Tool-Definitionen maßgeblich.
-        let mut with_tools = channel_cell.lock().expect("channel cell lock").is_some();
+        // Tools sind verfügbar, wenn beim Absenden ein Kanal gebunden war
+        // ODER der Provider force_tools gesetzt hat (Dummy-Definitionen für
+        // nicht-permissions-erlaubte Tools, die trotzdem immer angeboten werden).
+        let has_force_tools = !ep.force_tools.is_empty();
+        let mut with_tools = channel_cell.lock().expect("channel cell lock").is_some() || has_force_tools;
         // Reaktive Kompaktierung (bei context_length-Fehler) nur EINMAL pro Turn.
         let mut reactive_compacted = false;
 

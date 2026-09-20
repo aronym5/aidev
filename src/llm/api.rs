@@ -212,7 +212,7 @@ fn chat_body(
         body["stream_options"] = json!({ "include_usage": true });
     }
     if with_tools {
-        body["tools"] = json!(tool_definitions(permission));
+        body["tools"] = json!(tool_definitions(permission, &ep.force_tools));
     }
     body
 }
@@ -235,7 +235,7 @@ fn responses_body(
         body["max_output_tokens"] = json!(toks);
     }
     if with_tools {
-        body["tools"] = json!(responses_tools(permission));
+        body["tools"] = json!(responses_tools(permission, &ep.force_tools));
     }
     body
 }
@@ -319,8 +319,8 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
 }
 
 /// Konvertiert die (Chat-förmigen) Tool-Definitionen in das Responses-Format.
-fn responses_tools(permission: Permission) -> Vec<Value> {
-    tool_definitions(permission)
+fn responses_tools(permission: Permission, force_tools: &[String]) -> Vec<Value> {
+    tool_definitions(permission, force_tools)
         .into_iter()
         .map(|t| {
             let f = &t["function"];
