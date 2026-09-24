@@ -67,7 +67,16 @@ impl App {
         let id = s.id;
         let cancel = s.cancel.clone();
         let messages = crate::chat::api_messages(&s.chat);
-        llm::spawn_compact(self.tx.clone(), id, cfg, ep, messages, cancel);
+        llm::spawn_compact(
+            self.tx.clone(),
+            id,
+            cfg,
+            ep,
+            messages,
+            cancel,
+            llm::CompactTrigger::Manual,
+            None,
+        );
     }
 
     fn user_model(&mut self, arg: &str) {
@@ -1145,7 +1154,18 @@ impl App {
         };
         // Kontext-Kompaktierung nötig? Entscheidung VOR dem Zurücksetzen der
         // Session, damit das `usage` des letzten Turns noch verfügbar ist.
-        let compact = should_compact(&self.sessions[active], &cfg, &ep);
+        // Seit der automatischen Kompaktierung NACH der finalen Antwort läuft
+        // eine laufende `s.compacting`-Kompaktierung parallel zum Tippen;
+        // deren Ergebnis (Archive) ist dann bereits eingebaut bzw. kommt
+        // gleich. Die Sendzeit-Kompaktierung hier ist nur noch der Fallback,
+        // wenn die Auto-Kompaktierung nicht gegriffen hat (z. B. weil der
+        // neue Prompt selbst den Kontext über die Schwelle schiebt) – sie
+        // wird unterdrückt, solange eine Hintergrund-Kompaktierung läuft
+        // (kein Doppel-Start, keine blockierende Synchron-Kompaktierung).
+        let compact = {
+            let s = &self.sessions[active];
+            !s.compacting && should_compact(s, &cfg, &ep)
+        };
         // Live-Context-Basis des neuen Turns (monoton): Hat der letzte Turn eine
         // gesicherte Kontext-Größe geliefert (Usage), dient deren prompt_tokens
         // als harter Ankerpunkt (hier darf die Anzeige auch hart nach unten
@@ -1153,7 +1173,14 @@ impl App {
         // alle Inhalte monoton weiter, sodass die Statusleiste nie wieder unter
         // den zuletzt geschätzten Wert fällt (nur Compaction senkt sie).
         let prev = self.sessions[active].prompt_base;
-        let base_prompt = match self.sessions[active].last_usage_current() {
+        // Null-Usage-Runden (abgebrochene/fehlgeschlagene letzte Antwort)
+        // überspringen: deren `prompt_tokens` wäre 0 und würde `prompt_base`
+        // auf 0 ziehen – statt dessen auf die letzte Schätzung/den letzten
+        // guten Anker zurückfallen.
+        let base_prompt = match self.sessions[active]
+            .last_usage_current()
+            .filter(|u| u.total_tokens > 0)
+        {
             Some(u) => u.prompt_tokens,
             None => prev.max(prompt_tokens(&self.sessions[active]).max(1)),
         };

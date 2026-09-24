@@ -10,11 +10,13 @@ use crate::editor::InputLayout;
 pub(crate) use theme::*;
 mod blocks;
 mod dialogs;
+mod el;
 mod input;
 mod status;
 mod theme;
 pub(crate) use blocks::*;
 pub(crate) use dialogs::*;
+pub(crate) use el::ElBackend;
 pub(crate) use input::*;
 pub(crate) use status::*;
 

@@ -365,9 +365,16 @@ impl Chat {
     /// mehr: die Projektion `api_messages` startet bei der letzten Summary und
     /// reduziert so das Kontextfenster, ohne Inhalte zu löschen. Die
     /// `previous_id`-Verkettung wird auf die Summary umgebogen (primär bleibt
-    /// aber `Chat.order`). Liefert die Anzahl der von der Summary abgedeckten
-    /// Events (alles vor der boundary).
-    pub fn compact(&mut self, boundary: usize, summary: String, num_tokens: u64) -> u64 {
+    /// aber `Chat.order`). `log_path` hängt das Kompaktierungs-Protokoll ans
+    /// `Archive`-Event (nur Anzeige, kein LLM-Inhalt). Liefert die Anzahl der
+    /// von der Summary abgedeckten Events (alles vor der boundary).
+    pub fn compact(
+        &mut self,
+        boundary: usize,
+        summary: String,
+        num_tokens: u64,
+        log_path: Option<String>,
+    ) -> u64 {
         let arch = boundary.min(self.order.len());
         let id = self.next_id;
         self.next_id += 1;
@@ -393,6 +400,7 @@ impl Chat {
                 summary,
                 num_tokens,
                 archived_events: arch,
+                log_path,
             },
             // Die Summary ist der neue Projektions-Anker: ihre eigene Länge.
             context_len: Some(num_tokens),
@@ -991,11 +999,13 @@ pub enum EventKind {
     /// Markiert einen abgebrochenen Turn (Anzeige "abgebrochen", Fußzeile).
     Abort,
     /// Ergebnis der Kompaktierung. `num_tokens` ist die Token-Zahl der Summary
-    /// (aus dem Kompaktierungs-Aufruf abgeleitet; Fallback: Zeichen-Schätzung).
+    /// (aus dem Kompaktierungs-Aufruf abgeleitet; Fallback: Zeichen-Schätzung),
+    /// `log_path` der Pfad des Kompaktierungs-Protokolls (falls geschrieben).
     Archive {
         summary: String,
         num_tokens: u64,
         archived_events: usize,
+        log_path: Option<String>,
     },
 }
 
@@ -1020,11 +1030,16 @@ pub enum ToolKind {
         pattern: String,
         path: String,
         include: String,
+        /// Exakte Gesamtzahl der gefundenen Treffer.
         num_results: u32,
+        /// Im Ergebnistext tatsächlich berichtete Treffer (Anzeige-Decke/
+        /// Kürzung). `< num_results` ⇒ Anzeige „R of N results“.
+        num_results_reported: u32,
     },
     Glob {
         pattern: String,
         num_results: u32,
+        num_results_reported: u32,
     },
     Webfetch {
         url: String,
@@ -1218,6 +1233,7 @@ mod tests {
             2,
             "[Compressed history - 2 earlier messages]\n\nalt".into(),
             42,
+            Some("/tmp/kompaktierung".into()),
         );
         assert_eq!(arch, 2);
         // Altbestand bleibt erhalten, Summary sitzt genau an der boundary:
@@ -1244,6 +1260,17 @@ mod tests {
             Some("[Compressed history - 2 earlier messages]\n\nalt")
         );
         assert_eq!(wire[1].content.as_deref(), Some("c"));
+        // Der Protokollpfad hängt als reiner Anzeige-Zusatz am Archive-Event
+        // (geht NICHT in die API-Projektion).
+        assert_eq!(
+            chat.event(sum_id)
+                .and_then(|e| match &e.kind {
+                    EventKind::Archive { log_path, .. } => log_path.clone(),
+                    _ => None,
+                })
+                .as_deref(),
+            Some("/tmp/kompaktierung")
+        );
     }
 
     #[test]

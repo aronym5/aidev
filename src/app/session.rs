@@ -631,15 +631,22 @@ impl Session {
     /// alle Events bis zur `boundary` werden durch ein `Archive`-Event ersetzt,
     /// die letzten `keep` Turns bleiben erhalten. Alle IDs dahinter bleiben
     /// stabil (Render-Cache teilt sich entsprechend auf). `tokens` ist die
-    /// Token-Zahl der Summary (aus dem Kompaktierungs-Aufruf abgeleitet).
-    pub(crate) fn apply_compaction(&mut self, content: String, tokens: u64, keep: usize) {
+    /// Token-Zahl der Summary (aus dem Kompaktierungs-Aufruf abgeleitet),
+    /// `log_path` der Pfad zum Kompaktierungs-Protokoll (falls geschrieben).
+    pub(crate) fn apply_compaction(
+        &mut self,
+        content: String,
+        tokens: u64,
+        keep: usize,
+        log_path: Option<String>,
+    ) {
         self.compacting = false;
         self.prompt_base = 0;
         let boundary = compact_boundary(self, keep);
         if boundary == 0 {
             return;
         }
-        self.chat.compact(boundary, content, tokens);
+        self.chat.compact(boundary, content, tokens, log_path);
         // Einmaliger Shift auf die überlebenden Events: alte Kontextlänge des
         // letzten Events vor der Summary minus Summary-Länge. Dadurch zeigen die
         // Survivors ihre alte (ggf. bestätigte) Kontextlänge im neuen
@@ -724,11 +731,13 @@ pub(crate) fn tool_kind_from_activity(
             pattern: arg("pattern"),
             path: arg("path"),
             include: arg("include"),
-            num_results: a.output_full.lines().count() as u32,
+            num_results: a.num_results,
+            num_results_reported: a.num_results_reported,
         },
         "glob" => ToolKind::Glob {
             pattern: arg("pattern"),
-            num_results: a.output_full.lines().count() as u32,
+            num_results: a.num_results,
+            num_results_reported: a.num_results_reported,
         },
         "webfetch" => ToolKind::Webfetch {
             url: arg("url"),

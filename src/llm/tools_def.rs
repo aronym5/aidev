@@ -41,15 +41,21 @@ pub(crate) const USER_AGENT: &str = crate::config::AIDEV_USER_AGENT;
 /// (`Permission::tools`) – so bekommt das Modell bei `read` nur
 /// `grep`/`read`/`glob`/`webfetch` zu sehen.
 ///
-/// Tools aus `force_tools`, die nicht bereits durch die Berechtigung abgedeckt
+/// `has_channel` steuert die **kanallose** Variante (Session ohne gebundenen
+/// Kanal): Dort gibt es weder Dateisystem noch Shell, daher bleibt nur
+/// `webfetch` (reiner HTTP-Abruf) als volles Werkzeug übrig – `grep`/`glob`/
+/// `read` usw. machen ohne Kanal keinen Sinn. Der Rest erscheint höchstens als
+/// Dummy über `force_tools`.
+///
+/// Tools aus `force_tools`, die nicht bereits als volle Definition vertreten
 /// sind, werden als minimalistische Dummy-Definitionen angeboten (Name +
 /// erforderlicher Parameter + Hinweis "disabled"). Ein Aufruf eines solchen
 /// Dummy-Tools wird in der Ausführung mit einer Fehlermeldung abgelehnt.
 pub(crate) fn tool_definitions(
     permission: Permission,
     force_tools: &[String],
+    has_channel: bool,
 ) -> Vec<Value> {
-    let allowed: Vec<&str> = permission.tools().iter().copied().collect();
     let mut tools: Vec<Value> = vec![
         tool(
             "grep",
@@ -113,16 +119,26 @@ pub(crate) fn tool_definitions(
     ]
     .into_iter()
     .filter(|t| {
-        t["function"]["name"]
-            .as_str()
-            .is_some_and(|name| permission.allows(name))
+        let name = t["function"]["name"].as_str().unwrap_or_default();
+        if has_channel {
+            // Gebundener Kanal: volle, permissions-gefilterte Werkzeugmenge.
+            permission.allows(name)
+        } else {
+            // Ohne Kanal: keine Dateisystem-/Shell-Tools, nur webfetch
+            // (reiner HTTP-Abruf) bleibt als volles Werkzeug sinnvoll.
+            name == "webfetch"
+        }
     })
     .collect();
 
-    // Force-Tools hinzufügen, die nicht bereits durch die Berechtigung
-    // abgedeckt sind – als minimalistische Dummy-Definitionen.
+    // Force-Tools ergänzen, die nicht bereits als volle Definition vertreten
+    // sind: mit Kanal nur die nicht-permissions-erlaubten; ohne Kanal alle,
+    // weil dort bis auf `webfetch` kein Tool voll funktional ist.
     for ft in force_tools {
-        if !allowed.iter().any(|a| *a == ft.as_str()) {
+        let already_full = tools
+            .iter()
+            .any(|t| t["function"]["name"].as_str() == Some(ft.as_str()));
+        if !already_full {
             tools.push(dummy_tool(ft));
         }
     }

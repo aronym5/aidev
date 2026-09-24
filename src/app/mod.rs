@@ -13,6 +13,7 @@ use crate::channel::ChannelRegistry;
 use crate::config::Config;
 use crate::llm::WorkerEvent;
 use crate::ui;
+use crate::ui::ElBackend;
 
 mod list;
 pub(crate) use list::{ListNav, Selection};
@@ -594,14 +595,30 @@ impl App {
 
         match key.code {
             KeyCode::Enter => {
-                if shift {
-                    // Shift+Enter: Zeilenumbruch im Eingabefeld, nicht senden.
+                // Enter + Shift/Ctrl/Alt: Zeilenumbruch im Eingabefeld, NIEMALS
+                // senden – gängige Chat/GUI-Konvention. Voraussetzung ist ein
+                // Terminal mit Kitty-Keyboard-Protokoll (Stufe 4, siehe `main`),
+                // sonst kommt auch Shift+Enter ohne Modifier als nacktes Enter an.
+                if shift || ctrl || alt {
                     let s = self.active_mut();
                     s.editor.insert_newline();
                 } else {
-                    // Enter ohne Shift: Text abschicken.
+                    // Enter ohne Modifier: Text abschicken.
                     self.handle_enter();
                 }
+            }
+            // Ctrl+J = 0x0A (LF): universeller Zeilenumbruch, der in JEDEM
+            // Terminal funktioniert – auch ohne Kitty-Protokoll. Im Raw-Mode
+            // schickt das Terminal dafür das Byte 0x0A, das als `Char('\n')`
+            // ohne Modifier ankommt; mit Kitty-Protokoll kommt derselbe Tastendruck
+            // als `Char('j')` + CTRL an. Beides fügt einen harten Umbruch ein.
+            KeyCode::Char('\n') => {
+                let s = self.active_mut();
+                s.editor.insert_newline();
+            }
+            KeyCode::Char('j') if ctrl => {
+                let s = self.active_mut();
+                s.editor.insert_newline();
             }
             KeyCode::Esc => {
                 self.handle_esc();
@@ -931,7 +948,9 @@ pub fn run(config: Config) -> io::Result<()> {
         s.error = Some(startup_warnings.join(" · "));
     }
 
-    let backend = CrosstermBackend::new(io::stdout());
+    // `ElBackend` schließt jede Zeile nach dem letzten Inhalt per `ESC[K` ab –
+    // Markierung/Kopie nimmt so keine Trailing-Spaces mehr mit.
+    let backend = ElBackend::new(CrosstermBackend::new(io::stdout()));
     let mut terminal = Terminal::new(backend)?;
 
     let result = (|| {

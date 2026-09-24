@@ -49,9 +49,22 @@ fn main() -> io::Result<()> {
     // Keyboard-Enhancement aktivieren (Kitty-Protokoll), damit Numpad-Tasten
     // (KP_+, KP_-, KP_Enter usw.) als eigenständige KeyCodes erkannt werden
     // und nicht als unbekannte SS3-Sequenzen verloren gehen.
+    //
+    // ZUSÄTZLICH `REPORT_ALL_KEYS_AS_ESCAPE_CODES` (Stufe 4): Erst dadurch
+    // meldet das Terminal auch „Texttasten“ wie Enter als `CSI-u`-Sequenz
+    // (`CSI 13u`). Ohne dieses Flag sendet Enter (und auch Shift+Enter) im
+    // Legacy-Encoding identisch `\r`, und der SHIFT-Modifier ginge verloren –
+    // Shift+Enter würde dann beim Senden landen. Mit Stufe 4 kommt Enter als
+    // `CSI 13u` und Shift+Enter als `CSI 13;2u` (mit SHIFT-Modifier) an.
+    // Terminals ohne Kitty-Protokoll ignorieren die Sequenz harmlos und
+    // bleiben beim Legacy-Encoding (dort ist Shift+Enter nicht unterscheidbar;
+    // als universeller Ersatz dient Ctrl+J, siehe `handle_key`).
     let _ = execute!(
         io::stdout(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+        )
     );
 
     // Bracketed Paste einschalten: Damit kommt eingefügter (mehrzeiliger) Text

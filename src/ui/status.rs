@@ -225,32 +225,40 @@ pub(crate) fn key_help_full_width(bindings: &[(&str, &str)]) -> usize {
     width
 }
 
-/// Aktuelle Context-Größe der Session für die Statuszeile. Sobald live neue
-/// Daten eintreffen (mid-stream `UsageUpdate` bzw. Runden-`Usage`), zeigt die
-/// Statusleiste Deren `total_tokens` an dieser Stelle – nicht die der letzten
-/// abgeschlossenen Runde. Nur solange noch kein Live-Wert vorliegt (Turn-Start,
-/// noch keine neuen Daten), fällt sie auf den zuletzt abgeschlossenen Turn
-/// zurück – aber NUR wenn dessen Usage den aktuellen Kontext widerspiegelt.
-/// Direkt nach einer Compaction liegt der letzte Usage in der alten (größeren)
-/// Historie; dann zeigt sie die geschätzten Kontext-Tokens (`prompt_tokens`:
-/// Summary exakt + Heuristik der überlebenden Turns) bzw. die `prompt_base`-
-/// Basis.
-fn context_tokens(s: &Session) -> Option<u64> {
+/// Aktuelle Context-Größe der Session für die Statuszeile samt „grün?“-Flag:
+/// grün = serverbestätigt (live-Messung oder letzte abgeschlossene Runde mit
+/// Usage), grau = Schätzung (z. B. nach Abbruch/Fehler der letzten Runde oder
+/// nach einer Kompaktierung) – analog zur ersten Spalte rechts neben der
+/// Usage-Bar in der Overview-Sicht.
+///
+/// Sobald live neue Daten eintreffen (mid-stream `UsageUpdate` bzw. Runden-
+/// `Usage`), zeigt die Statusleiste deren `total_tokens` an dieser Stelle –
+/// nicht die der letzten abgeschlossenen Runde. Hat die letzte Runde KEIN
+/// bestätigtes Usage (z. B. vom User abgebrochen oder mit einem Fehler
+/// beendet), liefert `last_usage_current` einen Null-Usage. Statt dann „0T“
+/// zu zeigen, fällt die Anzeige auf die Schätzung `prompt_tokens` zurück:
+/// die letzte bestätigte Kontextlänge + Schätzung der seither angefügten
+/// Token (partieller Inhalte, neue Nachricht) – grau, weil nicht bestätigt.
+fn context_tokens(s: &Session) -> Option<(u64, bool)> {
     // Live-Wert hat Vorrang, sobald er gesetzt ist: neue Daten zeigen sofort
     // deren `total_tokens`, statt bis zum Rundenende zu warten.
     if let Some(t) = s.live_usage_total.filter(|&t| t > 0) {
-        return Some(t);
+        return Some((t, true));
     }
-    if let Some(u) = s.last_usage_current() {
-        return Some(u.total_tokens);
+    // Letzte abgeschlossene Runde mit bestätigtem Usage (Null-Usage abgebrochener/
+    // fehlgeschlagener Runden überspringen → sonst käme „0T“).
+    if let Some(u) = s.last_usage_current().filter(|u| u.total_tokens > 0) {
+        return Some((u.total_tokens, true));
     }
-    // Nach (oder ohne) Compaction: geschätzte Kontext-Tokens aus dem Event-Log
-    // (Summary exakt + überlebende Turns), sonst `prompt_base` als obere Schranke.
+    // Nach (oder ohne) Compaction / nach abgebrochener letzter Runde:
+    // geschätzte Kontext-Tokens aus dem Event-Log (letzte bestätigte
+    // Kontextlänge + angefügte Schätzung), sonst `prompt_base` als obere
+    // Schranke.
     let est = prompt_tokens(s);
     if est > 0 {
-        return Some(est);
+        return Some((est, false));
     }
-    (s.prompt_base > 0).then_some(s.prompt_base)
+    (s.prompt_base > 0).then_some((s.prompt_base, false))
 }
 
 /// Kompakte Darstellung einer Token-Zahl für die Statuszeile: max. 3 signifikante
@@ -291,8 +299,16 @@ pub(crate) fn metadata_line(app: &App) -> Line<'static> {
     // Gewähltes Modell der Session: Alias (falls per /model gewählt), sonst
     // die konfigurierte Modell-ID.
     let mut parts: Vec<Span<'static>> = vec![Span::styled(app.display_model(app.active), muted)];
-    if let Some(t) = context_tokens(s) {
-        parts.push(Span::styled(format!(" · {}", fmt_ctx(t)), muted));
+    if let Some((t, green)) = context_tokens(s) {
+        // Kontext-Größe analog zur Overview-Spalte: grün = serverbestätigt
+        // (live oder letzte Runde mit Usage), grau = Schätzung (Abbruch/Fehler
+        // der letzten Runde, Kompaktierung).
+        let ctx_color = if green {
+            Style::default().fg(theme().ok)
+        } else {
+            muted
+        };
+        parts.push(Span::styled(format!(" · {}", fmt_ctx(t)), ctx_color));
     }
     if let Some(ch) = &s.channel {
         parts.push(Span::styled(" · ", muted));
@@ -380,5 +396,67 @@ pub(crate) fn channel_status_color(status: ChannelStatus) -> Color {
         ChannelStatus::Starting => theme().warn,
         ChannelStatus::Problem => theme().err,
         ChannelStatus::Unknown => theme().muted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::context_tokens;
+    use crate::app::Session;
+    use crate::llm::Usage;
+    use crate::perm::Permission;
+
+    fn usage(p: u64, c: u64) -> Usage {
+        Usage {
+            prompt_tokens: p,
+            completion_tokens: c,
+            total_tokens: p + c,
+            cached_tokens: None,
+        }
+    }
+
+    #[test]
+    fn abgeschlossener_turn_zeigt_bestaetigt_gruen() {
+        let mut s = Session::new(0);
+        s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
+        let a = s.open_assistant("gedanke".into(), "antwort".into());
+        s.chat
+            .finalize_assistant(a, std::time::Instant::now(), usage(90_000, 10_000), 0, 0, false);
+        let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
+        assert_eq!(t, 100_000, "bestätigter Usage als Anker");
+        assert!(green, "bestätigt → grün");
+    }
+
+    /// Die letzte Runde wurde abgebrochen (kein Usage): statt „0T“ zeigt die
+    /// Statuszeile die Schätzung = letzte bestätigte Kontextlänge + seither
+    /// angefügte Tokens (grau, nicht bestätigt).
+    #[test]
+    fn abgebrochene_letzte_runde_faellt_auf_schaetzung_statt_0() {
+        let mut s = Session::new(0);
+        // Abgeschlossener Turn mit Usage (Anker 100_000).
+        s.push_user_message("frage eins".into(), Some(Permission::Read), "m".into());
+        let a1 = s.open_assistant("g1".into(), "antwort eins".into());
+        s.chat
+            .finalize_assistant(a1, std::time::Instant::now(), usage(90_000, 10_000), 0, 0, false);
+        // Nächster Turn wird abgebrochen → geschlossen mit Null-Usage.
+        s.push_user_message("frage zwei".into(), Some(Permission::Read), "m".into());
+        let a2 = s.open_assistant("halb fertig".into(), String::new());
+        s.chat.finalize_assistant(
+            a2,
+            std::time::Instant::now(),
+            usage(0, 0),
+            0,
+            0,
+            true,
+        );
+        // Neuer Prompt bereits gesendet (WaitingForLLM, live noch leer).
+        s.push_user_message("frage drei".into(), Some(Permission::Read), "m".into());
+        let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
+        assert!(!green, "nach Abbruch → Schätzung (grau)");
+        assert!(t > 0, "kein 0T nach Abbruch: {t}");
+        assert!(
+            t < 100_000 + 1_000,
+            "Anker + Append-Schätzung, nicht der alte Gesamtwert: {t}"
+        );
     }
 }

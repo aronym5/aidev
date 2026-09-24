@@ -279,6 +279,7 @@ pub(crate) fn build_history_cache(
             EventKind::Archive {
                 summary,
                 num_tokens,
+                log_path,
                 ..
             } => {
                 // Kompaktierung: Die Summary wird zum neuen Kontext-Anker.
@@ -305,6 +306,9 @@ pub(crate) fn build_history_cache(
                     ));
                 } else {
                     blocks.push(summary_block(summary, width));
+                    if let Some(path) = log_path {
+                        blocks.push(summary_log_line(path, width));
+                    }
                 }
             }
             EventKind::Abort => {
@@ -322,7 +326,8 @@ pub(crate) fn build_history_cache(
 
 /// User-Eingabe im Detail-Modus: volles Eingabe-Band mit Berechtigungsfarbe.
 fn user_input_block_chat(text: &str, p: Permission, width: usize) -> ChatBlock {
-    let mut lines = wrap_markdown(&decorate_emphasis(logical_lines(text)), width, PAD);
+    let mut lines =
+        wrap_markdown(&decorate_emphasis(logical_lines(&preserve_breaks(text))), width, PAD);
     let color = permission_color(p);
     lines = lines
         .into_iter()
@@ -446,6 +451,7 @@ fn tool_kind_body(kind: &ToolKind) -> String {
             pattern,
             path,
             num_results,
+            num_results_reported,
             ..
         } => {
             let mut d = format!("\"{}\"", pattern);
@@ -453,19 +459,16 @@ fn tool_kind_body(kind: &ToolKind) -> String {
                 d.push(' ');
                 d.push_str(path);
             }
-            if *num_results > 0 {
-                d.push_str(&format!(" - {num_results} results"));
-            }
+            push_results(&mut d, *num_results_reported, *num_results);
             d
         }
         ToolKind::Glob {
             pattern,
             num_results,
+            num_results_reported,
         } => {
             let mut d = format!("\"{}\"", pattern);
-            if *num_results > 0 {
-                d.push_str(&format!(" - {num_results} results"));
-            }
+            push_results(&mut d, *num_results_reported, *num_results);
             d
         }
         ToolKind::Webfetch { url, prompt } => {
@@ -494,6 +497,21 @@ fn tool_kind_label(kind: &ToolKind) -> String {
     format!("{} {}", tool_kind_name(kind), tool_kind_body(kind))
         .trim_end()
         .to_string()
+}
+
+/// Hängt die Trefferzahl an das Detail an: bei gedeckeltem Bericht
+/// „ - R of N results“, sonst „ - N result(s)“ (Singular bei 1). Bei 0
+/// Ergebnissen bleibt die Zeile ohne Zusatz.
+fn push_results(d: &mut String, reported: u32, total: u32) {
+    if total == 0 {
+        return;
+    }
+    if reported < total {
+        d.push_str(&format!(" - {reported} of {total} results"));
+    } else {
+        let noun = if total == 1 { "result" } else { "results" };
+        d.push_str(&format!(" - {total} {noun}"));
+    }
 }
 
 /// Komplette Kurzform mit Icon + Toolname + Detail (z. B. `⌕ grep TODO src - 5
@@ -727,6 +745,21 @@ pub(crate) fn summary_block(content: &str, width: usize) -> ChatBlock {
         .collect();
     ChatBlock {
         lines,
+        bg: None,
+        gap: 0,
+        is_tool: false,
+    }
+}
+
+/// Zeigt den Pfad des Kompaktierungs-Protokolls unter der Summary-Zusammen-
+/// fassung an (wie der `Debug-Material`-Hinweis bei Fehlern, nur neutral).
+fn summary_log_line(path: &str, width: usize) -> ChatBlock {
+    let lines = vec![Line::from(Span::styled(
+        format!("Kompaktierung-Protokoll: {path}"),
+        Style::default().fg(theme().muted),
+    ))];
+    ChatBlock {
+        lines: wrap_block(&lines, width, PAD),
         bg: None,
         gap: 0,
         is_tool: false,
@@ -1883,7 +1916,7 @@ pub(crate) fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
 /// Eigenständiger Text-Block für eine chronologisch verortete Äußerung des
 /// Modells (Zwischen-Statement vor einem Tool oder die finale Antwort).
 pub(crate) fn text_block(text: &str, width: usize) -> ChatBlock {
-    let logical = decorate_emphasis(logical_lines(text));
+    let logical = decorate_emphasis(logical_lines(&preserve_breaks(text)));
     ChatBlock {
         lines: wrap_markdown(&logical, width, PAD),
         bg: None,

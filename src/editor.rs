@@ -131,11 +131,31 @@ impl Editor {
     /// Cursorposition ein. Vorhandene Auswahl wird ersetzt, enthaltene `\n`
     /// wirken als harte Zeilenumbrüche (kein Senden); der Cursor landet
     /// hinter dem eingefügten Text.
+    ///
+    /// Zeilenenden werden normalisiert: `\r\n` und alleinstehende `\r` werden
+    /// zu `\n`. Der Chat (CommonMark-Markdown) bricht an allen drei Formen um,
+    /// das Eingabefeld nur an `\n` – ohne Normalisierung würde ein einge-
+    /// fügter Text mit `\r`-Zeilenenden im Verlauf umgebrochen erscheinen,
+    /// im Eingabefeld aber nicht.
     pub fn insert_snippet(&mut self, s: &str) {
         self.delete_selection();
         let at = self.cursor.min(self.text.len());
-        let count = s.chars().count();
-        self.text.splice(at..at, s.chars());
+        let mut normalized: Vec<char> = Vec::with_capacity(s.len());
+        let mut iter = s.chars().peekable();
+        while let Some(c) = iter.next() {
+            match c {
+                // CRLF und alleinstehendes CR gelten als Zeilenumbruch.
+                '\r' => {
+                    if iter.peek() == Some(&'\n') {
+                        iter.next();
+                    }
+                    normalized.push('\n');
+                }
+                _ => normalized.push(c),
+            }
+        }
+        let count = normalized.len();
+        self.text.splice(at..at, normalized);
         self.cursor = at + count;
     }
 
@@ -275,10 +295,10 @@ impl Editor {
             return (0, 0);
         };
         let c = self.cursor.min(self.text.len());
-        // Steht der Cursor direkt auf einem expliziten Umbruch (`\n`), so gehört
-        // er ans Ende der vorherigen Zeile (nach dem sichtbaren Text) – das
-        // Umbruchzeichen selbst ist unsichtbar und gehört keiner Zeile an.
-        if c < self.text.len() && self.text[c] == '\n' {
+        // Steht der Cursor direkt auf einem expliziten Umbruch (`\n` bzw. `\r`),
+        // so gehört er ans Ende der vorherigen Zeile (nach dem sichtbaren Text) –
+        // das Umbruchzeichen selbst ist unsichtbar und gehört keiner Zeile an.
+        if c < self.text.len() && matches!(self.text[c], '\n' | '\r') {
             for (r, range) in layout.ranges.iter().enumerate() {
                 if range.end == c {
                     return (r, range.len());
@@ -309,10 +329,11 @@ impl Editor {
 }
 
 /// Bricht eine Zeichenfolge in Zeilen-Ranges der Breite `width` um. Explizite
-/// Zeilenumbrüche (`\n`, per Shift+Enter) wirken als harte Zeilenenden – sie
-/// gehören keiner Zeile an. Dazwischen findet Wort-Umbruch an Whitespace-Grenzen
-/// statt; einzelne lange Wörter weichen auf Trennzeichen (`-`, `/`, `.`) aus;
-/// gibt es keins, wird blind gebrochen (die Folgezeile wird gefüllt).
+/// Zeilenumbrüche (`\n`, per Shift+Enter, sowie `\r` aus nicht normierten
+/// Zwischenablagen) wirken als harte Zeilenenden – sie gehören keiner Zeile an.
+/// Dazwischen findet Wort-Umbruch an Whitespace-Grenzen statt; einzelne lange
+/// Wörter weichen auf Trennzeichen (`-`, `/`, `.`) aus; gibt es keins, wird
+/// blind gebrochen (die Folgezeile wird gefüllt).
 fn wrap_ranges(chars: &[char], width: usize) -> Vec<Range<usize>> {
     let n = chars.len();
     let mut ranges = Vec::new();
@@ -322,10 +343,14 @@ fn wrap_ranges(chars: &[char], width: usize) -> Vec<Range<usize>> {
     }
     let mut i = 0usize;
     while i <= n {
-        // Logische Zeile: Text bis zum nächsten (exklusiven) `\n` bzw. Textende.
+        // Logische Zeile: Text bis zum nächsten (exklusiven) Umbruch (`\n` oder
+        // `\r`, länger erhaltener Alt-Mac-Stil bzw. nicht normalisierter Paste)
+        // bzw. Textende. `\n` ist der kanonische Umbruch; `\r` wird hier
+        // genauso behandelt, damit Eingabefeld und Chat (CommonMark bricht an
+        // beidem um) dieselben Zeilen zeigen.
         let line_end = chars[i..n]
             .iter()
-            .position(|&c| c == '\n')
+            .position(|&c| c == '\n' || c == '\r')
             .map_or(n, |p| i + p);
         let seg_len = line_end - i;
         if seg_len == 0 {
@@ -625,5 +650,36 @@ mod tests {
         assert_eq!(text(&e), "abmehr\nzeiligcd");
         assert_eq!(e.cursor, 13);
         assert!(e.selected_range().is_none());
+    }
+
+    #[test]
+    fn insert_snippet_normalisiert_cr_und_crlf_zu_n() {
+        // CRLF, alleinstehendes CR und gemischte Endungen → einheitlich `\n`,
+        // damit Eingabefeld und Chat (CommonMark) identisch umbrechen.
+        let mut e = ed();
+        e.insert_snippet("a\r\nb\rc\n");
+        assert_eq!(text(&e), "a\nb\nc\n");
+        assert_eq!(e.cursor, 6);
+        // Nur CRLF → ein Umbruch, kein Leerzeichen/Bruch in der Mitte.
+        let mut e2 = ed();
+        e2.insert_snippet("foo\r\nbar");
+        assert_eq!(text(&e2), "foo\nbar");
+        assert_eq!(e2.cursor, 7);
+    }
+
+    #[test]
+    fn cr_wird_als_harter_umbruch_behandelt() {
+        // Falls doch ein `\r` im Text landet (kein Normalisierungs-Pfad), bricht
+        // das Layout daran genauso um wie an `\n` – Chat und Eingabefeld bleiben
+        // konsistent (CommonMark behandelt CR ebenfalls als Zeilenende).
+        let mut e = ed();
+        e.set_width(20);
+        e.text = "a\rb".chars().collect();
+        e.cursor = 2; // direkt vor dem 'b' → Start der Folgezeile
+        let layout = e.layout();
+        assert_eq!(layout.row_range(0), 0..1);
+        assert_eq!(layout.row_range(1), 2..3);
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(e.cursor_row_col(&layout), (1, 0));
     }
 }

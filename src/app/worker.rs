@@ -1,4 +1,5 @@
 use super::*;
+use crate::llm;
 use crate::llm::WorkerEvent;
 use std::time::Instant;
 
@@ -199,12 +200,27 @@ impl App {
                     }
                 }
                 WorkerEvent::Done(id) => {
-                    if let Some(s) = self.session_mut(id) {
+                    // 1) Session finalisieren (Assistant-Runde, Phase → Idle).
+                    // 2) Automatisch nach der finalen Antwort prüfen, ob der
+                    //    Kontext kompaktiert werden sollte – die Kompaktierung
+                    //    läuft dann in einem eigenen Thread PARALLEL zur
+                    //    Eingabe des nächsten Prompts. Das `usage` des soeben
+                    //    beendeten Turns ist jetzt verbindlich (finish_assistant
+                    //    hat `context_len` beglichen) – die Entscheidung ist
+                    //    also genauso genau wie die bisherige Sendzeit-Prüfung.
+                    // `s.compacting` schützt vor einer bereits laufenden
+                    // Kompaktierung (kein Doppel-Start).
+                    let already_compacting = {
+                        let Some(s) = self.session_mut(id) else {
+                            continue;
+                        };
                         s.retrying = None;
-                        // `pending_usage` ist genau dieser Turn (Usage kommt vor
-                        // Done); `None` = kein Server-Usage → 0-Default.
                         s.finish_assistant(false, None);
                         s.phase = Phase::Idle;
+                        s.compacting
+                    };
+                    if !already_compacting {
+                        self.auto_compact_after_turn(id);
                     }
                 }
                 WorkerEvent::Cancelled(id) => {
@@ -242,13 +258,9 @@ impl App {
                         s.compacting = true;
                     }
                 }
-                WorkerEvent::Compacted(id, content, tokens) => {
-                    // `compact_keep_turns` VOR dem mutablen Borrow der Session
-                    // lesen – `session_mut` leiht `self` mutabel aus, ein
-                    // gleichzeitiger Zugriff auf `self.config` wäre E0503.
-                    let keep = self.config.compact_keep_turns;
+                WorkerEvent::Compacted(id, content, tokens, keep, log_path) => {
                     if let Some(s) = self.session_mut(id) {
-                        s.apply_compaction(content, tokens, keep);
+                        s.apply_compaction(content, tokens, keep, log_path);
                     }
                 }
                 WorkerEvent::BuilderLoaded(images_with_wd, container_info, worktrees) => {
@@ -321,5 +333,59 @@ impl App {
             }
         }
         changed
+    }
+
+    /// Startet die automatische Kompaktierung direkt nach dem Abschluss einer
+    /// finalen Antwort (Auslöser: Auto). Der Kompaktierungs-Thread läuft in
+    /// einem eigenen Thread und meldet sich über `Compacting`/`Compacted` –
+    /// der User kann parallel zum Tippen des nächsten Prompts weitermachen.
+    ///
+    /// Wird nur gestartet, wenn `should_compact` greift (Kontext am
+    /// `compact_at`-Anteil des Kontextfensters UND genug alte Turns) und nicht
+    /// schon eine Kompaktierung läuft.
+    fn auto_compact_after_turn(&mut self, id: usize) {
+        // `resolve_endpoint` braucht den Session-Index (die Event-ID ist die
+        // interne, fortlaufende `Session::id`).
+        let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
+            return;
+        };
+        // Config/Endpoint VOR dem mutablen Zugriff auf die Session.
+        let cfg = self.config.clone();
+        let ep = match self.resolve_endpoint(idx) {
+            Ok(ep) => ep,
+            Err(_) => return, // ohne Endpunkt keine automatische Kompaktierung
+        };
+        let (current, messages, cancel) = {
+            let s = &self.sessions[idx];
+            if s.compacting || !should_compact(s, &cfg, &ep) {
+                return;
+            }
+            (
+                prompt_tokens(s),
+                crate::chat::api_messages(&s.chat),
+                s.cancel.clone(),
+            )
+        };
+        // Kein echter Schnitt möglich? (z. B. Konversation besteht nur aus dem
+        // einen Query, oder unmittelbar vor dem letzten Query wurde bereits
+        // kompaktiert → Projektion hat < 3 user-Nachrichten). Dann starten wir
+        // gar keinen Hintergrund-Thread – sonst gäbe es nur die rote Meldung
+        // „keine zu kompaktierenden Turns“, obwohl nichts Schlimmes passiert.
+        if !llm::can_compact(&messages) {
+            return; // `s.compacting` bleibt false (wurde noch nicht gesetzt)
+        }
+        // Als laufend markieren – schließt das Rennen zu `send_prompt`, das die
+        // Sendzeit-Fallback-Kompaktierung über `s.compacting` unterdrückt.
+        self.sessions[idx].compacting = true;
+        llm::spawn_compact(
+            self.tx.clone(),
+            id,
+            cfg,
+            ep,
+            messages,
+            cancel,
+            llm::CompactTrigger::AutoTurn,
+            Some(current),
+        );
     }
 }

@@ -64,6 +64,7 @@ fn ueberlebende_events_nach_summary_werden_verschoben() {
         "[Compressed history - 1 earlier messages]\n\nzusammen".into(),
         10,
         0,
+        None,
     );
 
     // Turn 3 – NEUER Turn NACH der Kompaktierung.
@@ -263,6 +264,7 @@ fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
         ToolKind::Glob {
             pattern: "*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     s.chat.finish_tool(t1, std::time::Instant::now());
@@ -360,6 +362,7 @@ fn confirmed_context_len_beruecksichtigt_tool_call_anteil() {
         ToolKind::Glob {
             pattern: "*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     let t2 = s.open_tool(
@@ -370,6 +373,7 @@ fn confirmed_context_len_beruecksichtigt_tool_call_anteil() {
         ToolKind::Glob {
             pattern: "**/*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     s.chat
@@ -402,6 +406,7 @@ fn confirmed_context_len_beruecksichtigt_tool_call_anteil() {
         ToolKind::Glob {
             pattern: "*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     let t2 = s.open_tool(
@@ -412,6 +417,7 @@ fn confirmed_context_len_beruecksichtigt_tool_call_anteil() {
         ToolKind::Glob {
             pattern: "**/*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     s.chat
@@ -561,6 +567,7 @@ fn assistant_runden_verifizieren_das_event_davor() {
         ToolKind::Glob {
             pattern: "*".into(),
             num_results: 2,
+            num_results_reported: 2,
         },
     );
     s.chat.finish_tool(t1, t0);
@@ -726,6 +733,7 @@ fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
         2,
         "[Compressed history - 1 earlier messages]\n\nzusammenfassung".into(),
         summary_tokens,
+        None,
     );
     // Neuer Turn NACH der Summary (Tail) mit serverbestätigter Usage.
     s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
@@ -1029,6 +1037,7 @@ fn tool_kind_detail_baut_kompakte_kurzform_aus_strukturierten_feldern() {
             path: String::new(),
             include: String::new(),
             num_results: 0,
+            num_results_reported: 0,
         }),
         "⌕ grep \"fn main\""
     );
@@ -1038,15 +1047,55 @@ fn tool_kind_detail_baut_kompakte_kurzform_aus_strukturierten_feldern() {
             path: "src".into(),
             include: String::new(),
             num_results: 5,
+            num_results_reported: 5,
         }),
         "⌕ grep \"TODO\" src - 5 results"
+    );
+    // Genau ein Treffer → Singular „result“.
+    assert_eq!(
+        tool_kind_detail(&ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 1,
+            num_results_reported: 1,
+        }),
+        "⌕ grep \"TODO\" src - 1 result"
     );
     assert_eq!(
         tool_kind_detail(&ToolKind::Glob {
             pattern: "src/**/*.rs".into(),
             num_results: 0,
+            num_results_reported: 0,
         }),
         "☰ glob \"src/**/*.rs\""
+    );
+    assert_eq!(
+        tool_kind_detail(&ToolKind::Glob {
+            pattern: "*.rs".into(),
+            num_results: 1,
+            num_results_reported: 1,
+        }),
+        "☰ glob \"*.rs\" - 1 result"
+    );
+    // Decke aktiv: berichtet weniger als gefunden → „R of N results“.
+    assert_eq!(
+        tool_kind_detail(&ToolKind::Grep {
+            pattern: "TODO".into(),
+            path: "src".into(),
+            include: String::new(),
+            num_results: 486,
+            num_results_reported: 200,
+        }),
+        "⌕ grep \"TODO\" src - 200 of 486 results"
+    );
+    assert_eq!(
+        tool_kind_detail(&ToolKind::Glob {
+            pattern: "mod.rs".into(),
+            num_results: 486,
+            num_results_reported: 200,
+        }),
+        "☰ glob \"mod.rs\" - 200 of 486 results"
     );
     // webfetch → Host · Prompt, write/edit → Pfad, run → Kommando.
     assert_eq!(
@@ -1249,6 +1298,7 @@ fn grep_detail_zeigt_vorkommen_in_spalten() {
             path: "src".into(),
             include: String::new(),
             num_results: 3,
+            num_results_reported: 3,
         },
     );
     s.chat.set_tool_final(
@@ -1260,6 +1310,7 @@ fn grep_detail_zeigt_vorkommen_in_spalten() {
             path: "src".into(),
             include: String::new(),
             num_results: 3,
+            num_results_reported: 3,
         },
         0,
         0,
@@ -1309,6 +1360,7 @@ fn glob_detail_zeigt_dateien_in_spalten() {
         ToolKind::Glob {
             pattern: "src/**/*.rs".into(),
             num_results: 4,
+            num_results_reported: 4,
         },
     );
     s.chat.set_tool_final(
@@ -1317,6 +1369,7 @@ fn glob_detail_zeigt_dateien_in_spalten() {
         ToolKind::Glob {
             pattern: "src/**/*.rs".into(),
             num_results: 4,
+            num_results_reported: 4,
         },
         0,
         0,
@@ -1357,6 +1410,7 @@ fn grep_compact_bleibt_einzeiler() {
             path: "src".into(),
             include: String::new(),
             num_results: 3,
+            num_results_reported: 3,
         },
     );
     s.chat.set_tool_final(
@@ -1367,6 +1421,7 @@ fn grep_compact_bleibt_einzeiler() {
             path: "src".into(),
             include: String::new(),
             num_results: 3,
+            num_results_reported: 3,
         },
         0,
         0,
@@ -1412,6 +1467,7 @@ fn grep_detail_spaltenanzahl_passt_sich_an() {
         ToolKind::Glob {
             pattern: "*.txt".into(),
             num_results: 20,
+            num_results_reported: 20,
         },
     );
     s.chat.set_tool_final(
@@ -1420,6 +1476,7 @@ fn grep_detail_spaltenanzahl_passt_sich_an() {
         ToolKind::Glob {
             pattern: "*.txt".into(),
             num_results: 20,
+            num_results_reported: 20,
         },
         0,
         0,
@@ -1449,3 +1506,74 @@ fn grep_detail_spaltenanzahl_passt_sich_an() {
         text.len()
     );
 }
+
+#[test]
+fn preserve_breaks_haelt_einfache_zeilenumbrueche() {
+    // Kernfall aus der Fehlermeldung: mehrzeilige Eingabe soll im Chatdialog
+    // ihre Zeilen behalten statt zu einer Zeile zu verschmelzen.
+    let src = super::markdown::preserve_breaks("Zeile eins\nZeile zwei");
+    let l = super::markdown::logical_lines(&src);
+    let lines: Vec<String> = l.iter().map(|x| x.to_string()).collect();
+    assert_eq!(lines, ["Zeile eins", "Zeile zwei"]);
+}
+
+#[test]
+fn preserve_breaks_behaelt_absatzgrenzen_und_markdown() {
+    let show = |s: &str| -> Vec<String> {
+        super::markdown::logical_lines(&super::markdown::preserve_breaks(s))
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect()
+    };
+    // Inline-Formatierung bleibt erhalten, Zeilen bleiben trotzdem getrennt.
+    assert_eq!(
+        show("mit **bold**\nund code `x`\ndann weiter"),
+        ["mit bold", "und code x", "dann weiter"]
+    );
+    // Doppelte Umbrüche (Absätze) bleiben Absätze.
+    assert_eq!(show("Absatz 1\n\nAbsatz 2"), ["Absatz 1", "", "Absatz 2"]);
+    // Listen bleiben Listen.
+    assert_eq!(
+        show("- item eins\n- item zwei"),
+        ["- item eins", "- item zwei"]
+    );
+    // Zitate bleiben Zitate.
+    assert_eq!(show("> q eins\n> q zwei"), ["> q eins", "> q zwei"]);
+    // Bestehender harter Umbruch (zwei Spaces) bleibt unverändert.
+    assert_eq!(show("Zeile eins  \nZeile zwei"), ["Zeile eins", "Zeile zwei"]);
+}
+
+#[test]
+fn preserve_breaks_tabellen_und_code_bleiben_unangetastet() {
+    let show = |s: &str| -> Vec<String> {
+        super::markdown::logical_lines(&super::markdown::preserve_breaks(s))
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect()
+    };
+    // GFM-Tabelle (auch mit nackter Begrenzungszeile `---|---`) bleibt Tabelle.
+    let t = show("| a | b |\n---|---\n| 1 | 2 |");
+    assert_eq!(
+        t,
+        ["┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘"]
+    );
+    // Fenced-Codeblock bleibt zeichengetreu (keine eingefügten Spaces).
+    let src = "```rs\nlet a = 1;\nlet b = 2;\n```";
+    assert_eq!(show(src), ["```rs", "let a = 1;", "let b = 2;", "```"]);
+}
+
+#[test]
+fn preserve_breaks_blockzitate_bleiben_zeilengetreu() {
+    let show = |s: &str| -> Vec<String> {
+        super::markdown::logical_lines(&super::markdown::preserve_breaks(s))
+            .into_iter()
+            .map(|x| x.to_string())
+            .collect()
+    };
+    // Aufeinanderfolgende `>`-Zeilen sind Markdown-EIN Absatz und würden sonst
+    // verschmelzen – preserve_breaks hält sie getrennt, wie im Eingabefeld.
+    assert_eq!(show("> q eins\n> q zwei"), ["> q eins", "> q zwei"]);
+    assert_eq!(show("> eins\n> zwei\nnormal text"), ["> eins", "> zwei", "> normal text"]);
+}
+
+

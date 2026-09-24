@@ -44,7 +44,11 @@ pub(super) fn find_glob(
     // Pfade mit führendem `./`, daher ergänzen wir das Präfix. Ohne `/`
     // dagegen nur auf den Dateinamen (-name), sonst träfe `*.rs` nie, weil
     // der Pfad ja mit `./` beginnt.
-    let (flag, pat) = if pattern.contains('/') {
+    // Entscheidend: über das NORMALISIERTE `pat` entscheiden, nicht über das
+    // Original – sonst dedizierte ein führendes (bereits entferntes) `**/`
+    // fälschlich als Pfad-Muster (-path), und `**/mod.rs` träfe nur noch die
+    // top-level `mod.rs` statt jede Tiefe.
+    let (flag, pat) = if pat.contains('/') {
         ("-path", format!("./{pat}"))
     } else {
         ("-name", pat)
@@ -143,6 +147,21 @@ mod tests {
         // Dateien bekommen KEIN Schrägstrich.
         let hits = find_glob("README.md", &dir, Duration::from_secs(10)).unwrap();
         assert_eq!(hits, vec!["README.md"]);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn fuehrendes_doppelstern_matcht_jede_tiefe() {
+        let dir = temp_tree("dstar");
+        std::fs::create_dir_all(dir.join("src/app")).unwrap();
+        std::fs::write(dir.join("mod.rs"), "").unwrap();
+        std::fs::write(dir.join("src/app/mod.rs"), "").unwrap();
+        // „**/xxx“ heißt „Datei xxx in beliebiger Tiefe“ – also auch mod.rs in
+        // der Arbeitswurzel UND in Unterordnern (nicht nur top-level).
+        let hits = find_glob("**/mod.rs", &dir, Duration::from_secs(10)).unwrap();
+        assert_eq!(hits, vec!["mod.rs", "src/app/mod.rs"], "{hits:?}");
+        let hits = find_glob("**/nested.rs", &dir, Duration::from_secs(10)).unwrap();
+        assert_eq!(hits, vec!["src/deep/nested.rs"]);
         cleanup(&dir);
     }
 

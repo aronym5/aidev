@@ -51,7 +51,7 @@ fn mehrere_tool_indizes_werden_getrennt_gesammelt() {
 
 #[test]
 fn tool_definitions_enthalten_alle_werkzeuge() {
-    let defs = tool_definitions(Permission::Execute, &[]);
+    let defs = tool_definitions(Permission::Execute, &[], true);
     let names: Vec<&str> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
@@ -64,7 +64,7 @@ fn tool_definitions_enthalten_alle_werkzeuge() {
 #[test]
 fn tool_definitions_folgen_der_berechtigung() {
     let defs = |p: Permission| {
-        tool_definitions(p, &[])
+        tool_definitions(p, &[], true)
             .iter()
             .filter_map(|d| d["function"]["name"].as_str().map(str::to_string))
             .collect::<Vec<String>>()
@@ -93,8 +93,9 @@ fn sanitize_arguments_normalisiert_auf_gueltiges_json() {
 
 #[test]
 fn tool_definitions_mit_force_tools_fuegt_dummies_hinzu() {
-    // Bei Read-Permission: read ist erlaubt, bash nicht → bash als Dummy.
-    let defs = tool_definitions(Permission::Read, &["read".into(), "bash".into()]);
+    // Gebundener Kanal, Read-Permission: read ist erlaubt, bash nicht →
+    // bash als Dummy.
+    let defs = tool_definitions(Permission::Read, &["read".into(), "bash".into()], true);
     let names: Vec<&str> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
@@ -115,7 +116,7 @@ fn tool_definitions_mit_force_tools_fuegt_dummies_hinzu() {
 #[test]
 fn tool_definitions_force_tools_bereits_erlaubt_kein_duplikat() {
     // Bei Execute-Permission: bash ist bereits erlaubt → kein Dummy.
-    let defs = tool_definitions(Permission::Execute, &["bash".into()]);
+    let defs = tool_definitions(Permission::Execute, &["bash".into()], true);
     let bash_count = defs
         .iter()
         .filter(|d| d["function"]["name"].as_str() == Some("bash"))
@@ -125,13 +126,73 @@ fn tool_definitions_force_tools_bereits_erlaubt_kein_duplikat() {
 
 #[test]
 fn tool_definitions_ohne_force_tools_gleich_wie_bisher() {
-    // Ohne force_tools: identisches Verhalten wie vorher.
-    let defs = tool_definitions(Permission::Read, &[]);
+    // Gebundener Kanal, ohne force_tools: identisches Verhalten wie vorher.
+    let defs = tool_definitions(Permission::Read, &[], true);
     let names: Vec<&str> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
         .collect();
     assert_eq!(names, ["grep", "read", "glob", "webfetch"]);
+}
+
+// ── Kanallose Session (tools_def) ───────────────────────────────────────────
+
+#[test]
+fn tool_definitions_ohne_kanal_nur_webfetch_plus_force_dummies() {
+    // Kanallose Session (kein Verzeichnis/Shell): nur webfetch bleibt als
+    // volles Werkzeug übrig; die force_tools des zen-Providers (read, bash)
+    // kommen als Dummies. grep/glob/write/edit werden gar nicht angeboten.
+    let defs = tool_definitions(Permission::Read, &["read".into(), "bash".into()], false);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["webfetch", "read", "bash"]);
+    // webfetch bleibt ein normales (vollständiges) Tool.
+    let wf = defs
+        .iter()
+        .find(|d| d["function"]["name"].as_str() == Some("webfetch"))
+        .expect("webfetch vorhanden");
+    assert_ne!(
+        wf["function"]["description"].as_str(),
+        Some("This tool is disabled."),
+        "webfetch ohne Kanal ist voll funktional"
+    );
+    // read/bash sind als Dummies ("disabled") markiert.
+    for dummy in &["read", "bash"] {
+        let d = defs
+            .iter()
+            .find(|d| d["function"]["name"].as_str() == Some(*dummy))
+            .unwrap_or_else(|| panic!("{dummy} muss als Dummy vorhanden sein"));
+        assert_eq!(
+            d["function"]["description"].as_str(),
+            Some("This tool is disabled."),
+            "{dummy} muss Dummy-Beschreibung haben"
+        );
+    }
+}
+
+#[test]
+fn tool_definitions_ohne_kanal_und_ohne_force_nur_webfetch() {
+    // Ohne Kanal UND ohne force_tools bleibt nur webfetch übrig.
+    let defs = tool_definitions(Permission::Read, &[], false);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["webfetch"]);
+}
+
+#[test]
+fn tool_definitions_ohne_kanal_ignoriert_hoehere_permission() {
+    // Auch mit Execute-Permission: ohne Kanal keine grep/glob/bash/write/edit
+    // als volle Werkzeuge – nur webfetch plus force-Dummies.
+    let defs = tool_definitions(Permission::Execute, &["read".into(), "bash".into()], false);
+    let names: Vec<&str> = defs
+        .iter()
+        .filter_map(|d| d["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, ["webfetch", "read", "bash"]);
 }
 
 #[test]
@@ -209,7 +270,7 @@ fn tool_definitions_alle_force_tools_als_dummies() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let defs = tool_definitions(Permission::Read, &force);
+    let defs = tool_definitions(Permission::Read, &force, true);
     let names: Vec<&str> = defs
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
@@ -224,7 +285,7 @@ fn tool_definitions_alle_force_tools_als_dummies() {
         let d = defs
             .iter()
             .find(|d| d["function"]["name"].as_str() == Some(*dummy_name))
-            .expect(&format!("{dummy_name} muss vorhanden sein"));
+            .unwrap_or_else(|| panic!("{dummy_name} muss vorhanden sein"));
         assert_eq!(
             d["function"]["description"].as_str(),
             Some("This tool is disabled."),
@@ -356,8 +417,223 @@ fn kompaktierung_zu_kurze_historie_meldet_abbruch() {
         tool_calls: None,
         tool_call_id: None,
     }];
-    let err = compact_chat_messages(0, client, &cfg, &ep, &msgs, &cancel).unwrap_err();
+    let err = compact_chat_messages(
+        0,
+        client,
+        &cfg,
+        &ep,
+        &msgs,
+        &cancel,
+        CompactTrigger::Proactive,
+        None,
+    )
+    .unwrap_err();
     assert!(!err.is_empty());
+}
+
+// ── Kompaktierungs-Planung & -Entscheidung (variables compact_keep_turns) ──
+
+fn wm(role: &str, content: &str) -> WireMessage {
+    WireMessage {
+        role: role.into(),
+        content: Some(content.into()),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
+/// `turns` abwechselnd `user`/`assistant`.
+fn turns(n: usize, chars: usize) -> Vec<WireMessage> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.push(wm("user", &"a".repeat(chars + i)));
+        out.push(wm("assistant", &"b".repeat(chars)));
+    }
+    out
+}
+
+#[test]
+fn plan_candidates_listet_schnitte_mit_kontextgroessen() {
+    // 6 Turns → 6 user → größtes sinnvolles keep = 4 (mindestens 1 archivierter
+    // UND 1 überlebender Turn, vgl. `possible_max_keep`).
+    let msgs = turns(6, 100);
+    let cands = plan_candidates(&msgs, 4);
+    assert_eq!(cands.len(), 4, "keep=1..4 liefern je einen echten Schnitt");
+    // Keep größer → Schnitt früher → weniger archiviert, weniger fällt weg,
+    // mehr bleibt.
+    for w in cands.windows(2) {
+        assert!(
+            w[0].boundary > w[1].boundary,
+            "boundary sinkt mit keep ({:?} → {:?})",
+            w[0],
+            w[1]
+        );
+        assert!(
+            w[0].dropped_tokens > w[1].dropped_tokens,
+            "dropped sinkt mit keep"
+        );
+        assert!(
+            w[0].kept_tokens < w[1].kept_tokens,
+            "kept steigt mit keep"
+        );
+    }
+    // keep=4 (max): archiviert genau den ersten Turn (user + assistant = 2 Msg).
+    assert_eq!(cands[3].archived_msgs, 2);
+    assert!(cands[3].dropped_tokens > 0);
+    assert!(cands[3].kept_tokens > 0);
+}
+
+#[test]
+fn plan_candidates_ohne_moeglichen_schnitt_leer() {
+    // Nur 2 user → kein Kandidat mit echtem Schnitt (mind. 3 nötig).
+    assert_eq!(plan_candidates(&turns(2, 10), 8).len(), 0);
+}
+
+#[test]
+fn can_compact_folgt_den_benoetigten_user_nachrichten() {
+    // Ein einziger (z. B. riesiger, gerade laufender) Query: kein Schnitt.
+    assert!(!can_compact(&turns(1, 10)), "ein User → kein Schnitt");
+    // Direkt nach einer Kompaktierung: Projektion = summary + ein Query.
+    assert!(!can_compact(&turns(2, 10)), "zwei User → kein Schnitt");
+    // Ab drei Turns (ein archivierbarer, zwei überlebende) ist ein Schnitt möglich.
+    assert!(can_compact(&turns(3, 10)), "drei User → Schnitt möglich");
+}
+
+#[test]
+fn decide_keep_waehlt_maximalen_erhalt_unter_schwelle() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_at = 0.5; // Schwelle 50 000
+    cfg.compact_summary_tokens = 1_000;
+    cfg.compact_keep_turns = 3;
+    // Kleine Historie: jeder Schnitt bleibt (konservativ inkl. Budget) unter
+    // der Schwelle → Entscheidung = größtes gültiges keep (max. Kontext-Erhalt).
+    let msgs = turns(6, 100);
+    let total: u64 = msgs
+        .iter()
+        .map(|m| llm::estimate_tokens(m.content.as_deref().unwrap_or_default()))
+        .sum();
+    assert!(total < 50_000, "Prämisse: Kontext unter der Schwelle");
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    assert_eq!(keep, 4, "maximaler Erhalt (größtes keep) unter der Schwelle");
+    assert_eq!(cands.len(), 4);
+}
+
+#[test]
+fn decide_keep_faellt_ohne_ziel_auf_konfiguriertes_zurueck() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 10_000;
+    cfg.compact_at = 0.2; // Schwelle klein (2 000)
+    cfg.compact_summary_tokens = 1_000;
+    cfg.compact_keep_turns = 2;
+    // Große Historie: selbst der stärkste Schnitt (keep=1) lässt den Folge-
+    // Kontext (konservativ mit Budget) über der Schwelle → Fallback aufs
+    // konfigurierte compact_keep_turns.
+    let msgs = turns(6, 40_000);
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    assert_eq!(keep, 2, "Fallback auf das konfigurierte compact_keep_turns");
+}
+
+#[test]
+fn decide_keep_reaktiv_waehlt_staerksten_schnitt() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_at = 0.8;
+    cfg.compact_summary_tokens = 500;
+    cfg.compact_keep_turns = 3;
+    // Bei einem context_length-Fehler zählt das VOLLE Fenster (nicht die 80%-
+    // Schwelle): unter allen Kandidaten, die kept+budget ins Fenster bringen,
+    // wählt Reactive das kleinste keep (stärkster Schnitt) – hier 1.
+    let msgs = turns(6, 20_000);
+    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window);
+    assert_eq!(keep, 1, "Reactive wählt das kleinste keep unter dem vollen Fenster");
+}
+
+#[test]
+fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_at = 0.8;
+    cfg.compact_summary_tokens = 500;
+    cfg.compact_keep_turns = 3;
+    let msgs = turns(6, 200);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let chosen = cands
+        .iter()
+        .find(|c| c.keep_turns == keep)
+        .copied()
+        .unwrap();
+    let summary = "dateien gesichtet; entscheidung: refactor in zwei schritten";
+    let log = CompactionLog {
+        trigger: CompactTrigger::AutoTurn,
+        model: "test/m".into(),
+        base_url: "http://127.0.0.1:1".into(),
+        url: "http://127.0.0.1:1/chat/completions".into(),
+        context_window: cfg.context_window,
+        compact_at: cfg.compact_at,
+        summary_budget: cfg.compact_summary_tokens,
+        threshold: (cfg.context_window as f64 * cfg.compact_at) as u64,
+        current_tokens: 93_000,
+        decided_keep: keep,
+        candidates: cands,
+        chosen,
+        archived_msgs: 6,
+        summary: summary.into(),
+        summary_tokens: 17,
+        overview: overview_from_wire(&msgs),
+        request: serde_json::json!({"model": "m", "max_tokens": 500}),
+        response: r#"{"choices":[{"message":{"content":"ok"}}]}"#.into(),
+    };
+    let files: std::collections::HashMap<String, String> =
+        render_compaction_log(&log).into_iter().collect();
+    for want in ["meta.txt", "overview.txt", "plan.txt", "summary.txt", "request.json", "response.txt"] {
+        assert!(files.contains_key(want), "Protokoll fehlt {want}");
+    }
+
+    let meta = &files["meta.txt"];
+    // Auslöser + Randbedingungen + Entscheidung + erreichte Summary.
+    assert!(meta.contains("auto (nach Turn)"), "Auslöser: {meta}");
+    assert!(meta.contains("context_window:  100000"));
+    assert!(meta.contains("compact_at:      0.8"));
+    assert!(meta.contains("threshold:       80000"));
+    assert!(meta.contains("current_tokens:  93000"));
+    assert!(meta.contains(&format!("decided_keep:    {keep}")));
+    assert!(meta.contains("summary_tokens:  17"), "erreichte Summary: {meta}");
+
+    // Kandidaten-Tabelle (variables compact_keep_turns) mit gewählter
+    // Markierung + Kontextgrößen (wegfallend/bleibend).
+    let plan = &files["plan.txt"];
+    assert!(plan.contains(&format!("keep={keep}")), "gewählte Zeile: {plan}");
+    assert!(plan.contains("<-- gewählt"));
+    assert!(plan.contains("T weg"));
+    assert!(plan.contains("T bleiben"));
+
+    // Kurzübersicht: Rollen der Historie.
+    let overview = &files["overview.txt"];
+    assert!(overview.contains("user") && overview.contains("assistant"));
+
+    // Summary mit Tokenlänge (erreichtes Ergebnis).
+    let sum = &files["summary.txt"];
+    assert!(sum.contains("summary_tokens: 17"));
+    assert!(sum.contains("archived_msgs:  6"));
+    assert!(sum.contains("dateien gesichtet"));
+}
+
+/// Lokale (identische) Fassung der Protokoll-Übersicht über die
+/// Wire-Nachrichten – `message_overview` selbst ist privat.
+fn overview_from_wire(msgs: &[WireMessage]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (i, m) in msgs.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "[{i:3}] {:<10} T  {}",
+            m.role,
+            llm::estimate_tokens(m.content.as_deref().unwrap_or_default())
+        );
+    }
+    out
 }
 
 // ── Helfer (helpers) ──────────────────────────────────────────────────────

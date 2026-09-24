@@ -77,14 +77,15 @@ pub(crate) fn request_once(
     cancel: &AtomicBool,
     with_tools: bool,
     permission: Permission,
+    has_channel: bool,
 ) -> (Step, bool) {
     if !with_tools {
         return (
-            do_request(tx, session, client, ep, msgs, cancel, false, permission),
+            do_request(tx, session, client, ep, msgs, cancel, false, permission, has_channel),
             false,
         );
     }
-    let first = do_request(tx, session, client, ep, msgs, cancel, true, permission);
+    let first = do_request(tx, session, client, ep, msgs, cancel, true, permission, has_channel);
     if let Step::Err(msg) = &first {
         // Nur eine 400-Antwort mit Tool-/Funktions-Hinweis deutet auf fehlende
         // Werkzeug-Unterstützung hin – DANN ohne `tools` wiederholen. Andere
@@ -97,7 +98,7 @@ pub(crate) fn request_once(
         {
             // Retry ohne Tools: die Info geht sonst als WorkerEvent/Fehler
             // in die UI; ein Konsolen-Print würde das TUI-Layout zerschießen.
-            let retry = do_request(tx, session, client, ep, msgs, cancel, false, permission);
+            let retry = do_request(tx, session, client, ep, msgs, cancel, false, permission, has_channel);
             return (retry, false);
         }
     }
@@ -175,13 +176,15 @@ pub(crate) fn do_request(
     cancel: &AtomicBool,
     with_tools: bool,
     permission: Permission,
+    has_channel: bool,
 ) -> Step {
     // API-Shape aus dem Cache ermitteln (Default Chat Completions). `determined`
     // sagt, ob die Shape bestätigt oder nur geraten wurde – bei einer geratenen
     // Shape wird unten bei einem Server-Fehler (5xx) auch die andere API probiert.
     let shape_info = api::resolve_shape_info(ep);
     let mut shape = shape_info.shape;
-    let (mut url, mut body) = api::build_body(ep, shape, msgs, with_tools, permission, true, None);
+    let (mut url, mut body) =
+        api::build_body(ep, shape, msgs, with_tools, permission, has_channel, true, None);
     let mut shape_flipped = false;
 
     // Eine neue HTTP-Runde beginnt: Die Statusleiste setzt ihre
@@ -280,7 +283,9 @@ pub(crate) fn do_request(
         {
             shape_flipped = true;
             shape = shape.flipped();
-            let (u, b) = api::build_body(ep, shape, msgs, with_tools, permission, true, None);
+            let (u, b) = api::build_body(
+                ep, shape, msgs, with_tools, permission, has_channel, true, None,
+            );
             url = u;
             body = b;
             continue;

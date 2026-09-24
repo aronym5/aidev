@@ -729,6 +729,7 @@ fn prompt_tokens_nach_compaction_zaehlt_nur_aktuellen_kontext() {
         2,
         "[Compressed history - 1 earlier messages]\n\nzusammenfassung".into(),
         summary_tokens,
+        None,
     );
     // Neuer Turn NACH der Summary.
     s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
@@ -801,7 +802,7 @@ fn should_compact_verwendet_nach_compaction_nicht_altes_usage() {
     );
 
     // Kompaktierung (via Session): Turn 1 wird archiviert, Turn 2 überlebt.
-    s.apply_compaction("zusammenfassung".into(), 1_000, 0);
+    s.apply_compaction("zusammenfassung".into(), 1_000, 0, None);
 
     // UNMITTELBAR danach: Der echte aktuelle Kontext ist klein (Summary + Survivor-Shift)
     // → KEINE weitere Kompaktierung nötig, auch wenn das rohe `reported_usage`
@@ -843,7 +844,7 @@ fn last_usage_current_verwirft_usage_vor_der_compaction() {
     );
     // Compaction: Archive NACH dem alten Turn einfügen – dessen Usage ist
     // jetzt veraltet (stammt aus der größeren Historie).
-    s.chat.compact(2, "zusammenfassung".into(), 5);
+    s.chat.compact(2, "zusammenfassung".into(), 5, None);
     assert!(
         s.last_usage_current().is_none(),
         "Usage vor dem Archive wird verworfen"
@@ -877,6 +878,98 @@ fn last_usage_current_verwirft_usage_vor_der_compaction() {
     );
 }
 
+#[test]
+fn done_startet_auto_kompaktierung_nach_finaler_antwort() {
+    use crate::config::ResolvedEndpoint;
+    let cfg = base_config();
+    let ep = ResolvedEndpoint {
+        model: "test/m".into(),
+        api_model: "m".into(),
+        base_url: "http://127.0.0.1:1".into(),
+        api_key: "x".into(),
+        user_agent: String::new(),
+        context_window: 200_000,
+        force_tools: Vec::new(),
+    };
+    let mut a = app();
+    {
+        let s = &mut a.sessions[0];
+        let usage = |p: u64, c: u64| llm::Usage {
+            prompt_tokens: p,
+            completion_tokens: c,
+            total_tokens: p + c,
+            cached_tokens: None,
+        };
+        // Fünf Turns (letzter Usage über der Schwelle 160_000) – genug, dass
+        // die Projektion überhaupt einen Schnitt zulässt (≥ 3 user).
+        for i in 0..5 {
+            s.push_user_message(
+                format!("frage {i}"),
+                Some(Permission::Read),
+                "m".into(),
+            );
+            let aid = s.open_assistant(format!("g{i}"), format!("a{i}"));
+            s.chat.finalize_assistant(
+                aid,
+                std::time::Instant::now(),
+                usage(90_000 + 15_000 * i, 10_000),
+                0,
+                0,
+                false,
+            );
+        }
+        assert!(
+            should_compact(s, &cfg, &ep),
+            "Prämisse: Kontext über der Kompaktierungs-Schwelle"
+        );
+    }
+    // Finale Antwort abgeschlossen → `Done`: die Auto-Kompaktierung startet in
+    // einem Hintergrund-Thread (parallel zur nächsten Eingabe). Um den
+    // Thread-Race unempfindlich zu machen, akzeptiert der Test beide Zwischen-
+    // zustände: die Kompaktierung läuft (`compacting`) oder ihr Hintergrund-
+    // Aufruf ist bereits am Test-Endpunkt fehlgeschlagen (`error`).
+    a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
+    a.drain_events();
+    let s = &a.sessions[0];
+    assert_eq!(s.phase, Phase::Idle, "Turn ist abgeschlossen");
+    assert!(
+        s.compacting || s.error.is_some(),
+        "Auto-Kompaktierung nach der finalen Antwort angestoßen \
+         (läuft: compacting; oder Hintergrund-Aufruf scheiterte: error)"
+    );
+}
+
+#[test]
+fn done_unter_schwelle_startet_keine_auto_kompaktierung() {
+    let mut a = app();
+    {
+        let s = &mut a.sessions[0];
+        s.push_user_message("kleine frage".into(), Some(Permission::Read), "m".into());
+        let aid = s.open_assistant("g".into(), "a".into());
+        s.chat.finalize_assistant(
+            aid,
+            std::time::Instant::now(),
+            llm::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: None,
+            },
+            0,
+            0,
+            false,
+        );
+    }
+    a.tx.send(llm::WorkerEvent::Done(0)).unwrap();
+    a.drain_events();
+    let s = &a.sessions[0];
+    assert!(s.error.is_none(), "kein Hintergrund-Fehler erwartet");
+    assert!(
+        !s.compacting,
+        "unter der Schwelle startet Done keine Auto-Kompaktierung"
+    );
+}
+
 fn zero_usage() -> llm::Usage {
     llm::Usage {
         prompt_tokens: 0,
@@ -884,6 +977,51 @@ fn zero_usage() -> llm::Usage {
         total_tokens: 0,
         cached_tokens: None,
     }
+}
+
+/// Nach einem Abbruch (letzte Runde mit Null-Usage geschlossen) darf der
+/// nächste Turn die Context-Basis `prompt_base` nicht auf 0 zurücksetzen –
+/// statt des Null-Usages greift der letzte gute Anker/Schätzung.
+#[test]
+fn nach_abbruch_faellt_prompt_base_nicht_auf_0() {
+    let mut a = app();
+    {
+        let s = &mut a.sessions[0];
+        let usage = |p: u64, c: u64| llm::Usage {
+            prompt_tokens: p,
+            completion_tokens: c,
+            total_tokens: p + c,
+            cached_tokens: None,
+        };
+        // Abgeschlossener Turn mit Usage; `prompt_base` steht auf dem Anker.
+        s.push_user_message("frage eins".into(), Some(Permission::Read), "m".into());
+        let a1 = s.open_assistant("g1".into(), "antwort eins".into());
+        s.chat.finalize_assistant(
+            a1,
+            std::time::Instant::now(),
+            usage(90_000, 10_000),
+            0,
+            0,
+            false,
+        );
+        s.prompt_base = 90_000;
+        // Nächster Turn wird abgebrochen → geschlossen mit Null-Usage.
+        s.push_user_message("frage zwei".into(), Some(Permission::Read), "m".into());
+        let a2 = s.open_assistant("halb".into(), String::new());
+        s.chat
+            .finalize_assistant(a2, std::time::Instant::now(), usage(0, 0), 0, 0, true);
+    }
+    assert!(
+        a.sessions[0].last_usage_current().map(|u| u.total_tokens) == Some(0),
+        "Prämisse: abgebrochene Runde liefert Null-Usage"
+    );
+    a.sessions[0].editor.set_text("frage drei");
+    a.send_prompt(0);
+    assert!(
+        a.sessions[0].prompt_base > 0,
+        "prompt_base darf nach Abbruch nicht auf 0 fallen: {}",
+        a.sessions[0].prompt_base
+    );
 }
 
 // ── /run und Key-Handling ─────────────────────────────────────────────────

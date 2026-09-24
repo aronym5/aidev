@@ -132,20 +132,21 @@ These isolate changes and make review easy while sharing the same repository und
 New to a project? Open the channel picker with `Alt+C` — either choose an existing channel
 or build a new one via the "new channel" entry.
 
-| Key                      | Action                                                         |
-|--------------------------|----------------------------------------------------------------|
-| `Enter`                  | Send message / confirm in dialog                               |
-| `Esc`                    | Cancel running response / abort / close dialog                 |
-| `Ctrl+N`                 | New session / tab                                              |
-| `Ctrl+D` / `Ctrl+W`      | Close session / tab                                            |
-| `Alt+←` / `Alt+→`        | Switch session / tab (or `Ctrl+1`…`Ctrl+9`)                    |
-| `Alt+C`                  | Open channel picker (choose / manage / build new)              |
-| `Alt+M`                  | Open model picker (same as `/model` without argument)          |
-| `Alt+D`                  | Duplicate channel (own worktree)                               |
-| `Ctrl+O`                 | Options dialog                                                 |
-| `Alt++` / `Alt+-`        | Zoom in / Zoom out (detail / dialog / overview)                |
-| `Tab`                    | Change permission (read/write/execute, needs a channel)        |
-| `PgUp` / `PgDn`          | Scroll chat history                                            |
+| Key                          | Action                                                                                |
+|------------------------------|---------------------------------------------------------------------------------------|
+| `Enter`                      | Send message / confirm in dialog                                                      |
+| `Shift+Enter` / `Ctrl+Enter` | Insert line break in the input field (or `Alt+Enter` / `Ctrl+J`, depends on terminal) |
+| `Esc`                        | Cancel running response / abort / close dialog                                        |
+| `Ctrl+N`                     | New session / tab                                                                     |
+| `Ctrl+D` / `Ctrl+W`          | Close session / tab                                                                   |
+| `Alt+←` / `Alt+→`            | Switch session / tab (or `Ctrl+1`…`Ctrl+9`)                                           |
+| `Alt+C`                      | Open channel picker (choose / manage / build new)                                     |
+| `Alt+M`                      | Open model picker (same as `/model` without argument)                                 |
+| `Alt+D`                      | Duplicate channel (own worktree)                                                      |
+| `Ctrl+O`                     | Options dialog                                                                        |
+| `Alt++` / `Alt+-`            | Zoom in / Zoom out (detail / dialog / overview)                                       |
+| `Tab`                        | Change permission (read/write/execute, needs a channel)                               |
+| `PgUp` / `PgDn`              | Scroll chat history                                                                   |
 
 The input field supports multi-line editing, word-wrap, and cursor/selection movement
 with the arrow keys.

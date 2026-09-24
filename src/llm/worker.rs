@@ -7,10 +7,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::compact::{compact_chat_messages, looks_like_context_error};
+use super::compact::{can_compact, compact_chat_messages, looks_like_context_error, CompactTrigger};
 use super::http::{request_once, shared_client};
 use super::tools_def::{Step, ToolInvocation};
-use super::tools_exec::{run_command_display, run_tool_live, tool_activity, tool_label, ToolOut};
+use super::tools_exec::{
+    run_command_display, run_tool_live, run_webfetch, tool_activity, tool_label, ToolOut,
+};
 use super::wire::WireMessage;
 use super::{ExecConfirmReply, WorkerEvent};
 use crate::app::LiveChannel;
@@ -51,19 +53,35 @@ pub fn spawn_worker(
         // ODER der Provider force_tools gesetzt hat (Dummy-Definitionen für
         // nicht-permissions-erlaubte Tools, die trotzdem immer angeboten werden).
         let has_force_tools = !ep.force_tools.is_empty();
-        let mut with_tools = channel_cell.lock().expect("channel cell lock").is_some() || has_force_tools;
+        let has_channel = channel_cell
+            .lock()
+            .expect("channel cell lock")
+            .is_some();
+        let mut with_tools = has_channel || has_force_tools;
         // Reaktive Kompaktierung (bei context_length-Fehler) nur EINMAL pro Turn.
         let mut reactive_compacted = false;
 
         // Proaktive Kompaktierung: alte Nachrichten durch eine Zusammenfassung
-        // ersetzen, BEVOR der eigentliche Turn startet. Schlägt sie fehl (z. B.
-        // Historie zu kurz oder Endpunkt ohne max_tokens), wird die
-        // Original-Historie gesendet – kein harter Abbruch.
-        if compact {
+        // ersetzen, BEVOR der eigentliche Turn startet. Ohne möglichen Schnitt
+        // (`!can_compact`: Projektion zu kurz) wird gar nicht erst versucht –
+        // sonst entstünden nur ein „Compacting“-Blip und eine erfolglose
+        // Kompaktierung; die Original-Historie geht raus. Schlägt sie aus
+        // anderen Gründen fehl (z. B. Endpunkt ohne max_tokens), gilt dasselbe:
+        // kein harter Abbruch.
+        if compact && can_compact(&msgs) {
             let _ = tx.send(WorkerEvent::Compacting(session));
-            match compact_chat_messages(session, client, &config, &ep, &msgs, &cancel) {
-                Ok((repl, content, tokens)) => {
-                    let _ = tx.send(WorkerEvent::Compacted(session, content, tokens));
+            match compact_chat_messages(
+                session,
+                client,
+                &config,
+                &ep,
+                &msgs,
+                &cancel,
+                CompactTrigger::Proactive,
+                None,
+            ) {
+                Ok((repl, content, tokens, keep, log_path)) => {
+                    let _ = tx.send(WorkerEvent::Compacted(session, content, tokens, keep, log_path));
                     msgs = repl;
                 }
                 Err(_) => {
@@ -81,7 +99,7 @@ pub fn spawn_worker(
             // Request-Runde starten. `with_tools` schaltet um, wenn der Endpunkt
             // keine Werkzeug-Unterstützung meldet.
             let (step, supported) = request_once(
-                &tx, session, client, &ep, &msgs, &cancel, with_tools, permission,
+                &tx, session, client, &ep, &msgs, &cancel, with_tools, permission, has_channel,
             );
             // Endpunkt ohne Werkzeug-Unterstützung? Dann ohne Tools weiter.
             with_tools = with_tools && supported;
@@ -109,12 +127,28 @@ pub fn spawn_worker(
                     // die Session-Historie, und `repl` wird zur neuen
                     // Nachrichtenliste der folgenden Runden – Historie und
                     // gesendete Anfrage bleiben so im Turn konsistent.
-                    if !reactive_compacted && config.compact_auto && looks_like_context_error(&err)
+                    // `can_compact` guard: ohne echten Schnitt (z. B. ein
+                    // einziger, riesiger Query) kein sinnvoller Kompaktierungs-
+                    // aufruf möglich – dann bleibt nur der Fehlerpfad unten.
+                    if !reactive_compacted
+                        && config.compact_auto
+                        && can_compact(&msgs)
+                        && looks_like_context_error(&err)
                     {
                         let _ = tx.send(WorkerEvent::Compacting(session));
-                        match compact_chat_messages(session, client, &config, &ep, &msgs, &cancel) {
-                            Ok((repl, content, tokens)) => {
-                                let _ = tx.send(WorkerEvent::Compacted(session, content, tokens));
+                        match compact_chat_messages(
+                            session,
+                            client,
+                            &config,
+                            &ep,
+                            &msgs,
+                            &cancel,
+                            CompactTrigger::Reactive,
+                            None,
+                        ) {
+                            Ok((repl, content, tokens, keep, log_path)) => {
+                                let _ = tx
+                                    .send(WorkerEvent::Compacted(session, content, tokens, keep, log_path));
                                 msgs = repl;
                                 reactive_compacted = true;
                                 continue;
@@ -234,10 +268,19 @@ pub fn spawn_worker(
                                     sink.flush();
                                     out
                                 }
-                                None => ToolOut {
-                                    text: "ERROR: no channel bound".to_string(),
-                                    ..Default::default()
-                                },
+                                None => {
+                                    // Ohne Kanal läuft nur `webfetch` (reiner
+                                    // HTTP-Abruf, kein Dateisystem/Shell). Alle
+                                    // anderen Tools brauchen einen Kanal.
+                                    if t.name == "webfetch" {
+                                        run_webfetch(&t.arguments)
+                                    } else {
+                                        ToolOut {
+                                            text: "ERROR: no channel bound".to_string(),
+                                            ..Default::default()
+                                        }
+                                    }
+                                }
                             }
                         };
                         let _ = tx.send(WorkerEvent::ToolEnd(session, tool_activity(&result)));
@@ -281,7 +324,7 @@ pub fn spawn_worker(
             tool_calls: None,
             tool_call_id: None,
         });
-        let (step, _) = request_once(&tx, session, client, &ep, &msgs, &cancel, false, permission);
+        let (step, _) = request_once(&tx, session, client, &ep, &msgs, &cancel, false, permission, has_channel);
         match step {
             Step::Final { usage, parts } => {
                 if let Some(u) = usage {

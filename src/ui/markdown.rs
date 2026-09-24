@@ -53,6 +53,135 @@ pub(super) fn logical_lines<'a>(src: &'a str) -> Vec<Line<'a>> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Zeilenumbrüche im Chat erhalten („harte“ Absatzumbrüche statt CommonMark-
+// Soft-Breaks).
+//
+// CommonMark behandelt einen einzelnen Zeilenumbruch innerhalb eines Absatzes
+// als *Soft-Break*: `tui-markdown` rendert ihn als normales Leerzeichen, nur
+// eine Leerzeile (doppelter Umbruch) beginnt einen neuen Absatz. Für ein Chat-
+// Element, in dem man bewusst mehrzeilig schreibt (Shift+Enter im Eingabefeld),
+// ist das unerwartet: Jede getippte Zeile verschmilzt zu einer Zeile im
+// Chatdialog.
+//
+// `preserve_breaks` wandelt deshalb normale Absatzzeilen in *harte* Umbrüche
+// (CommonMark-Syntax: zwei Leerzeichen am Zeilenende) um, damit jede Eingabe-
+// zeile auch im Rendering sichtbar eine eigene Zeile bleibt. Markdown-
+// Konstrukte, die ihre Zeilen bereits strukturell trennen oder besondere
+// Semantik haben, bleiben unangetastet:
+//
+// - fenced Codeblöcke (```…```) – Zeilenumbrüche bleiben zeichengetreu,
+// - Tabellen (Zeilen mit `|`) – Spalten/Rahmen dürfen nicht verändert werden,
+// - thematische Trenner (`---`, `***`, `___`),
+// - `#`-Überschriften und Listenpunkte (`- `/`* `/`+ `/`1. `…) trennen auf
+//   Block-Ebene ohnehin jede Zeile,
+// - Leerzeilen (Absatzgrenzen) und die letzte Zeile ohne `\n`.
+//
+// Blockzitate (`>`-Zeilen) zählen BEWUSST zu den umzuwandelnden Absatzzeilen:
+// Aufeinanderfolgende `>`-Zeilen sind im Markdown ein einziger Absatz (Soft-
+// Break) und verschmelzen sonst ebenfalls zu einer Zeile.
+// ---------------------------------------------------------------------------
+
+/// Wandelt einfache Zeilenumbrüche innerhalb von Absätzen in harte Umbrüche
+/// um (zwei Leerzeichen vor dem Zeilenende), ohne Code-/Tabellen-/Listen-
+/// Semantik anzutasten.
+pub(super) fn preserve_breaks(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + src.len() / 8);
+    let mut in_code = false;
+    let mut lines = src.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let body = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = body.trim_start();
+        // Code-Fence bzw. Codeblock-Inhalt: unangetastet übernehmen.
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            out.push_str(line);
+            continue;
+        }
+        // Leerzeile (Absatzgrenze) oder Codeblock-Inhalt: nichts ändern.
+        if in_code || trimmed.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        // Tabellenzeile: zusammenhängende `|`-Zeilen unangetastet lassen.
+        if trimmed.starts_with('|') {
+            out.push_str(line);
+            while let Some(next) = lines.peek() {
+                let b = next.trim_end_matches('\n').trim_end_matches('\r');
+                let t = b.trim_start();
+                if t.starts_with('|') || is_delimiter_row(t) {
+                    out.push_str(next);
+                    lines.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Thematischer Trenner (---, ***, ___): unangetastet.
+        if is_thematic_break_str(trimmed) {
+            out.push_str(line);
+            continue;
+        }
+        // Block-Marker (Überschrift `#`, Listenpunkt `- `/`1. `): unangetastet –
+        // solche Zeilen sind bereits eigene logische Zeilen.
+        if line_starts_block(trimmed) {
+            out.push_str(line);
+            continue;
+        }
+        // Normale Absatzzeile: harter Umbruch, sofern nicht schon vorhanden.
+        if line.ends_with('\n') && !body.ends_with("  ") && !body.ends_with('\\') {
+            out.push_str(body);
+            out.push_str("  ");
+            out.push_str(if line.ends_with("\r\n") { "\r\n" } else { "\n" });
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// GFM-Tabellen-Begrenzungszeile? (`|---|`, `|:--|--:|`, `---|---`, …) – reine
+/// Kombination aus `|`, `:`, `-` und Leerzeichen mit mindestens einem `-`.
+fn is_delimiter_row(t: &str) -> bool {
+    t.chars().all(|c| matches!(c, '|' | ':' | '-' | ' ')) && t.contains('-')
+}
+
+/// Thematischer Trenner (`---`, `***`, `___`), CommonMark-Sicht.
+fn is_thematic_break_str(t: &str) -> bool {
+    t.len() >= 3 && t.chars().all(|c| matches!(c, '-' | '*' | '_'))
+}
+
+/// Beginnt die Zeile (nach Einrückung) mit einem Block-Level-Marker, der die
+/// Zeile ohnehin als eigene logische Zeile abgrenzt (Überschrift bzw. Listen-
+/// punkt)? Solche Zeilen brauchen keinen künstlichen harten Umbruch.
+///
+/// Absichtlich NICHT dabei: `>` (Blockzitat) – aufeinanderfolgende `>`-Zeilen
+/// sind im Markdown EIN Absatz (Soft-Break) und verschmelzen sonst, sie
+/// brauchen also genauso einen harten Umbruch wie Prosa.
+fn line_starts_block(trimmed: &str) -> bool {
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some('#') => true,
+        Some('-' | '*' | '+') => {
+            let rest = chars.as_str();
+            // Listenpunkt nur, wenn ein Leerzeichen folgt (`- item`); `-foo`
+            // oder `*fett*` am Zeilenanfang ist Absatz-Text.
+            rest.is_empty() || rest.starts_with(char::is_whitespace)
+        }
+        Some(c) if c.is_ascii_digit() => {
+            // Geordnete Liste: Ziffern, dann `.`/`)`, dann Whitespace/Ende.
+            let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+            (after_digits.starts_with('.') || after_digits.starts_with(')'))
+                && {
+                    let rest = after_digits.get(1..).unwrap_or("");
+                    rest.is_empty() || rest.starts_with(char::is_whitespace)
+                }
+        }
+        _ => false,
+    }
+}
+
 /// Orange Farbe für fetten/kursiven Text (Hervorhebung).
 const HIGHLIGHT_FG: Color = Color::Rgb(238, 198, 93); // Orange wie theme().warn
 

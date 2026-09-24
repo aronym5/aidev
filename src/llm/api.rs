@@ -168,12 +168,17 @@ fn is_responses_error_envelope(raw: &str) -> bool {
 
 /// Baut URL + Body für eine Anfrage in der gewählten Shape.
 /// `max_output_tokens` ist nur für nicht-streamende (Kompaktierungs-)Aufrufe.
+/// `has_channel` entscheidet, ob die volle Kanal-Werkzeugmenge (gebundener
+/// Kanal) oder nur die kanallose Minimalmenge (webfetch + Force-Dummies)
+/// in die `tools` geht – siehe `tool_definitions`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_body(
     ep: &ResolvedEndpoint,
     shape: ApiShape,
     msgs: &[WireMessage],
     with_tools: bool,
     permission: Permission,
+    has_channel: bool,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> (String, Value) {
@@ -181,10 +186,10 @@ pub(crate) fn build_body(
     let url = format!("{base}{}", shape.endpoint_path());
     let body = match shape {
         ApiShape::ChatCompletions => {
-            chat_body(ep, msgs, with_tools, permission, stream, max_output_tokens)
+            chat_body(ep, msgs, with_tools, permission, has_channel, stream, max_output_tokens)
         }
         ApiShape::Responses => {
-            responses_body(ep, msgs, with_tools, permission, stream, max_output_tokens)
+            responses_body(ep, msgs, with_tools, permission, has_channel, stream, max_output_tokens)
         }
     };
     (url, body)
@@ -195,6 +200,7 @@ fn chat_body(
     msgs: &[WireMessage],
     with_tools: bool,
     permission: Permission,
+    has_channel: bool,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> Value {
@@ -212,7 +218,7 @@ fn chat_body(
         body["stream_options"] = json!({ "include_usage": true });
     }
     if with_tools {
-        body["tools"] = json!(tool_definitions(permission, &ep.force_tools));
+        body["tools"] = json!(tool_definitions(permission, &ep.force_tools, has_channel));
     }
     body
 }
@@ -222,6 +228,7 @@ fn responses_body(
     msgs: &[WireMessage],
     with_tools: bool,
     permission: Permission,
+    has_channel: bool,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> Value {
@@ -235,7 +242,7 @@ fn responses_body(
         body["max_output_tokens"] = json!(toks);
     }
     if with_tools {
-        body["tools"] = json!(responses_tools(permission, &ep.force_tools));
+        body["tools"] = json!(responses_tools(permission, &ep.force_tools, has_channel));
     }
     body
 }
@@ -319,8 +326,8 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
 }
 
 /// Konvertiert die (Chat-förmigen) Tool-Definitionen in das Responses-Format.
-fn responses_tools(permission: Permission, force_tools: &[String]) -> Vec<Value> {
-    tool_definitions(permission, force_tools)
+fn responses_tools(permission: Permission, force_tools: &[String], has_channel: bool) -> Vec<Value> {
+    tool_definitions(permission, force_tools, has_channel)
         .into_iter()
         .map(|t| {
             let f = &t["function"];

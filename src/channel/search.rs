@@ -14,17 +14,22 @@ pub(super) fn search_files(
     context_lines: usize,
 ) -> Result<SearchResult, String> {
     match rg_search(pattern, path, timeout, include, context_lines) {
-        Ok((matches, raw)) => Ok(SearchResult {
-            matches,
-            note: None,
-            raw,
-        }),
+        Ok((matches, raw)) => {
+            let count = match_count_of(&matches, &raw);
+            Ok(SearchResult {
+                matches,
+                note: None,
+                match_count: count,
+                raw,
+            })
+        }
         Err(err) => {
             if err.starts_with("rg not available:") {
                 // Der Fallback-Hinweis steht bereits im `note`-Feld der
                 // SearchResult (und damit in der UI); ein Konsolen-Print
                 // würde das TUI-Layout zerschießen.
                 let (matches, raw) = grep_search(pattern, path, timeout, include, context_lines)?;
+                let count = match_count_of(&matches, &raw);
                 Ok(SearchResult {
                     matches,
                     note: Some(
@@ -32,6 +37,7 @@ pub(super) fn search_files(
                          the search was run with classic grep."
                             .to_string(),
                     ),
+                    match_count: count,
                     raw,
                 })
             } else {
@@ -39,6 +45,17 @@ pub(super) fn search_files(
             }
         }
     }
+}
+
+/// Exakte Trefferzahl: im Einzeltreffer-Modus die Anzahl der geparsten
+/// `pfad:zeile:text`-Treffer (nach Ignore-Filter), im Kontext-Modus die
+/// Trefferzeilen im Roh-Ausdruck. Kontext- und „--“-Zeilen hängen dabei nur an
+/// den Treffer-Einträgen an, erzeugen aber keinen eigenen Treffer – so liefert
+/// `parse_search_lines` auf den Roh-Ausdruck exakt die Trefferzeilen.
+fn match_count_of(matches: &[Match], raw: &Option<String>) -> usize {
+    raw.as_deref()
+        .map(|r| parse_search_lines(r).len())
+        .unwrap_or(matches.len())
 }
 
 /// Unterscheidet, ob `path` eine Datei oder ein Verzeichnis ist, und baut
@@ -310,6 +327,50 @@ mod tests {
     fn roh_ausdruck_verliert_punkt_schräg_präfix() {
         let raw = normalize_raw("./src/a.rs:3:x\n--\n./src/a.rs-2-kontext\n");
         assert_eq!(raw, "src/a.rs:3:x\n--\nsrc/a.rs-2-kontext");
+    }
+
+    #[test]
+    fn kontext_roh_zaehlt_nur_trefferzeilen() {
+        // Kontext-Ausgabe von rg/grep mit -C: Trefferzeilen (`pfad:zeile:text`)
+        // vs. Kontextzeilen (`pfad-zeile-text`) und „--“-Gruppentrenner. Die
+        // Trefferzahl ist die Anzahl der Trefferzeilen – NICHT die Zeilenanzahl
+        // des Ergebnis-Textes (die Kontext/`--` mitzählte).
+        let raw = "src/a.rs-1-  vor\nsrc/a.rs:2:match eins\nsrc/a.rs-3-  nach\n--\nsrc/b.rs:10:match zwei\n";
+        assert_eq!(match_count_of(&[], &Some(raw.into())), 2);
+        // Einzeltreffer-Modus: count = Anzahl der geparsten Treffer.
+        let ms = parse_search_lines("f:1:a\nf:2:b\nf:3:c\n");
+        assert_eq!(match_count_of(&ms, &None), 3);
+    }
+
+    /// End-to-End: `match_count` entspricht der echten Trefferzahl, sowohl im
+    /// Einzeltreffer- wie im Kontext-Modus (und eben nicht der Zeilenanzahl
+    /// inkl. Kontextzeilen). Übersprungen, wenn weder rg noch grep da ist.
+    #[test]
+    fn search_files_match_count_zaehlt_echte_treffer() {
+        if std::process::Command::new("grep")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            eprintln!("skipped: kein grep verfügbar");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("aidev-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "alpha\nbeta\nalpha\n").unwrap();
+        // Einzeltreffer-Modus: 2 Trefferzeilen.
+        let plain = search_files("alpha", &dir, Duration::from_secs(10), None, 0)
+            .expect("Suche lief (rg oder grep-Fallback)");
+        assert_eq!(plain.match_count, 2, "Trefferzeilen: {:?}", plain.matches);
+        // Kontext-Modus: ebenfalls 2 Treffer, obwohl der Roh-Text mehr Zeilen
+        // (Kontext + ggf. --) enthält.
+        let ctx = search_files("alpha", &dir, Duration::from_secs(10), None, 1)
+            .expect("Kontextsuche lief");
+        assert_eq!(ctx.match_count, 2, "Roh: {:?}", ctx.raw);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

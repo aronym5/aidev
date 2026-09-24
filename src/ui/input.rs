@@ -1,5 +1,7 @@
 //! Eingabe-Band am unteren Rand: Berechtigungs-Prompt, Textzeilen, Cursor.
 
+use std::ops::Range;
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -44,7 +46,6 @@ pub(crate) fn draw_input(
     let editor = &app.sessions[app.active].editor;
     let sel_range = editor.selected_range();
     let (cur_row, cur_off) = editor.cursor_row_col(layout);
-    let pad = " ".repeat(PAD);
     // Ohne Kanal gibt es keine Berechtigung: neutraler Prompt (`> `) in
     // gedämpfter Farbe, statt des read/write/exec-Labels in Berechtigungsfarbe.
     let bound = app.sessions[app.active].channel.is_some();
@@ -55,14 +56,46 @@ pub(crate) fn draw_input(
     };
     let (label, _) = permission_prompt(bound.then_some(app.sessions[app.active].permission));
 
+    let lines = build_input_lines(editor, layout, &label, color, sel_range);
+
+    let para = Paragraph::new(lines).style(Style::default().bg(theme().band_bg));
+    f.render_widget(para, area);
+
+    // Cursor-Position (Spalte relativ zum Text, zzgl. Abstand + Prompt).
+    // Solange ein Dialog offen ist (`show_cursor == false`), wird der Cursor
+    // hier nicht gesetzt – ratatui versteckt ihn dann nach dem Frame, statt
+    // dass er in der Eingabezeile stehen bleibt. Die Ausnahme (Dialog mit
+    // eigenem Textinput) setzt den Cursor separat in `draw_channel_builder`.
+    if show_cursor {
+        let cell_col = PAD + layout.indent + cur_off;
+        let x = area.x + cell_col.min(area.width.saturating_sub(1) as usize) as u16;
+        let y = area.y + (cur_row as u16).min(area.height.saturating_sub(1));
+        f.set_cursor_position((x, y));
+    }
+}
+
+/// Baut die sichtbaren Textzeilen des Eingabefelds aus dem Umbruch-Layout.
+/// Je `layout`-Zeile eine `Line` (`<PAD>`, Prompt bzw. hängender Einzug, dann
+/// die Zeichen des Zeilenbereichs). Selektion wird invertiert dargestellt.
+///
+/// Als eigene Funktion, damit die Darstellung mehrzeiliger Eingaben direkt
+/// getestet werden kann (das Layout schneidet explizite `\n` aus den Bereichen
+/// heraus; `\n` wird hier NIE als Zeichen in eine Zeile gerendert).
+fn build_input_lines(
+    editor: &crate::editor::Editor,
+    layout: &InputLayout,
+    label: &str,
+    color: Color,
+    sel_range: Option<Range<usize>>,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::with_capacity(layout.rows());
     for row in 0..layout.rows() {
-        let mut spans: Vec<Span> = vec![Span::raw(pad.clone())];
+        let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(PAD))];
         if row == 0 {
             // Berechtigungs-Prompt: nur das kurze Label, fett in der
             // Berechtigungsfarbe, damit der Userinput hervorgehoben ist.
             spans.push(Span::styled(
-                label.clone(),
+                label.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
         } else {
@@ -80,19 +113,76 @@ pub(crate) fn draw_input(
         }
         lines.push(Line::from(spans));
     }
+    lines
+}
 
-    let para = Paragraph::new(lines).style(Style::default().bg(theme().band_bg));
-    f.render_widget(para, area);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::editor::Editor;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
-    // Cursor-Position (Spalte relativ zum Text, zzgl. Abstand + Prompt).
-    // Solange ein Dialog offen ist (`show_cursor == false`), wird der Cursor
-    // hier nicht gesetzt – ratatui versteckt ihn dann nach dem Frame, statt
-    // dass er in der Eingabezeile stehen bleibt. Die Ausnahme (Dialog mit
-    // eigenem Textinput) setzt den Cursor separat in `draw_channel_builder`.
-    if show_cursor {
-        let cell_col = PAD + layout.indent + cur_off;
-        let x = area.x + cell_col.min(area.width.saturating_sub(1) as usize) as u16;
-        let y = area.y + (cur_row as u16).min(area.height.saturating_sub(1));
-        f.set_cursor_position((x, y));
+    /// Zeichnet den Eingabe-Inhalt `text` genau wie `draw_input` (Prompt `> `,
+    /// PAD, hängender Einzug) in einen Test-Screen und liefert die Zellen je Zeile.
+    fn render_input(text: &str, width: u16, height: u16) -> Vec<String> {
+        let mut ed = Editor::new(width as usize);
+        ed.insert_snippet(text);
+        ed.set_indent(2); // "> "
+        let layout = ed.layout();
+        let lines = build_input_lines(&ed, &layout, "> ", Color::White, None);
+        let para = Paragraph::new(lines).style(Style::default().bg(theme().band_bg));
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).expect("TestBackend");
+        term.draw(|f| f.render_widget(para, f.area())).expect("render");
+        let buf = term.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf.get(x, y).symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Kern der Frage „Wird mehrzeilige Eingabe im Feld dargestellt?“:
+    /// Ein eingefügter Text mit `\n` MUSS als mehrere sichtbare Zeilen erscheinen –
+    /// das `\n` selbst ist dabei nirgends als Zeichen zu sehen.
+    #[test]
+    fn mehrzeiliger_paste_erscheint_als_mehrere_zeilen() {
+        let rows = render_input("aaa\nbbb", 20, 4);
+        for (y, r) in rows.iter().enumerate() {
+            println!("row {y}: {r:?}");
+        }
+        // Zeile 0: "<PAD><Prompt>aaa", Zeile 1: "<PAD>  bbb".
+        assert_eq!(&rows[0][0..4], "  > ");
+        assert_eq!(&rows[0][4..7], "aaa");
+        assert_eq!(&rows[1][0..4], "    ");
+        assert_eq!(&rows[1][4..7], "bbb");
+        // Kein `\n` als sichtbares Zeichen irgendwo.
+        assert!(rows.iter().all(|r| !r.contains('\n')));
+    }
+
+    /// Auch CRLF/CR aus der Zwischenablage entsteht durch die Normalisierung in
+    /// `insert_snippet` ein sichtbarer Umbruch (zwei getrennte Zeilen) statt
+    /// einer endlosen Zeile.
+    #[test]
+    fn crlf_paste_zeigt_zeilenumbruch() {
+        let rows = render_input("aaa\r\nbbb", 20, 4);
+        for (y, r) in rows.iter().enumerate() {
+            println!("row {y}: {r:?}");
+        }
+        assert_eq!(&rows[0][4..7], "aaa");
+        assert_eq!(&rows[1][4..7], "bbb");
+        assert_ne!(rows[0], rows[1]);
+    }
+
+    /// Alleinstehendes `\r` (Alt-Mac-Stil) erzeugt ebenfalls eine sichtbare
+    /// zweite Zeile – konsistent mit dem Chat, der an CR umbricht.
+    #[test]
+    fn cr_paste_zeigt_zeilenumbruch() {
+        let rows = render_input("aaa\rbbb", 20, 4);
+        assert_eq!(&rows[0][4..7], "aaa");
+        assert_eq!(&rows[1][4..7], "bbb");
     }
 }

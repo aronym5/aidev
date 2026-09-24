@@ -21,6 +21,12 @@ use serde_json::Map;
 pub(crate) struct ToolOut {
     /// Text, der dem Modell als `tool`-Nachricht zurückgegeben wird.
     pub(crate) text: String,
+    /// Exakte Gesamtzahl der gefundenen Ergebnisse für `grep`/`glob` (0 sonst).
+    pub(crate) num_results: u32,
+    /// Wie viele davon im Ergebnistext tatsächlich berichtet werden (durch
+    /// Anzeige-Decke/Kürzung). `reported < num_results` ⇒ die Anzeige zeigt
+    /// „R of N results“, sonst nur „N results“.
+    pub(crate) num_results_reported: u32,
     /// Abgesetzte Konsolen-Box für `run`-Aufrufe mit Ausgabe.
     pub(crate) run: Option<RunInfo>,
     /// Diff-Daten für `edit`-Aufrufe (zweispaltige Chat-Anzeige).
@@ -93,33 +99,47 @@ pub(crate) fn run_tool_live(
                     }
                     _ => text.push_str("No matches.\n"),
                 }
-            } else {
-                // Zwitter aus count und files_with_matches: pro Datei die
-                // Anzahl ihrer Funde, in Fundreihenfolge.
-                let mut counts: Vec<(&str, usize)> = Vec::new();
-                for m in &result.matches {
-                    match counts.last_mut() {
-                        Some((p, c)) if *p == m.path.as_str() => *c += 1,
-                        _ => counts.push((m.path.as_str(), 1)),
-                    }
-                }
-                if counts.is_empty() {
-                    text.push_str("No matches.\n");
-                } else {
-                    for (i, (p, c)) in counts.iter().enumerate() {
-                        if i >= GREP_FILE_CAP {
-                            text.push_str(&format!(
-                                "... {} more files\n",
-                                counts.len() - GREP_FILE_CAP
-                            ));
-                            break;
-                        }
-                        text.push_str(&format!("{p}:{c}\n"));
-                    }
+                let text = truncate(&text, TOOL_RESULT_CAP);
+                let reported = count_match_lines(&text) as u32;
+                return Ok(ToolOut {
+                    text,
+                    num_results: result.match_count as u32,
+                    num_results_reported: reported,
+                    ..Default::default()
+                });
+            }
+            // Zwitter aus count und files_with_matches: pro Datei die
+            // Anzahl ihrer Funde, in Fundreihenfolge.
+            let mut counts: Vec<(&str, usize)> = Vec::new();
+            for m in &result.matches {
+                match counts.last_mut() {
+                    Some((p, c)) if *p == m.path.as_str() => *c += 1,
+                    _ => counts.push((m.path.as_str(), 1)),
                 }
             }
+            if counts.is_empty() {
+                text.push_str("No matches.\n");
+            } else {
+                for (i, (p, c)) in counts.iter().enumerate() {
+                    if i >= GREP_FILE_CAP {
+                        text.push_str(&format!(
+                            "... {} more files\n",
+                            counts.len() - GREP_FILE_CAP
+                        ));
+                        break;
+                    }
+                    text.push_str(&format!("{p}:{c}\n"));
+                }
+            }
+            let text = truncate(&text, TOOL_RESULT_CAP);
+            // Gesamt = Summe aller Datei-Treffer; berichtet = Summe der
+            // tatsächlich gelisteten Dateien (GREP_FILE_CAP-Decke).
+            let shown = counts.len().min(GREP_FILE_CAP);
+            let reported = counts[..shown].iter().map(|(_, c)| *c).sum::<usize>() as u32;
             Ok(ToolOut {
-                text: truncate(&text, TOOL_RESULT_CAP),
+                text,
+                num_results: result.match_count as u32,
+                num_results_reported: reported,
                 ..Default::default()
             })
         }
@@ -143,31 +163,14 @@ pub(crate) fn run_tool_live(
             }
             Ok(ToolOut {
                 text: truncate(&text, TOOL_RESULT_CAP),
+                // Gesamtzahl der gefundenen Pfade (unabhängig von der
+                // Anzeige-Decke GLOB_RESULT_CAP); berichtet nur bis zur Decke.
+                num_results: paths.len() as u32,
+                num_results_reported: paths.len().min(GLOB_RESULT_CAP) as u32,
                 ..Default::default()
             })
         }
-        "webfetch" => {
-            let url = arg_str(&v, "url")?;
-            // Der Prompt geht nicht an die Seite – er dokumentiert die
-            // Absicht und erscheint über das Label im Verlauf (tool_label).
-            arg_str(&v, "prompt")?;
-            let out = super::webfetch::fetch(&url)?;
-            let mut text = format!(
-                "[HTTP {} / {:.1} kB / {}]\n",
-                out.status,
-                out.bytes as f64 / 1024.0,
-                out.final_url
-            );
-            text.push_str(out.text.trim_end());
-            text.push('\n');
-            if out.truncated {
-                text.push_str("...[Body truncated at size cap]\n");
-            }
-            Ok(ToolOut {
-                text: truncate(&text, TOOL_RESULT_CAP),
-                ..Default::default()
-            })
-        }
+        "webfetch" => webfetch_out(&v),
         "read" => {
             let path = arg_str(&v, "path")?;
             let content = ch.read(Path::new(&path))?;
@@ -321,6 +324,76 @@ pub(crate) fn run_tool_live(
     }
 }
 
+/// Führt das `webfetch`-Werkzeug aus – das einzige Tool, das auch OHNE
+/// gebundenen Kanal funktioniert (reiner HTTP-Abruf, kein Dateisystem/Shell).
+/// Enthält das Argument-Parsing samt Leere-Objekt-Prüfung, damit der kanallose
+/// Ausführungspfad im Worker dieselben Fehlermeldungen liefert wie ein
+/// Kanal-Aufruf.
+pub(crate) fn run_webfetch(args: &str) -> ToolOut {
+    let v: Value = if args.trim().is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(args).unwrap_or_else(|_| Value::Object(Map::new()))
+    };
+    if v.as_object().is_some_and(Map::is_empty) {
+        return ToolOut {
+            text: "ERROR: The \"webfetch\" tool received an empty argument object \
+                   (its required arguments were missing). This usually means the \
+                   streamed tool arguments were truncated or corrupted in transit \
+                   (a provider streaming glitch). Re-issue the identical webfetch \
+                   call with the exact same parameters."
+                .to_string(),
+            ..Default::default()
+        };
+    }
+    match webfetch_out(&v) {
+        Ok(t) => t,
+        Err(err) => ToolOut {
+            text: format!("ERROR: {err}"),
+            ..Default::default()
+        },
+    }
+}
+
+/// Erzeugt das Ergebnis eines `webfetch`-Aufrufs aus dem bereits geparsten
+/// Argument-Objekt. Kanal-unabhängig, daher geteilt zwischen `run_tool_live`
+/// und dem kanallosen `run_webfetch`.
+fn webfetch_out(v: &Value) -> Result<ToolOut, String> {
+    let url = arg_str(v, "url")?;
+    // Der Prompt geht nicht an die Seite – er dokumentiert die Absicht und
+    // erscheint über das Label im Verlauf (tool_label).
+    arg_str(v, "prompt")?;
+    let out = super::webfetch::fetch(&url)?;
+    let mut text = format!(
+        "[HTTP {} / {:.1} kB / {}]\n",
+        out.status,
+        out.bytes as f64 / 1024.0,
+        out.final_url
+    );
+    text.push_str(out.text.trim_end());
+    text.push('\n');
+    if out.truncated {
+        text.push_str("...[Body truncated at size cap]\n");
+    }
+    Ok(ToolOut {
+        text: truncate(&text, TOOL_RESULT_CAP),
+        ..Default::default()
+    })
+}
+
+/// Zählt Trefferzeilen (`pfad:zeile:…`) in einem (ggf. per Zeichen
+/// gekürzten) grep-Kontext-Text – Kontext- und „--“-Zeilen zählen nicht.
+/// Liefert, wie viele Treffer der finale Text des Modells noch enthält.
+fn count_match_lines(s: &str) -> usize {
+    s.lines()
+        .filter(|l| {
+            l.split_once(':')
+                .and_then(|(_, rest)| rest.split_once(':').map(|(n, _)| n))
+                .is_some_and(|n| n.parse::<usize>().is_ok())
+        })
+        .count()
+}
+
 /// Erzeugt die `ToolActivity`-Abschlussdaten eines beendeten Werkzeugs: den
 /// vollen Ergebnistext (für Modell + API-Projektion) und die UI-Render-Zusätze
 /// (Konsolen-Box, Diff, read-Range). Label/Status der Anzeige kommen aus dem
@@ -328,6 +401,8 @@ pub(crate) fn run_tool_live(
 pub(crate) fn tool_activity(result: &ToolOut) -> ToolActivity {
     ToolActivity {
         output_full: result.text.clone(),
+        num_results: result.num_results,
+        num_results_reported: result.num_results_reported,
         run: result.run.clone(),
         diff: result.diff.clone(),
         read: result.read.clone(),
@@ -446,5 +521,23 @@ pub(crate) fn run_command_display(t: &ToolInvocation) -> String {
         "(empty command)".to_string()
     } else {
         parts.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::count_match_lines;
+
+    #[test]
+    fn count_match_lines_zaehlt_nur_trefferzeilen() {
+        // Kontext-Ausgabe von rg/grep: `pfad:zeile:…` = Treffer, `pfad-zeile-…`
+        // = Kontext, `--` = Gruppentrenner.
+        let ctx = "src/a.rs-1-  vor\nsrc/a.rs:2:treffer eins\nsrc/a.rs-3-  nach\n--\nsrc/a.rs:4:treffer zwei\n";
+        assert_eq!(count_match_lines(ctx), 2);
+        // Auch in einem per Zeichen gekürzten Ausschnitt zählt nur, was steht.
+        assert_eq!(count_match_lines("--\nsrc/a.rs:9:letzter treffer\n"), 1);
+        // Strukturlose Zeilen (z. B. Notiz) erzeugen keine Treffer.
+        assert_eq!(count_match_lines("Note: ripgrep fehlt.\nfoo\n"), 0);
+        assert_eq!(count_match_lines(""), 0);
     }
 }

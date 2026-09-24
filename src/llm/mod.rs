@@ -21,6 +21,13 @@ pub struct ToolActivity {
     pub diff: Option<crate::diff::DiffInfo>,
     /// Bei `read` als Fenster-Lesung: die kompakt gelesenen Zeilennummern.
     pub read: Option<ReadInfo>,
+    /// Exakte Gesamtzahl der `grep`/`glob`-Ergebnisse (`ToolKind.num_results`),
+    /// sonst 0. Wird aus dem Tool-Layer durchgereicht – nicht aus der Ausgabe
+    /// abgeleitet, damit die Anzeige keine Zeilen-Heuristik nutzt.
+    pub num_results: u32,
+    /// Wie viele davon der Ergebnistext tatsächlich berichtet (Anzeige-Decke/
+    /// Kürzung). `< num_results` ⇒ Anzeige „R of N results“ statt nur „N“.
+    pub num_results_reported: u32,
 }
 
 /// Grobe Token-Schätzung für Text (4 Zeichen ≈ 1 Token), wie in der
@@ -141,8 +148,10 @@ pub enum WorkerEvent {
     /// grenze eingefügt wird: die älteren Nachrichten bleiben im Speicher/der
     /// UI erhalten, werden aber von `api_messages` nicht mehr mitgesendet.
     /// `tokens` ist die Token-Zahl der Summary (`completion_tokens` des
-    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung).
-    Compacted(usize, String, u64),
+    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung), `keep` das dabei
+    /// verwendete (über die Kandidaten entschiedene) `compact_keep_turns` und
+    /// `log_path` der Protokollordner der Kompaktierung (falls geschrieben).
+    Compacted(usize, String, u64, usize, Option<String>),
     /// Hintergrund-Laden des Channel Builders abgeschlossen: (images_with_wd, container_info, worktrees)
     BuilderLoaded(
         Vec<(String, Option<String>)>,
@@ -236,14 +245,17 @@ mod wire;
 mod worker;
 
 // Externe API: von app.rs / ui.rs genutzt
-pub(crate) use compact::spawn_compact;
+pub(crate) use compact::{can_compact, spawn_compact, CompactTrigger};
 pub(crate) use http::shared_client;
 pub(crate) use wire::{WireFunction, WireMessage, WireToolCall};
 pub(crate) use worker::{spawn_user_run, spawn_worker};
 
 // Test-Hilfsre-exports: nur für das Testmodul (tests.rs) dieses Moduls
 #[cfg(test)]
-pub(crate) use compact::{compact_chat_messages, looks_like_context_error, wire_compact_boundary};
+pub(crate) use compact::{
+    compact_chat_messages, decide_keep, looks_like_context_error, plan_candidates,
+    render_compaction_log, wire_compact_boundary, CompactionLog,
+};
 #[cfg(test)]
 pub(crate) use helpers::{
     civil_from_days, reasoning_contract_hint, server_error_summary, truncate, with_debug,

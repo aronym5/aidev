@@ -63,6 +63,12 @@ pub struct SearchResult {
     /// (`pfad-zeile-text`) und „--“-Gruppentrenner. In diesem Modus ist
     /// `matches` leer; das Rendering reicht `raw` direkt durch.
     pub raw: Option<String>,
+    /// Exakte Anzahl der Trefferzeilen, unabhängig vom Modus: im
+    /// Einzeltreffer-Modus identisch zu `matches.len()` (nach Ignore-Filter),
+    /// im Kontext-Modus aus den Trefferzeilen des Roh-Ausdrucks gezählt.
+    /// Die Anzeige / das `ToolKind` zeigt damit die echte Zahl statt einer
+    /// Zeilen-Heuristik des Ergebnistextes.
+    pub match_count: usize,
 }
 
 /// Ergebnis eines Kommando-Laufs.
