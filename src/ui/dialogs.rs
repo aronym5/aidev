@@ -260,11 +260,20 @@ pub(crate) fn draw_model_picker(f: &mut Frame, app: &mut App) {
             ModelPick::Default => model_picker_row("(default)", sel, None),
             ModelPick::Model { key, display } => {
                 // Farblicher Status-Indikator aus der Model-Registry.
-                let color = registry.status(key).map(|s| match s {
-                    crate::app::models::ModelStatus::ConfigAndFetched => theme().ok, // grün
-                    crate::app::models::ModelStatus::ConfigStale => theme().err,     // rot
-                    crate::app::models::ModelStatus::FetchedOnly => theme().muted,   // grau
-                });
+                // Ein Probe-Test (grün/gelb/rot) hat Vorrang vor dem reinen
+                // Refresh-Status (grün/grau/rot).
+                let color = match registry.health(key) {
+                    crate::app::models::ModelHealth::Green => Some(theme().ok),   // grün
+                    crate::app::models::ModelHealth::Yellow => Some(theme().warn), // gelb
+                    crate::app::models::ModelHealth::Red => Some(theme().err),    // rot
+                    crate::app::models::ModelHealth::None => {
+                        registry.status(key).map(|s| match s {
+                            crate::app::models::ModelStatus::ConfigAndFetched => theme().ok, // grün
+                            crate::app::models::ModelStatus::ConfigStale => theme().err,     // rot
+                            crate::app::models::ModelStatus::FetchedOnly => theme().muted,   // grau
+                        })
+                    }
+                };
                 model_picker_row(display, sel, color)
             }
         },

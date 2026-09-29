@@ -13,14 +13,46 @@ use std::time::{Duration, Instant};
 
 use super::RunOut;
 
+/// Hält die vom Runner erzeugte Prozessgruppe aktiv, bis sie ausdrücklich
+/// beendet wurde. Dadurch wird die Gruppe auch bei unerwarteten Rückgaben
+/// (z. B. Pipe-Fehlern oder einem Panic im Live-Callback) bereinigt.
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn terminate(&mut self) {
+        if self.armed {
+            kill_process_group(self.pid);
+            self.armed = false;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 /// Führt ein Kommando mit Timeout aus und kapselt Stdout/Stderr.
 ///
 /// Robust gegen hängende Ausgabepipes: Es wird **nie auf EOF gewartet**. Nach
 /// Kind-Ende bzw. Timeout wird der Puffer nur noch kurz (Grace-Fenster)
 /// nachgelesen – auch wenn ein Enkelprozess die Pipes geerbt hat und offen hält.
-/// Bei Timeout wird das Kind samt seiner Prozessgruppe beendet; vor dem
-/// Gruppen-Kill wird die Gruppenzugehörigkeit gegen `/proc` verifiziert, damit
-/// nie eine fremde Prozessgruppe getroffen werden kann.
+/// Bei **jedem** Ende des direkten Kindprozesses – auch bei normalem Erfolg –
+/// wird dessen Prozessgruppe beendet. Dadurch werden auch gewöhnliche
+/// `cmd &`-/`nohup`-Hintergrundprozesse nicht als Aufräumer zurückgelassen.
+/// Prozesse, die sich mit `setsid`/Daemonisierung aktiv aus der Gruppe lösen,
+/// können damit nicht erfasst werden.
 ///
 /// (Auf Nicht-Unix-Systemen fällt die Funktion auf die einfachere
 /// Thread-basierte Variante zurück, die an geerbten Pipes hängen kann.)
@@ -61,12 +93,15 @@ pub(super) fn run_with_timeout_live(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0); // eigenes PGID → Gruppen-Kill bei Timeout möglich
+        .process_group(0); // eigenes PGID → Gruppen-Kill bei jedem Ende möglich
 
     let mut child = builder
         .spawn()
         .map_err(|e| format!("{cmd} nicht startbar: {e}"))?;
     let pid = child.id();
+    // Der Guard deckt auch Fehlerpfade ab, auf denen die Funktion vor dem
+    // normalen Ende des Kindes zurückkehrt.
+    let mut process_group = ProcessGroupGuard::new(pid);
 
     // Pipes non-blocking anlegen – gelesen wird in einer einzigen Schleife.
     let mut stdout = child.stdout.take().expect("stdout-Pipe");
@@ -93,7 +128,7 @@ pub(super) fn run_with_timeout_live(
         // beenden und – wie beim Timeout – nur noch ein kurzes Restfenster
         // nachlesen, damit der Endwert als "abgebrochen" gemeldet wird.
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            kill_process_group(pid);
+            process_group.terminate();
             let _ = child.kill();
             let _ = child.wait();
             exit_code = None; // abgebrochen → als abgebrochen markieren
@@ -120,7 +155,27 @@ pub(super) fn run_with_timeout_live(
         }
 
         if !done && !timed_out {
-            if let Some(status) = child.try_wait().map_err(|e| format!("wait-Fehler: {e}"))? {
+            // Linux: `try_wait()` würde den Leader sofort reapen. Mit WNOWAIT
+            // erkennen wir sein Ende ohne Freigabe der PID; so kann die Gruppe
+            // noch sicher bereinigt und erst danach der Exit-Status abgeholt
+            // werden. Auf anderen Unixen bleibt `try_wait()` der Fallback.
+            #[cfg(target_os = "linux")]
+            let status =
+                if child_exited_without_reaping(pid).map_err(|e| format!("wait-Fehler: {e}"))? {
+                    process_group.terminate();
+                    Some(child.wait().map_err(|e| format!("wait-Fehler: {e}"))?)
+                } else {
+                    None
+                };
+            #[cfg(not(target_os = "linux"))]
+            let status = child.try_wait().map_err(|e| format!("wait-Fehler: {e}"))?;
+
+            if let Some(status) = status {
+                // Auch bei erfolgreichem/fehlerhaftem normalem Shell-Ende
+                // müssen verwaiste Nachkommen aus derselben Prozessgruppe
+                // sterben, bevor das Tool-Ergebnis an den Worker zurückgeht.
+                #[cfg(not(target_os = "linux"))]
+                process_group.terminate();
                 exit_code = status.code();
                 done = true;
                 drain_until = Some(Instant::now() + GRACE);
@@ -129,7 +184,7 @@ pub(super) fn run_with_timeout_live(
 
         if !timed_out && !done && Instant::now() >= deadline {
             timed_out = true;
-            kill_process_group(pid);
+            process_group.terminate();
             let _ = child.kill();
             let _ = child.wait();
             exit_code = None; // Timeout → als abgebrochen markieren
@@ -204,23 +259,74 @@ pub(super) fn trim_front(out: &mut String, cap: usize) -> bool {
     true
 }
 
-/// Beendet bei Timeout die Prozessgruppe des Kindes (`kill(-pgid, SIGKILL)`),
-/// damit auch Nachkommen sterben. Erst wenn auf Linux verifiziert wurde, dass
-/// das Kind noch in ihrer eigenen Gruppe liegt (`pgrp == pid`), kann der
-/// Gruppen-Kill ausschließlich unsere eigene Gruppe treffen – andernfalls
-/// bleibt es beim direkten Kill des Kindes (durch den Aufrufer).
+/// Prefix von `siginfo_t`, den Linux für ein Child-Event garantiert belegt.
+/// `libc` bildet die si_pid-Information auf Linux als Union-/Padding-Feld ab;
+/// dieses repr(C)-Prefix vermeidet die seit libc 0.2.54 versteckten Felder.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct ChildExitInfo {
+    _si_signo: libc::c_int,
+    _si_errno: libc::c_int,
+    _si_code: libc::c_int,
+    // Die Union im Linux-siginfo_t ist auf 64-Bit-Systemen 8-byte-aligned.
+    #[cfg(target_pointer_width = "64")]
+    _padding: libc::c_int,
+    si_pid: libc::pid_t,
+}
+
+/// Prüft, ob `pid` beendet ist, ohne den Prozess zu reapen. Dadurch bleibt
+/// seine PID/PGID bis zum anschließenden Gruppen-Kill unserem Runner zugeordnet.
+#[cfg(target_os = "linux")]
+fn child_exited_without_reaping(pid: u32) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            let event = unsafe {
+                std::ptr::read_unaligned(
+                    (&mut info as *mut libc::siginfo_t).cast::<ChildExitInfo>(),
+                )
+            };
+            return Ok(event.si_pid == pid as libc::pid_t);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// Beendet die vom Runner erzeugte Prozessgruppe (`kill(-pgid, SIGKILL)`),
+/// damit auch Nachkommen sterben. Das wird sowohl bei Timeout/Cancel als auch
+/// nach normalem Ende des direkten Kindes aufgerufen: `nohup … &` und
+/// vergleichbare Jobs erben normalerweise die PGID des Kindes, auch wenn die
+/// aufrufende Shell bereits beendet ist.
+///
+/// `setsid` und echte Daemonisierung können die Gruppe bewusst verlassen und
+/// benötigen eine stärkere Isolation (z. B. cgroup/Container-Supervisor).
 #[cfg(unix)]
 pub(super) fn kill_process_group(pid: u32) {
     #[cfg(target_os = "linux")]
-    {
-        if proc_pgrp(pid) == Some(pid as i32) {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-        }
+    if proc_pgrp(pid) != Some(pid as i32) {
+        // Der Leader ist nicht (mehr) in seiner eigenen Gruppe. Das ist im
+        // normalen WNOWAIT-Pfad nicht zu erwarten; bei unerwarteten Races
+        // bleibt der direkte Child-Kill beim Aufrufer der Fallback.
+        return;
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = pid;
+
+    let Ok(pgid) = i32::try_from(pid) else {
+        return;
+    };
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
 }
 
 /// Liest die Prozessgruppen-ID (`pgrp`, Feld 5) des Prozesses `pid` aus

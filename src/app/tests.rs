@@ -35,7 +35,6 @@ fn base_config() -> Config {
     Config {
         model: "test/m".into(),
         provider: test_provider("http://127.0.0.1:1"),
-        max_tool_rounds: 16,
         default_channel: None,
         channels: std::collections::HashMap::new(),
         context_window: 200_000,
@@ -1012,8 +1011,9 @@ fn nach_abbruch_faellt_prompt_base_nicht_auf_0() {
             .finalize_assistant(a2, std::time::Instant::now(), usage(0, 0), 0, 0, true);
     }
     assert!(
-        a.sessions[0].last_usage_current().map(|u| u.total_tokens) == Some(0),
-        "Prämisse: abgebrochene Runde liefert Null-Usage"
+        a.sessions[0].last_usage_current().is_none(),
+        "Prämisse: abgebrochene Runde liefert keinen Usage (keine bestätigte \
+         Kontextlänge)"
     );
     a.sessions[0].editor.set_text("frage drei");
     a.send_prompt(0);
@@ -1918,4 +1918,53 @@ fn reload_liefert_neue_config_und_baut_registries_um() {
         Some("Config neu geladen."),
         "Statusmeldung gesetzt"
     );
+}
+
+#[test]
+fn model_probe_event_aktualisiert_registry_status_gelb_dann_rot() {
+    let mut a = app();
+    // Modell per Refresh in die Registry holen.
+    apply_refresh(&mut a, &[("test/fast", None)]);
+    let key = "test/fast";
+    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::None);
+
+    // Erste Fehlermeldung (Chat Completions) → gelb.
+    a.tx
+        .send(llm::WorkerEvent::ModelProbe {
+            model: key.into(),
+            protocol: llm::ApiProtocol::ChatCompletions,
+            ok: false,
+        })
+        .unwrap();
+    assert!(a.drain_events(), "Probe-Ereignis verarbeitet");
+    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Yellow);
+
+    // Zweite Fehlermeldung (Responses) → auf allen Protokollen getestet, nur
+    // Fehler, war bereits gelb → rot.
+    a.tx
+        .send(llm::WorkerEvent::ModelProbe {
+            model: key.into(),
+            protocol: llm::ApiProtocol::Responses,
+            ok: false,
+        })
+        .unwrap();
+    assert!(a.drain_events(), "Probe-Ereignis verarbeitet");
+    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Red);
+}
+
+#[test]
+fn model_probe_event_korrekte_antwort_gibt_gruen() {
+    let mut a = app();
+    apply_refresh(&mut a, &[("test/fast", None)]);
+    let key = "test/fast";
+
+    a.tx
+        .send(llm::WorkerEvent::ModelProbe {
+            model: key.into(),
+            protocol: llm::ApiProtocol::ChatCompletions,
+            ok: true,
+        })
+        .unwrap();
+    a.drain_events();
+    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Green);
 }

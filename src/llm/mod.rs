@@ -3,6 +3,16 @@
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
+/// Ein API-Protokoll, auf dem ein Modell getestet werden kann (für den
+/// Statusindikator im Modell-Picker: grün/gelb/rot je nach Trefferquote).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiProtocol {
+    /// `POST /chat/completions` (`messages`).
+    ChatCompletions,
+    /// `POST /responses` (`input`).
+    Responses,
+}
+
 /// Eine ausgeführte Werkzeug-Option – für den Abschluss im Event-Log.
 ///
 /// Trägt nur noch das, was das Event-Log beim Abschluss braucht: den vollen
@@ -160,6 +170,16 @@ pub enum WorkerEvent {
     ),
     /// Modell-Liste von einem Provider abgerufen: `(modell_id, demand)`.
     ModelsRefreshed(Vec<(String, Option<u64>)>),
+    /// Ein Modell-Probe-Ergebnis auf einem API-Protokoll – für den
+    /// Statusindikator im Modell-Picker. `model` ist der Registry-Key
+    /// (`provider/alias`), `ok` gibt an, ob das Modell auf diesem Protokoll
+    /// korrekt geantwortet hat. Der Client aktualisiert damit den grün/gelb/rot-
+    /// Status des Modells (siehe `ModelRegistry::record_probe`).
+    ModelProbe {
+        model: String,
+        protocol: ApiProtocol,
+        ok: bool,
+    },
     /// Eine neue HTTP-Runde der laufenden Antwort wird abgesendet
     /// (`t0` = Zeitpunkt des Request-Starts). Die Statusleiste setzt damit ihre
     /// Streaming-Metrik-Felder zurück und zählt „thinking…“ ab diesem Zeitpunkt

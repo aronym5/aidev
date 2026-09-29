@@ -259,3 +259,16 @@ pub(crate) enum Step {
     Cancelled,
     Err(String),
 }
+
+/// Ausschließlich die `force_tools` als **Dummies** – ohne jede volle
+/// Definition und unabhängig von Kanal-Zustand oder `permission`.
+///
+/// Für Aufrufe, die keine echten Werkzeuge anbieten dürfen (die
+/// Kontext-Kompaktierung) den Provider aber ein nicht-leeres `tools`-Array
+/// sehen müssen: zen/opencode beantwortet die Zusammenfassung nur mit
+/// `tools` (sonst `403 FreeTierError`), die Zusammenfassung soll aber nichts
+/// aufrufen können. Ist `force_tools` leer, ist auch das Ergebnis leer – dann
+/// entfällt das `tools`-Feld ganz (siehe `api::put_tools`).
+pub(crate) fn force_tool_definitions(force_tools: &[String]) -> Vec<Value> {
+    force_tools.iter().map(|ft| dummy_tool(ft)).collect()
+}

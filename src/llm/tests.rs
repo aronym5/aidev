@@ -6,11 +6,14 @@
 //! mehr das alte `ChatMessage`-Layout.
 
 use super::*;
+use crate::channel::{Channel, ChannelKind, RunOut, SearchResult};
 use crate::config::{Config, ProviderConfig};
 use crate::llm;
 use crate::perm::Permission;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ── Tool-Delta-Akkumulation (tools_def) ───────────────────────────────────
@@ -311,6 +314,7 @@ fn ensure_reasoning_fuellt_leeres_feld_fuer_tool_calls_nach() {
             },
         }]),
         tool_call_id: None,
+        num_tokens: None,
     };
     let norm = ensure_reasoning_for_tool_calls(std::slice::from_ref(&assistant));
     assert_eq!(norm[0].reasoning_content.as_deref(), Some(""));
@@ -351,6 +355,454 @@ fn retry_backoff_waechst_und_jitter_bleibt_in_grenzen() {
     assert!(d2 > d1, "Backoff muss wachsen");
 }
 
+// ── SSE-Fragmentierung großer Tool-Argumente (http) ─────────────────────────
+//
+// Manche OpenAI-kompatiblen Endpunkte/Proxys zerlegen lange `edit`-/`write`-
+// Argumente mit mehrzeiligen Blöcken über mehrere `data:`-Zeilen. Der
+// Fragment-Puffer muss solche Nutzlasten wieder zu einem gültigen Event
+// zusammensetzen, statt sie als „unvollständig“ zu verwerfen (→ abgeschnittene
+// `arguments` → „Argument … missing“).
+
+#[test]
+fn sse_fragment_in_string_wert_wird_ohne_verfaelschung_zusammengesetzt() {
+    // Der Provider bricht ein `edit`-Event mitten im `new`-String-Wert über
+    // zwei `data:`-Zeilen um. Wir bauen das Event per serde_json (garantiert
+    // korrektes Escaping), serialisieren den `new`-Wert – der einen echten
+    // Zeilenumbruch enthält – und splitten an einer Stelle mitten in diesem
+    // Wert. Beim Zusammensetzen darf KEIN Trennzeichen in den String geraten,
+    // sonst wiche der `new`-Wert von den beiden Originalen ab.
+    let full = tool_call_event(&ToolArgs {
+        path: "a.txt",
+        old: "alt",
+        new: "zwei\nzeilen\nuebersprung",
+        id: "c1",
+    });
+
+    // Schnitt mitten in `...new\":\"zwei` – also mitten im neuen Wert.
+    let cut = full.find("{\\\"path").unwrap() + "{\\\"path\\\":\\\"a.txt\\\",\\\"old\\\":\\\"alt\\\",\\\"new\\\":\\\"zwei".len();
+    let part1 = &full[..cut];
+    let part2 = &full[cut..];
+
+    let mut pending = String::new();
+    assert!(
+        super::http::accumulate_sse_event(&mut pending, part1).is_none(),
+        "erstes Fragment muss noch unvollständig sein"
+    );
+    let ev = super::http::accumulate_sse_event(&mut pending, part2).expect("zweites Fragment schließt Event ab");
+    let args = ev["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+        .as_str()
+        .expect("arguments als String");
+    // Der `new`-Wert besteht exakt aus der Aneinanderreihung der beiden
+    // Fragment-Stücke, ohne eingefügtes Trennzeichen. Im rohen `arguments`-
+    // String steht der Zeilenumbruch als JSON-Escapesequenz (`\n` als zwei
+    // Zeichen) – das ist der unverfälschte Wert, den das spätere
+    // `sanitize_arguments` / der `edit`-Aufruf erhält.
+    assert_eq!(
+        args,
+        r#"{"path":"a.txt","old":"alt","new":"zwei\nzeilen\nuebersprung"}"#
+    );
+
+    // Puffer ist danach leer – das nächste (unabhängige) Event kommt sauber durch.
+    assert!(pending.is_empty());
+    let ok = super::http::accumulate_sse_event(&mut pending, r#"{"choices":[],"usage":{"completion_tokens":1}}"#);
+    assert!(ok.is_some(), "nächstes eigenständiges Event muss parsebar sein");
+}
+
+#[test]
+fn sse_split_zwischen_json_tokens_wird_zusammengesetzt() {
+    // Schnitt zwischen zwei JSON-Tokens des `arguments`-Strings – hier direkt
+    // vor `"new"`. Das Fragment-Paar muss wieder zu einem gültigen Event
+    // verbunden werden; in diesem Fall wäre selbst ein `\n` als Whitespace
+    // unschädlich, aber der leere Join löst es bereits verlustfrei.
+    let full = tool_call_event(&ToolArgs {
+        path: "a.txt",
+        old: "alt",
+        new: "neu",
+        id: "c1",
+    });
+    let cut = full.find("\\\"new\\\"").unwrap();
+    let part1 = &full[..cut];
+    let part2 = &full[cut..];
+
+    let mut pending = String::new();
+    assert!(super::http::accumulate_sse_event(&mut pending, part1).is_none());
+    let ev = super::http::accumulate_sse_event(&mut pending, part2).expect("zusammen gültig");
+    assert_eq!(
+        ev["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str(),
+        Some(r#"{"path":"a.txt","old":"alt","new":"neu"}"#)
+    );
+    assert!(pending.is_empty());
+}
+
+/// Baut ein Chat-Completions-Delta-Event für einen `edit`-Aufruf.
+///
+/// Die `arguments` werden als String mit fester Feld-Reihenfolge
+/// (`path`, `old`, `new`) aufgebaut und dann als JSON-String in den
+/// `delta.tool_calls[0].function.arguments`-Slot gesetzt. Das escapert
+/// `serde_json` beim Serialisieren korrekt (verschachteltes JSON im String).
+struct ToolArgs<'a> {
+    path: &'a str,
+    old: &'a str,
+    new: &'a str,
+    id: &'a str,
+}
+
+fn tool_call_event(a: &ToolArgs) -> String {
+    // Argumente-Inhalt als roher Text mit stabiler Feldreihenfolge. Jeder Wert
+    // wird einzeln korrekt als JSON-String escapt (`serde_json::to_string`
+    // liefert `"…"` inkl. Quotes und Escaping).
+    let esc = |v: &str| serde_json::to_string(v).expect("korrekter JSON-String");
+    let args_raw = format!(
+        "{{\"path\":{},\"old\":{},\"new\":{}}}",
+        esc(a.path),
+        esc(a.old),
+        esc(a.new)
+    );
+    serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": a.id,
+                    "function": { "name": "edit", "arguments": args_raw }
+                }]
+            }
+        }]
+    })
+    .to_string()
+}
+
+// Die `.done`-Argumente eines Responses-Streams dürfen die per Deltas
+// akkumulierten nur ersetzen, wenn letztere unvollständig sind – sonst gingen
+// die über die Deltas bereits gebuchten Token verloren bzw. würden doppelt
+// zählen.
+#[test]
+fn abgeschnittene_tool_argumente_gelten_als_unvollstaendig() {
+    // Nichts angekommen.
+    assert!(super::http::arguments_incomplete(""));
+    assert!(super::http::arguments_incomplete("   "));
+    // Präfix eines Objekts – der Fall eines abgebrochenen Delta-Stroms: `path`
+    // und `old` sind da, `new` fehlt noch. Ein solches Präfix kann nie
+    // gültiges JSON sein (die äußere `{` bliebe ungeöffnet).
+    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt""#));
+    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt","new""#));
+    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt","new":""#));
+    // Ungültiges bzw. nachgeschobenes JSON.
+    assert!(super::http::arguments_incomplete("{'path':'a.txt'}"));
+    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt"}x"#));
+}
+
+#[test]
+fn vollstaendige_tool_argumente_bleiben_unangetastet() {
+    assert!(!super::http::arguments_incomplete(
+        r#"{"path":"a.txt","old":"alt","new":"neu"}"#
+    ));
+    assert!(!super::http::arguments_incomplete("  {\"path\":\"a.txt\"}  "));
+}
+
+// ── Edit-Werkzeug: Happy Path + Argument-Prüfung (tools_exec) ────────────────
+//
+// Diese Tests rufen `run_tool_live("edit", …)` direkt auf – mit allen drei
+// Argumenten (`path`/`old`/`new`), wie es ein Modell tut. Der Fall „alle drei
+// da, aber `new` fehlt“ ist damit abgedeckt: `new` als Nicht-String wird
+// korrekt abgelehnt, `new` als String wird angewendet.
+
+/// In-Memory-Kanal als Test-Double: hält ein einzelnes „Arbeitsverzeichnis"
+/// als Datei-Gemisch und implementiert nur das Nötigste, damit `run_tool_live`
+/// für `edit` funktioniert (read + write). Alle übrigen Kanal-Methoden sind
+/// Stubs, die in diesen Tests nicht aufgerufen werden.
+struct MockChannel {
+    files: Mutex<HashMap<String, String>>,
+    /// Letzter an `grep` übergebener Suchpfad (kanalrelativ) – zum Prüfen der
+    /// Absolutpfad-Abbildung.
+    last_grep_path: Mutex<Option<String>>,
+    /// Letztes an `glob` übergebenes Muster – zum Prüfen der Abbildung.
+    last_glob_pattern: Mutex<Option<String>>,
+}
+
+impl MockChannel {
+    fn new(files: HashMap<String, String>) -> Self {
+        Self {
+            files: Mutex::new(files),
+            last_grep_path: Mutex::new(None),
+            last_glob_pattern: Mutex::new(None),
+        }
+    }
+
+    fn last_grep_path(&self) -> Option<String> {
+        self.last_grep_path.lock().unwrap().clone()
+    }
+
+    fn last_glob_pattern(&self) -> Option<String> {
+        self.last_glob_pattern.lock().unwrap().clone()
+    }
+}
+
+impl Channel for MockChannel {
+    fn kind(&self) -> ChannelKind {
+        ChannelKind::Local
+    }
+    fn root(&self) -> String {
+        "/mock".to_string()
+    }
+    fn read(&self, rel: &Path) -> Result<String, String> {
+        let files = self.files.lock().unwrap();
+        files
+            .get(rel.to_str().unwrap_or(""))
+            .cloned()
+            .ok_or_else(|| format!("Datei fehlt: {}", rel.display()))
+    }
+    fn write(&self, rel: &Path, content: &str) -> Result<(), String> {
+        let mut files = self.files.lock().unwrap();
+        files.insert(rel.to_str().unwrap_or("").to_string(), content.to_string());
+        Ok(())
+    }
+    fn abs_root(&self) -> Option<String> {
+        // Mount-Punkt des gemockten Arbeitsverzeichnisses – entspricht `root()`.
+        Some("/mock".to_string())
+    }
+    fn glob(&self, pattern: &str, _rel: &Path) -> Result<Vec<String>, String> {
+        *self.last_glob_pattern.lock().unwrap() = Some(pattern.to_string());
+        Ok(Vec::new())
+    }
+    fn grep(
+        &self,
+        _pattern: &str,
+        rel: &Path,
+        _include: Option<&str>,
+        _context_lines: usize,
+    ) -> Result<SearchResult, String> {
+        *self.last_grep_path.lock().unwrap() = Some(rel.to_string_lossy().into_owned());
+        Ok(SearchResult {
+            matches: Vec::new(),
+            note: None,
+            raw: None,
+            match_count: 0,
+        })
+    }
+    fn run(&self, _cmd: &str, _args: &[String], _rel_cwd: &Path) -> Result<RunOut, String> {
+        Ok(RunOut {
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+    fn dup(&self) -> Result<Arc<dyn Channel>, String> {
+        let files = self.files.lock().unwrap().clone();
+        Ok(Arc::new(MockChannel::new(files)))
+    }
+}
+
+#[test]
+fn edit_happy_path_wendet_austausch_an() {
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "alt-text zeile\nzweite zeile\n".to_string());
+    let ch = MockChannel::new(files);
+
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"a.txt","old":"alt-text zeile","new":"NEU-TEXT"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("Changed: a.txt"), "Text: {}", out.text);
+    assert_eq!(
+        ch.read(Path::new("a.txt")).unwrap(),
+        "NEU-TEXT\nzweite zeile\n"
+    );
+    assert!(out.diff.is_some(), "edit liefert einen Diff");
+}
+
+#[test]
+fn edit_happy_path_mit_replace_all() {
+    let mut files = HashMap::new();
+    files.insert(
+        "b.txt".to_string(),
+        "x\nx\n".to_string(),
+    );
+    let ch = MockChannel::new(files);
+
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"b.txt","old":"x","new":"y","replace_all":true}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("Changed: b.txt"), "Text: {}", out.text);
+    assert_eq!(ch.read(Path::new("b.txt")).unwrap(), "y\ny\n");
+}
+
+#[test]
+fn edit_ohne_new_wird_als_missing_gemeldet() {
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "alt-text zeile\n".to_string());
+    let ch = MockChannel::new(files);
+    // `new` fehlt komplett.
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"a.txt","old":"alt-text zeile"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert_eq!(out.text, r#"ERROR: Argument "new" missing or not a string."#);
+
+    // `new` ist vorhanden, aber kein String (z. B. `null`) → dieselbe Ablehnung.
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"a.txt","old":"alt-text zeile","new":null}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert_eq!(out.text, r#"ERROR: Argument "new" missing or not a string."#);
+}
+
+// ── Absolute Pfade (read/write/edit): nur unter dem Mount-Punkt ─────────────
+//
+// Der MockChannel deklariert `/mock` als Mount-Punkt der Arbeitskopie
+// (`abs_root`). Absolute Tool-Pfade darunter werden um den Mount-Punkt gekürzt
+// und wie ein relativer Pfad behandelt; alles andere wird abgelehnt und die
+// Datei-Operation gar nicht erst ausgeführt.
+
+#[test]
+fn read_absoluter_pfad_im_mount_wird_gelesen() {
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "inhalt\n".to_string());
+    let ch = MockChannel::new(files);
+    let out = super::tools_exec::run_tool_live(
+        "read",
+        r#"{"path":"/mock/a.txt"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.contains("inhalt"), "Text: {}", out.text);
+}
+
+#[test]
+fn read_absoluter_pfad_ausserhalb_wird_abgelehnt() {
+    let ch = MockChannel::new(HashMap::new());
+    let out = super::tools_exec::run_tool_live(
+        "read",
+        r#"{"path":"/etc/passwd"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("ERROR:"), "Text: {}", out.text);
+    assert!(out.text.contains("/etc/passwd"), "Text: {}", out.text);
+}
+
+#[test]
+fn write_absoluter_pfad_im_mount_wird_geschrieben() {
+    let ch = MockChannel::new(HashMap::new());
+    let out = super::tools_exec::run_tool_live(
+        "write",
+        r#"{"path":"/mock/sub/x.txt","content":"hi"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("Written:"), "Text: {}", out.text);
+    assert_eq!(ch.read(Path::new("sub/x.txt")).unwrap(), "hi");
+}
+
+#[test]
+fn edit_absoluter_pfad_ausserhalb_laesst_datei_unveraendert() {
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "alt\n".to_string());
+    let ch = MockChannel::new(files);
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"/etc/a.txt","old":"alt","new":"neu"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("ERROR:"), "Text: {}", out.text);
+    // Nichts geschrieben – die vorhandene Datei bleibt unberührt.
+    assert_eq!(ch.read(Path::new("a.txt")).unwrap(), "alt\n");
+}
+
+#[test]
+fn edit_absoluter_pfad_im_mount_wird_angewendet() {
+    let mut files = HashMap::new();
+    files.insert("a.txt".to_string(), "alt\nzweite\n".to_string());
+    let ch = MockChannel::new(files);
+    let out = super::tools_exec::run_tool_live(
+        "edit",
+        r#"{"path":"/mock/a.txt","old":"alt","new":"neu"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("Changed:"), "Text: {}", out.text);
+    assert_eq!(ch.read(Path::new("a.txt")).unwrap(), "neu\nzweite\n");
+}
+
+// `grep`/`glob` nutzen dieselbe Abbildung: bei `grep` ist es das `path`-Argument,
+// bei `glob` der `pattern` selbst. Der MockChannel protokolliert die zuletzt
+// gesehenen Argumente, damit die Ableitung (Absolutpfad → relativ) prüfbar ist.
+
+#[test]
+fn grep_absoluter_pfad_im_mount_wird_gekuerzt() {
+    let ch = MockChannel::new(HashMap::new());
+    let _ = super::tools_exec::run_tool_live(
+        "grep",
+        r#"{"pattern":"x","path":"/mock/src","content":0}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert_eq!(ch.last_grep_path(), Some("src".to_string()));
+}
+
+#[test]
+fn grep_absoluter_pfad_ausserhalb_wird_abgelehnt() {
+    let ch = MockChannel::new(HashMap::new());
+    let out = super::tools_exec::run_tool_live(
+        "grep",
+        r#"{"pattern":"x","path":"/etc"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("ERROR:"), "Text: {}", out.text);
+    // Kein Suchlauf – der Pfad wurde gar nicht erst an den Kanal gegeben.
+    assert_eq!(ch.last_grep_path(), None);
+}
+
+#[test]
+fn glob_absolutes_muster_im_mount_wird_gekuerzt() {
+    let ch = MockChannel::new(HashMap::new());
+    let _ = super::tools_exec::run_tool_live(
+        "glob",
+        r#"{"pattern":"/mock/src/**/*.rs"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert_eq!(ch.last_glob_pattern(), Some("src/**/*.rs".to_string()));
+}
+
+#[test]
+fn glob_absolutes_muster_ausserhalb_wird_abgelehnt() {
+    let ch = MockChannel::new(HashMap::new());
+    let out = super::tools_exec::run_tool_live(
+        "glob",
+        r#"{"pattern":"/etc/**/*.conf"}"#,
+        &ch,
+        &mut |_| {},
+        None,
+    );
+    assert!(out.text.starts_with("ERROR:"), "Text: {}", out.text);
+    assert_eq!(ch.last_glob_pattern(), None);
+}
+
 // ── Kompaktierungs-Grenzen (compact) ──────────────────────────────────────
 
 #[test]
@@ -361,6 +813,7 @@ fn wire_compact_boundary_zaehlt_turns_an_user_nachrichten() {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
+        num_tokens: None,
     };
     // Turn 1 mit Werkzeug-Runde: user → assistant(tool_calls) → tool → tool
     let mut tool = w("assistant");
@@ -384,14 +837,53 @@ fn wire_compact_boundary_zaehlt_turns_an_user_nachrichten() {
     // Die Zählung läuft über `user`-Nachrichten (identisch zu
     // `compact_boundary` auf der Session-Seite): eine mehrteilige Tool-Runde
     // ist Teil ihres Turns und wird komplett mit archiviert.
-    // keep=1 → es bleiben die letzten 2 User (turn2 + Pending user3) übrig;
-    // Turn 1 (Indizes 0..4, samt Werkzeug-Runde) wird archiviert.
-    assert_eq!(wire_compact_boundary(&msgs, 1), 4);
-    // keep=2 → auch der vorletzte Turn würde gebraucht; mit nur 3 Usern gibt
-    // es nichts hinter der Grenze zu archivieren.
-    assert_eq!(wire_compact_boundary(&msgs, 2), 0);
+    // Semantik: `keep_turns = k` ⇒ GENAU die letzten k Turns überleben.
+    // keep=1 → nur turn3 (Pending user3, Index 6) bleibt; Turn 1+2 werden
+    // archiviert.
+    assert_eq!(wire_compact_boundary(&msgs, 1), 6);
+    // keep=2 → die letzten 2 User (turn2 + Pending user3) bleiben, Turn 1 weg.
+    assert_eq!(wire_compact_boundary(&msgs, 2), 4);
     // keep größer als die Turn-Zahl → nichts zu archivieren.
     assert_eq!(wire_compact_boundary(&msgs, 9), 0);
+}
+
+#[test]
+fn wire_compact_boundary_erlaubt_schnitt_an_letzter_user_nachricht() {
+    // Der Fall aus dem echten Kompaktierungs-Log (2026-09-29): der letzte
+    // `user` liegt NICHT am Ende der Liste – nach ihm folgen noch tool/assistant-
+    // Nachrichten der finalen Runde. Früher (Semantik `keep=k` ⇒ k+1 überlebende
+    // Turns) war `keep=1` auf den vorletzten User beschränkt; jetzt muss
+    // `keep=1` GENAU die letzte User-Nachricht treffen.
+    let w = |role: &str| WireMessage {
+        role: role.into(),
+        content: Some("x".into()),
+        reasoning_content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        num_tokens: None,
+    };
+    // 5 User bei Index 0,1,5,127,194 – danach folgen weitere tool/assistant-
+    // Nachrichten (bis 232), damit die letzte User-Nachricht nicht am Ende steht.
+    let mut msgs: Vec<WireMessage> = Vec::new();
+    let user_idx = [0usize, 1, 5, 127, 194];
+    let mut ui = 0;
+    for i in 0..233 {
+        if ui < user_idx.len() && i == user_idx[ui] {
+            msgs.push(w("user"));
+            ui += 1;
+        } else {
+            msgs.push(w(if i % 2 == 0 { "tool" } else { "assistant" }));
+        }
+    }
+    // keep=1 → Schnitt genau an der letzten User-Nachricht (Index 194).
+    assert_eq!(wire_compact_boundary(&msgs, 1), 194);
+    // keep=2 → Schnitt an der vorletzten User-Nachricht (127).
+    assert_eq!(wire_compact_boundary(&msgs, 2), 127);
+    // keep=3 → an der drittletzten (5); keep=4 → an der viertletzten (1).
+    assert_eq!(wire_compact_boundary(&msgs, 3), 5);
+    assert_eq!(wire_compact_boundary(&msgs, 4), 1);
+    // keep=5 (users-1) → nur der älteste User (0) wird archiviert.
+    assert_eq!(wire_compact_boundary(&msgs, 5), 0);
 }
 
 #[test]
@@ -416,6 +908,7 @@ fn kompaktierung_zu_kurze_historie_meldet_abbruch() {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
+        num_tokens: None,
     }];
     let err = compact_chat_messages(
         0,
@@ -440,6 +933,7 @@ fn wm(role: &str, content: &str) -> WireMessage {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
+        num_tokens: None,
     }
 }
 
@@ -455,8 +949,9 @@ fn turns(n: usize, chars: usize) -> Vec<WireMessage> {
 
 #[test]
 fn plan_candidates_listet_schnitte_mit_kontextgroessen() {
-    // 6 Turns → 6 user → größtes sinnvolles keep = 4 (mindestens 1 archivierter
-    // UND 1 überlebender Turn, vgl. `possible_max_keep`).
+    // 6 Turns → 6 user → größtes sinnvolles keep = 5 (`users - 1`: nur der
+    // älteste Turn wird archiviert, vgl. `possible_max_keep`). Hier wird der
+    // Bereich bewusst auf keep=1..4 geprüft.
     let msgs = turns(6, 100);
     let cands = plan_candidates(&msgs, 4);
     assert_eq!(cands.len(), 4, "keep=1..4 liefern je einen echten Schnitt");
@@ -478,61 +973,180 @@ fn plan_candidates_listet_schnitte_mit_kontextgroessen() {
             "kept steigt mit keep"
         );
     }
-    // keep=4 (max): archiviert genau den ersten Turn (user + assistant = 2 Msg).
-    assert_eq!(cands[3].archived_msgs, 2);
+    // keep=4: Schnitt am 4.-letzten User → die ersten 4 Nachrichten (Turn 0+1)
+    // werden archiviert.
+    assert_eq!(cands[3].archived_msgs, 4);
     assert!(cands[3].dropped_tokens > 0);
     assert!(cands[3].kept_tokens > 0);
 }
 
 #[test]
 fn plan_candidates_ohne_moeglichen_schnitt_leer() {
-    // Nur 2 user → kein Kandidat mit echtem Schnitt (mind. 3 nötig).
-    assert_eq!(plan_candidates(&turns(2, 10), 8).len(), 0);
+    // Nur 1 user → kein Kandidat mit echtem Schnitt (mind. 2 nötig: keep=1
+    // ließe nur den letzten Turn überleben → nichts zu archivieren).
+    assert_eq!(plan_candidates(&turns(1, 10), 8).len(), 0);
+    assert_eq!(plan_candidates(&turns(2, 10), 8).len(), 1, "keep=1 → nur letzter Turn weg, einer bleibt");
+}
+
+/// Wire-Projektion wie nach einer Kompaktierung: die Summary der letzten
+/// Kompaktierung steht als erste `user`-Nachricht, danach `n` Turns.
+fn turns_after_summary(n: usize, chars: usize) -> Vec<WireMessage> {
+    let mut out = vec![wm(
+        "user",
+        &format!(
+            "[Compressed history - 12 earlier messages]\n\n{}",
+            "s".repeat(chars)
+        ),
+    )];
+    out.extend(turns(n, chars));
+    out
 }
 
 #[test]
 fn can_compact_folgt_den_benoetigten_user_nachrichten() {
     // Ein einziger (z. B. riesiger, gerade laufender) Query: kein Schnitt.
     assert!(!can_compact(&turns(1, 10)), "ein User → kein Schnitt");
-    // Direkt nach einer Kompaktierung: Projektion = summary + ein Query.
-    assert!(!can_compact(&turns(2, 10)), "zwei User → kein Schnitt");
     // Ab drei Turns (ein archivierbarer, zwei überlebende) ist ein Schnitt möglich.
     assert!(can_compact(&turns(3, 10)), "drei User → Schnitt möglich");
 }
 
 #[test]
-fn decide_keep_waehlt_maximalen_erhalt_unter_schwelle() {
-    let mut cfg = test_config("http://127.0.0.1:1");
-    cfg.context_window = 100_000;
-    cfg.compact_at = 0.5; // Schwelle 50 000
-    cfg.compact_summary_tokens = 1_000;
-    cfg.compact_keep_turns = 3;
-    // Kleine Historie: jeder Schnitt bleibt (konservativ inkl. Budget) unter
-    // der Schwelle → Entscheidung = größtes gültiges keep (max. Kontext-Erhalt).
-    let msgs = turns(6, 100);
-    let total: u64 = msgs
-        .iter()
-        .map(|m| llm::estimate_tokens(m.content.as_deref().unwrap_or_default()))
-        .sum();
-    assert!(total < 50_000, "Prämisse: Kontext unter der Schwelle");
-    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
-    assert_eq!(keep, 4, "maximaler Erhalt (größtes keep) unter der Schwelle");
-    assert_eq!(cands.len(), 4);
+fn can_compact_nicht_unmittelbar_nach_kompaktierung() {
+    // Summary + 1 Query (wie direkt nach `/compact`).
+    assert!(
+        !can_compact(&turns_after_summary(1, 10)),
+        "Summary + ein Query → nichts Neues zu schneiden"
+    );
+    // Summary + 2 Turns: `keep_turns = 1` (nur der letzte Turn überlebt) ist
+    // jetzt ein echter, nicht-gesperrter Schnitt – es wird ein neuer Turn (der
+    // zweite) zusammen mit der alten Summary archiviert, keine Wiederholung.
+    assert!(
+        can_compact(&turns_after_summary(2, 10)),
+        "Summary + zwei Turns → keep=1 (nur letzter Turn) möglich"
+    );
+    // Summary + 3 Turns: ein weiterer Turn lässt sich neu archivieren.
+    assert!(
+        can_compact(&turns_after_summary(3, 10)),
+        "Summary + drei Turns → Schnitt möglich"
+    );
 }
 
 #[test]
-fn decide_keep_faellt_ohne_ziel_auf_konfiguriertes_zurueck() {
+fn decide_keep_waehlt_schnitt_naechst_am_freiziel() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_keep_ratio = 0.2; // Ziel: ~20 000 T bleiben, ~80 000 T frei
+    cfg.compact_summary_tokens = 1_000;
+    cfg.compact_keep_turns = 3;
+    // 6 gleich große Turns (~10 002 T je Turn; `keep=k` behält genau k davon):
+    // Ziel 20 000 T liegt konkret zwischen keep=1 (1 Turn, ~10 000 T) und
+    // keep=2 (2 Turns, ~20 004 T) – näher ist keep=2.
+    let msgs = turns(6, 20_000);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    assert_eq!(keep, 2, "Schnitt, dessen Tail dem Ziel am nächsten liegt");
+    let chosen = cands.iter().find(|c| c.keep_turns == keep).unwrap();
+    let kept = chosen.kept_tokens;
+    let total = cands
+        .iter()
+        .map(|c| c.dropped_tokens + c.kept_tokens)
+        .next()
+        .unwrap();
+    assert!(
+        kept.abs_diff(20_000) < 1_000,
+        "erhaltener Tail ~{kept} T nahe am Ziel (~20 % des Fensters)"
+    );
+    // 80 % *des Fensters* frei werden ist nur möglich, wenn der Kontext auch
+    // gefüllt war; maßgeblich ist der Zielwert selbst – hier bleiben ~20 % des
+    // Fensters stehen, der Rest der ~60 000 T Historie fällt weg.
+    assert_eq!(chosen.dropped_tokens + kept, total);
+    assert!(chosen.dropped_tokens > 39_000, "mehr als die Hälfte fällt weg");
+    assert!(
+        kept < 20_000 + 1_000,
+        "Ziel wird nicht nach oben überschritten (Ziel {kept})"
+    );
+    // Ausdrücklich NICHT mehr „maximaler Erhalt“ (z. B. keep=4/5).
+    assert_ne!(keep, 4, "Kriterium ist das Freiziel, nicht der größte Erhalt");
+}
+
+#[test]
+fn decide_keep_waehlt_staerksten_schnitt_wenn_ziel_unerreichbar() {
     let mut cfg = test_config("http://127.0.0.1:1");
     cfg.context_window = 10_000;
-    cfg.compact_at = 0.2; // Schwelle klein (2 000)
+    cfg.compact_keep_ratio = 0.2; // Ziel 2 000 T
     cfg.compact_summary_tokens = 1_000;
     cfg.compact_keep_turns = 2;
-    // Große Historie: selbst der stärkste Schnitt (keep=1) lässt den Folge-
-    // Kontext (konservativ mit Budget) über der Schwelle → Fallback aufs
-    // konfigurierte compact_keep_turns.
+    // Riesige Historie: selbst der stärkste Schnitt (keep=1) lässt ~20 000 T
+    // stehen, das Ziel 2 000 T ist unerreichbar → es wird so weit wie
+    // möglich geschnitten.
     let msgs = turns(6, 40_000);
     let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
-    assert_eq!(keep, 2, "Fallback auf das konfigurierte compact_keep_turns");
+    assert_eq!(keep, 1, "unerreichbares Ziel → stärkster Schnitt");
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::Manual, cfg.context_window);
+    assert_eq!(keep, 1, "unerreichbares Ziel → stärkster Schnitt (manuell)");
+}
+
+#[test]
+fn decide_keep_waehlt_mehr_erhalt_wenn_ziel_bereits_unterschritten() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_keep_ratio = 0.2; // Ziel 20 000 T
+    cfg.compact_keep_turns = 3;
+    // Winzige Historie (~2400 T gesamt): das Ziel ist unerreichbar, alles liegt
+    // weit darunter → es wird der schwächste Schnitt gewählt (maximaler
+    // Erhalt, `possible_max_keep = users - 1 = 5`), also nur der älteste Turn
+    // archiviert.
+    let msgs = turns(6, 100);
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    assert_eq!(keep, 5, "Ziel weit unterboten → größtes zulässiges keep");
+}
+
+#[test]
+fn decide_keep_schneidet_nie_wieder_an_der_letzten_stelle() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 100_000;
+    cfg.compact_keep_ratio = 0.2; // Ziel 20 000 T
+    cfg.compact_summary_tokens = 500;
+    cfg.compact_keep_turns = 3;
+    // Summary am Kopf + 4 Turns → 5 `user`-Nachrichten → `max_keep = 4`. Der
+    // Kandidat `keep=4` schneidet unmittelbar hinter der Summary, also exakt an
+    // der Stelle der letzten Kompaktierung: er würde nichts als die bereits
+    // komprimierte Historie erneut zusammenfassen und ist ausgeschlossen.
+    let msgs = turns_after_summary(4, 5_000);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let blocked = cands
+        .iter()
+        .find(|c| c.previous_cut)
+        .expect("Kandidat der letzten Schnittstelle markiert");
+    assert_eq!(blocked.keep_turns, 4, "letzte Schnittstelle = größtes keep");
+    assert_eq!(blocked.archived_msgs, 1, "dort liegt nur die Summary");
+    assert_ne!(keep, blocked.keep_turns, "nie erneut dort schneiden");
+    assert_eq!(keep, 3, "nächststärkster erlaubter Schnitt");
+    // Für alle nicht-reaktiven Auslöser gilt dieselbe Sperre.
+    for t in [CompactTrigger::Proactive, CompactTrigger::Manual] {
+        let (k, _) = decide_keep(&msgs, &cfg, t, cfg.context_window);
+        assert_eq!(k, keep, "Sperre gilt auch für {t:?}");
+    }
+    // Der Kandidat bleibt im Protokoll sichtbar, nur markiert.
+    assert!(cands.iter().all(|c| c.keep_turns <= 4));
+}
+
+#[test]
+fn decide_keep_ohne_moeglichen_schnitt_liefert_konfiguriertes() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.compact_keep_turns = 2;
+    // Summary + 1 Query (wie direkt nach `/compact`): jeder mögliche Schnitt
+    // wäre eine Wiederholung der letzten Kompaktierung.
+    let (keep, cands) = decide_keep(
+        &turns_after_summary(1, 10),
+        &cfg,
+        CompactTrigger::AutoTurn,
+        100_000,
+    );
+    assert!(
+        cands.iter().all(|c| c.previous_cut),
+        "alle Kandidaten liegen auf der letzten Schnittstelle"
+    );
+    assert_eq!(keep, cfg.compact_keep_turns, "meldet 'nichts zu kompaktieren'");
 }
 
 #[test]
@@ -540,14 +1154,30 @@ fn decide_keep_reaktiv_waehlt_staerksten_schnitt() {
     let mut cfg = test_config("http://127.0.0.1:1");
     cfg.context_window = 100_000;
     cfg.compact_at = 0.8;
+    cfg.compact_keep_ratio = 0.2;
     cfg.compact_summary_tokens = 500;
     cfg.compact_keep_turns = 3;
-    // Bei einem context_length-Fehler zählt das VOLLE Fenster (nicht die 80%-
-    // Schwelle): unter allen Kandidaten, die kept+budget ins Fenster bringen,
-    // wählt Reactive das kleinste keep (stärkster Schnitt) – hier 1.
+    // Bei einem context_length-Fehler zählt das VOLLE Fenster (nicht das
+    // Freiziel und nicht die 80%-Schwelle): unter allen Kandidaten, die
+    // kept+budget ins Fenster bringen, wählt Reactive das kleinste keep
+    // (stärkster Schnitt) – hier 1.
     let msgs = turns(6, 20_000);
     let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window);
     assert_eq!(keep, 1, "Reactive wählt das kleinste keep unter dem vollen Fenster");
+}
+
+#[test]
+fn decide_keep_reaktiv_faellt_auf_konfiguriertes_zurueck() {
+    let mut cfg = test_config("http://127.0.0.1:1");
+    cfg.context_window = 10_000;
+    cfg.compact_keep_ratio = 0.2;
+    cfg.compact_summary_tokens = 1_000;
+    cfg.compact_keep_turns = 2;
+    // Selbst der stärkste Schnitt passt nicht ins volle Fenster → Rückfall auf
+    // das konfigurierte `compact_keep_turns`.
+    let msgs = turns(6, 40_000);
+    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window);
+    assert_eq!(keep, 2, "Rückfall auf das konfigurierte compact_keep_turns");
 }
 
 #[test]
@@ -572,6 +1202,8 @@ fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung(
         url: "http://127.0.0.1:1/chat/completions".into(),
         context_window: cfg.context_window,
         compact_at: cfg.compact_at,
+        keep_ratio: cfg.compact_keep_ratio,
+        target_tokens: 20_000,
         summary_budget: cfg.compact_summary_tokens,
         threshold: (cfg.context_window as f64 * cfg.compact_at) as u64,
         current_tokens: 93_000,
@@ -597,17 +1229,20 @@ fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung(
     assert!(meta.contains("context_window:  100000"));
     assert!(meta.contains("compact_at:      0.8"));
     assert!(meta.contains("threshold:       80000"));
+    assert!(meta.contains("keep_ratio:      0.2"));
+    assert!(meta.contains("target_tokens:   20000"));
     assert!(meta.contains("current_tokens:  93000"));
     assert!(meta.contains(&format!("decided_keep:    {keep}")));
     assert!(meta.contains("summary_tokens:  17"), "erreichte Summary: {meta}");
 
     // Kandidaten-Tabelle (variables compact_keep_turns) mit gewählter
-    // Markierung + Kontextgrößen (wegfallend/bleibend).
+    // Markierung + Kontextgrößen (wegfallend/bleibend) + Abstand zum Ziel.
     let plan = &files["plan.txt"];
     assert!(plan.contains(&format!("keep={keep}")), "gewählte Zeile: {plan}");
     assert!(plan.contains("<-- gewählt"));
     assert!(plan.contains("T weg"));
     assert!(plan.contains("T bleiben"));
+    assert!(plan.contains("Abstand zum Ziel"), "Zielabstand: {plan}");
 
     // Kurzübersicht: Rollen der Historie.
     let overview = &files["overview.txt"];

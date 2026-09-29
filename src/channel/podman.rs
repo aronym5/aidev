@@ -425,6 +425,12 @@ impl Channel for PodmanChannel {
         fsops::write_at(&self.file_path(rel)?, content)
     }
 
+    /// Mount-Punkt = das Arbeitsverzeichnis im Container (`workdir`), unter dem
+    /// die host-seitige Arbeitskopie eingehängt ist.
+    fn abs_root(&self) -> Option<String> {
+        (!self.workdir.is_empty()).then(|| self.workdir.clone())
+    }
+
     fn grep(
         &self,
         pattern: &str,

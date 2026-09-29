@@ -1087,16 +1087,25 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
             continue;
         };
         match &ev.kind {
-            EventKind::UserPrompt { text, .. } => out.push(user(text)),
+            EventKind::UserPrompt {
+                text, num_tokens, ..
+            } => out.push(user_tokens(text, opt_tokens(*num_tokens))),
             EventKind::Assistant {
                 reasoning,
                 text,
                 tool_event_ids,
+                num_tokens_reasoning,
+                num_tokens_text,
                 ..
             } => {
+                // Bestätigte Wortzahl dieser Assistant-Nachricht (Reasoning +
+                // Text). Bei einer Tool-Runde zählen die Tool-Ausgaben separat
+                // (je `num_tokens_output` ihrer tool-Wire); der Call-Anker selbst
+                // steckt in den Argumenten der assistant-Wire.
+                let ast_tokens = opt_tokens(*num_tokens_reasoning + *num_tokens_text);
                 if tool_event_ids.is_empty() {
                     // reine Antwort ohne Tool-Runde
-                    out.push(assistant(
+                    out.push(assistant_tokens(
                         text,
                         if reasoning.is_empty() {
                             None
@@ -1104,6 +1113,7 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
                             Some(reasoning.clone())
                         },
                         None,
+                        ast_tokens,
                     ));
                 } else {
                     // Tool-Runde: assistant mit tool_calls + tool-Nachrichten
@@ -1127,12 +1137,18 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
                             _ => unreachable!("tool_event_id verweist nicht auf ein Tool"),
                         })
                         .collect();
-                    out.push(assistant(text, Some(reasoning.clone()), Some(calls)));
+                    out.push(assistant_tokens(
+                        text,
+                        Some(reasoning.clone()),
+                        Some(calls),
+                        ast_tokens,
+                    ));
                     for t_id in tool_event_ids {
                         if let Some(t) = chat.events.get(t_id) {
                             if let EventKind::Tool {
                                 tool_call_id,
                                 output,
+                                num_tokens_output,
                                 ..
                             } = &t.kind
                             {
@@ -1142,6 +1158,7 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
                                     reasoning_content: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tool_call_id.clone()),
+                                    num_tokens: opt_tokens(*num_tokens_output),
                                 });
                             }
                         }
@@ -1153,11 +1170,16 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
                 // assistant → übersprungen (die Tool-Ergebnisse erscheinen über
                 // ihre Assistant-Runde).
             }
-            EventKind::Archive { summary, .. } => {
+            EventKind::Archive {
+                summary, num_tokens, ..
+            } => {
                 // Der Marker „[Compressed history - N earlier messages]“ steht
                 // bereits am Anfang von `summary` (siehe `compact_chat_messages`);
-                // die Projektion hängt ihn nicht noch einmal davor.
-                out.push(user(summary.trim()));
+                // die Projektion hängt ihn nicht noch einmal davor. Die gemessene
+                // Summary-Länge (`num_tokens`) wird als bestätigte Zahl mitgegeben
+                // – so zählt die Kompaktierungs-Planung die schon komprimierte
+                // Historie nicht erneut per Zeichen-Schätzung.
+                out.push(user_tokens(summary.trim(), opt_tokens(*num_tokens)));
             }
             EventKind::Abort => {
                 // bewusst nicht projiziert (Anzeige/Steuerung)
@@ -1167,20 +1189,29 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
     out
 }
 
-fn user(content: &str) -> WireMessage {
+/// Wandelt eine gemessene Tokenzahl aus dem Event-Log in die bestätigte Form:
+/// `0` bedeutet „nicht gemessen“ → `None` (Zeichen-Schätzung greift), sonst
+/// `Some(zahl)`.
+fn opt_tokens(n: u64) -> Option<u64> {
+    (n > 0).then_some(n)
+}
+
+fn user_tokens(content: &str, num_tokens: Option<u64>) -> WireMessage {
     WireMessage {
         role: "user".into(),
         content: Some(content.to_string()),
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
+        num_tokens,
     }
 }
 
-fn assistant(
+fn assistant_tokens(
     content: &str,
     reasoning_content: Option<String>,
     tool_calls: Option<Vec<WireToolCall>>,
+    num_tokens: Option<u64>,
 ) -> WireMessage {
     WireMessage {
         role: "assistant".into(),
@@ -1192,6 +1223,7 @@ fn assistant(
         reasoning_content,
         tool_calls,
         tool_call_id: None,
+        num_tokens,
     }
 }
 
@@ -1217,10 +1249,48 @@ mod tests {
         assert_eq!(
             api_messages(&chat),
             vec![
-                wire("user", Some("hallo".into()), None, None, None),
-                wire("assistant", Some("hi".into()), None, None, None),
+                wire("user", Some("hallo".into()), None, None, None, None),
+                wire("assistant", Some("hi".into()), None, None, None, None),
             ]
         );
+    }
+
+    #[test]
+    fn api_messages_uebernimmt_bestaetigte_num_tokens_als_num_tokens() {
+        let mut chat = Chat::new();
+        // User mit gemessener Tokenzahl (`num_tokens`), sonst 0.
+        let uid = chat.push_user_prompt(
+            "frage".into(),
+            Permission::Read,
+            "m".into(),
+            0,
+            Instant::now(),
+        );
+        chat.set_user_prompt_tokens(uid, 37);
+        // Assistant-Runde mit Tool: bestätigte Reasoning/Text-Tokens.
+        let aid = chat.open_assistant(None, "gedanken".into(), "antwort".into(), Instant::now());
+        let tid = chat.open_tool(
+            Some(aid),
+            "call_1".into(),
+            "read".into(),
+            "{}".into(),
+            "ergebnistext".into(),
+            ToolKind::Read {
+                path: "a.txt".into(),
+                range: "1,2".into(),
+            },
+            Instant::now(),
+        );
+        chat.set_tool_tokens(tid, 10, 123); // 123 = bestätigte Ausgabe-Tokens
+        chat.finalize_assistant(aid, Instant::now(), zero(), 15, 22, false); // 15+22 Text/Reasoning
+
+        let msgs = api_messages(&chat);
+        // user   → bestätigt 37
+        // assistant (tool-Runde) → 15 + 22 = 37
+        // tool   → bestätigt 123
+        assert_eq!(msgs[0].num_tokens, Some(37), "user übernimmt num_tokens");
+        assert_eq!(msgs[1].num_tokens, Some(37), "assistant = reasoning+text");
+        assert_eq!(msgs[2].num_tokens, Some(123), "tool übernimmt num_tokens_output");
     }
 
     #[test]
@@ -1591,6 +1661,7 @@ mod tests {
         reasoning_content: Option<String>,
         tool_calls: Option<Vec<crate::llm::WireToolCall>>,
         tool_call_id: Option<String>,
+        num_tokens: Option<u64>,
     ) -> WireMessage {
         WireMessage {
             role: role.into(),
@@ -1598,6 +1669,7 @@ mod tests {
             reasoning_content,
             tool_calls,
             tool_call_id,
+            num_tokens,
         }
     }
 

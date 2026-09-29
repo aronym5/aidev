@@ -86,6 +86,23 @@ pub trait Channel: Send + Sync {
     fn root(&self) -> String;
     fn read(&self, rel: &Path) -> Result<String, String>;
     fn write(&self, rel: &Path, content: &str) -> Result<(), String>;
+    /// Absoluter Kanal-Pfad, unter dem die Arbeitskopie liegt (Mount-Punkt des
+    /// Workingdirectories im Container bzw. auf dem Host). Dient
+    /// [`Self::tool_path`], um absolute Pfade aus Tool-Aufrufen auf
+    /// kanalrelative abzubilden. Kanäle ohne zuordenbaren Mount-Punkt liefern
+    /// `None`.
+    fn abs_root(&self) -> Option<String> {
+        None
+    }
+    /// Bildet den vom Modell gelieferten Pfad eines Datei-Werkzeugs
+    /// (`read`/`write`/`edit`/`grep`/`glob`) auf einen kanalrelativen Pfad ab:
+    /// relative Pfade bleiben unverändert, ein absoluter Pfad wird nur
+    /// akzeptiert, wenn er unter [`Self::abs_root`] liegt (und wird um diesen
+    /// gekürzt), sonst Fehler – die Operation wird dann gar nicht erst
+    /// ausgeführt.
+    fn tool_path(&self, raw: &str) -> Result<PathBuf, String> {
+        resolve::to_rel(self.abs_root().as_deref(), raw)
+    }
     /// Datei-Pattern-Suche (`glob`-Werkzeug) über `find`.
     fn glob(&self, pattern: &str, rel: &Path) -> Result<Vec<String>, String>;
     /// Volltextsuche (`grep`-Werkzeug). `include` filtert nach Glob-Muster

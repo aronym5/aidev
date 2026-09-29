@@ -528,12 +528,21 @@ impl Session {
     }
 
     /// Server-bestätigte Usage der letzten (abgeschlossenen) Assistant-Runde –
-    /// NUR wenn dieser gegen den AKTUELLEN Kontext gemessen wurde: Der letzte
-    /// abgeschlossene Turn muss NACH der letzten Kompaktierung (Archive-Event)
-    /// liegen. Direkt nach einer Compaction stammt der letzte Usage sonst aus
-    /// der alten, größeren Historie und würde die Context-Anzeige fälschlich
-    /// aufblähen – dann liefern wir `None` und die Schätzung (`prompt_tokens`,
-    /// basierend auf den verschobenen `context_len`-Ankern) übernimmt.
+    /// NUR wenn diese den AKTUELLEN Kontext beschreibt. Zwei Bedingungen:
+    ///
+    /// 1. Die Runde liegt NACH der letzten Kompaktierung (Archive-Event) – ein
+    ///    Usage aus dem abgedeckten Teil der Historie misst die alte, größere
+    ///    Nachricht.
+    /// 2. Ihre gespeicherte `context_len` ist nicht verschoben worden, die Usage
+    ///    ist also noch die dazu ableitbare bestätigte Zahl
+    ///    (`Chat::context_is_green`). Die überlebenden Events behalten nach einer
+    ///    Kompaktierung ihre gegen die ALTE Historie gemessene Usage – als
+    ///    Anker wären sie zu hoch, der `context_len`-Shift weicht deshalb ab.
+    ///
+    /// Trifft eine der beiden nicht zu, liefern wir `None` und die Schätzung
+    /// (`prompt_tokens`) übernimmt: Kontextlänge des NEUESTEN Events der History
+    /// (nach dem Shift = Summary + Überlebende) plus die Schätzung der noch
+    /// offenen Events – das ist der aktuelle Kontext.
     pub(crate) fn last_usage_current(&self) -> Option<llm::Usage> {
         let order = self.chat.order();
         let last_arch = order.iter().rposition(|id| {
@@ -552,7 +561,10 @@ impl Session {
                         Some(a) => i > a,
                         None => true,
                     };
-                    return current.then_some(*reported_usage);
+                    if !current || !self.chat.context_is_green(*id) {
+                        return None;
+                    }
+                    return Some(*reported_usage);
                 }
             }
         }
@@ -642,6 +654,13 @@ impl Session {
     ) {
         self.compacting = false;
         self.prompt_base = 0;
+        // Der zuletzt *live* gemeldete `total_tokens`-Wert misst noch den alten,
+        // jetzt gelöschten Kontext. Als Anker für die Statusleiste ist er
+        // wertlos – sie soll auf den neuen Kontext springen. Bis der retryte
+        // Turn wieder Usage liefert, zählt daher `prompt_tokens`: der
+        // `context_len` des NEUESTEN History-Events (nach dem Shift unten =
+        // Summary + Überlebende) plus die Schätzung der noch offenen Events.
+        self.live_usage_total = None;
         let boundary = compact_boundary(self, keep);
         if boundary == 0 {
             return;
@@ -772,18 +791,18 @@ pub(crate) fn apply_channel_permission_default(s: &mut Session) {
     }
 }
 
-/// Token-Anzahl des AKTUELLEN Kontexts (ohne manuelle `/run`-Tools): die
-/// API-Projektion (`api_messages`) startet an der LETZTEN Summary, daher
-/// zählen auch wir nur Events ab dort – nicht die Zeichen aller Nachrichten.
-/// Die Summary selbst trägt ihre exakte Token-Zahl vom Kompaktierungs-Aufruf
-/// (`Archive.num_tokens`, = `completion_tokens` des Compaction-Aufrufs /
-/// Fallback Zeichen-Schätzung); hier kein Umweg über Zeichen. Alles danach
-/// (überlebende Turns + neue Nachrichten) muss per Zeichen-Heuristik geschätzt
-/// Anzahl der Token, die an den nächsten LLM-Aufruf geschickt werden (Basis
-/// fürs Live/Stream-Label). Seit der context_len-Mechanik die gespeicherte
-/// kumulative Kontextlänge des letzten finalisierten Events (enthält bereits
-/// bestätigte Werte und Kompaktierungs-Shifts – KEIN Zeichen-Umweg mehr);
-/// offene (wachsende) Events zählen mit ihrem aktuellen Streaming-Stand dazu.
+/// Token-Anzahl des AKTUELLEN Kontexts (ohne manuelle `/run`-Tools), also das,
+/// was der nächste LLM-Aufruf schickt – Basis fürs Live-/Stream-Label, für
+/// die Context-Anzeige der Statusleiste und für `should_compact`.
+///
+/// Maß ist die gespeicherte kumulative Kontextlänge (`context_len`) des letzten
+/// FINALISIERTEN Events: sie enthält bereits bestätigte Server-Werte und die
+/// Kompaktierungs-Shifts, also KEIN Zeichen-Umweg. Die API-Projektion
+/// (`api_messages`) beginnt an der LETZTEN Summary – der Resync auf deren
+/// `context_len` erfasst das ohnehin (sie trägt ihre exakte Token-Zahl aus dem
+/// Kompaktierungs-Aufruf, `Archive.num_tokens`). Offene (wachsende) Events und
+/// Events ohne `context_len` zählen mit ihrem geschätzten Beitrag obendrauf
+/// (`Chat::estimate_contribution`).
 pub(crate) fn prompt_tokens(s: &Session) -> u64 {
     let order = s.chat.order();
     let mut total = 0u64;

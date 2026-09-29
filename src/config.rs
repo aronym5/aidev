@@ -344,11 +344,6 @@ pub struct Config {
     /// Provider-Definitionen: Schlüssel = Name, der als Prefix in Modell-IDs dient.
     #[serde(default)]
     pub provider: HashMap<String, ProviderConfig>,
-    /// Maximalschutzwert an Werkzeug-Runden pro Turn. Bei Erreichen bekommt
-    /// das Modell eine letzte Runde OHNE Werkzeuge mit der Aufforderung,
-    /// abschließend zu antworten (statt hart abgebrochen zu werden).
-    #[serde(default = "default_max_tool_rounds")]
-    pub max_tool_rounds: u64,
     /// Timeout für Kommandos in Sekunden – **global**, gilt einheitlich für
     /// alle Kanäle (nicht mehr pro Kanal konfigurierbar).
     #[serde(default = "default_timeout_secs")]
@@ -371,9 +366,18 @@ pub struct Config {
     /// zusammengefasst wird (0.8 = ab 80 % Auslastung).
     #[serde(default = "default_compact_at")]
     pub compact_at: f64,
+    /// Zielanteil von `context_window`, den der UNVERÄNDERTE Historienteil nach
+    /// der Kompaktierung belegen soll (0.2 = ~20 %). Die Kompaktierung wählt den
+    /// Schnitt, dessen verbleibender Tail diesem Ziel am nächsten kommt –
+    /// angestrebt werden also ~80 % frei gewordener Kontext. Sollte deutlich
+    /// unter `compact_at` liegen, sonst löst sich die Kompaktierung im nächsten
+    /// Turn sofort wieder aus.
+    #[serde(default = "default_compact_keep_ratio")]
+    pub compact_keep_ratio: f64,
     /// Anzahl der letzten Turns (User+Assistant), die bei der Kompaktierung
     /// unangetastet bleiben – die Zusammenfassung ersetzt nur ältere
-    /// Nachrichten.
+    /// Nachrichten. Dient als Rückfall, wenn kein Schnitt sein Ziel erreicht
+    /// (reaktiv) bzw. als Vorprüfung, ob überhaupt etwas zu schneiden ist.
     #[serde(default = "default_compact_keep_turns")]
     pub compact_keep_turns: usize,
     /// Token-Budget (`max_tokens`) für die Zusammenfassung – Obergrenze,
@@ -422,16 +426,16 @@ fn default_model() -> String {
     "zen/big-pickle".to_string()
 }
 
-fn default_max_tool_rounds() -> u64 {
-    100
-}
-
 fn default_context_window() -> u64 {
     200_000
 }
 
 fn default_compact_at() -> f64 {
     0.8
+}
+
+fn default_compact_keep_ratio() -> f64 {
+    0.2
 }
 
 fn default_compact_keep_turns() -> usize {
@@ -474,13 +478,13 @@ impl Default for Config {
         Config {
             model: default_model(),
             provider: default_provider(),
-            max_tool_rounds: default_max_tool_rounds(),
             timeout_secs: default_timeout_secs(),
             default_channel: None,
             channels: HashMap::new(),
             models: default_models(),
             context_window: default_context_window(),
             compact_at: default_compact_at(),
+            compact_keep_ratio: default_compact_keep_ratio(),
             compact_keep_turns: default_compact_keep_turns(),
             compact_summary_tokens: default_compact_summary_tokens(),
             compact_auto: default_compact_auto(),
@@ -661,11 +665,6 @@ impl Config {
                 self.model.trim().to_string()
             },
             provider: self.provider,
-            max_tool_rounds: if self.max_tool_rounds == 0 {
-                d.max_tool_rounds
-            } else {
-                self.max_tool_rounds
-            },
             timeout_secs: if self.timeout_secs == 0 {
                 d.timeout_secs
             } else {
@@ -683,6 +682,12 @@ impl Config {
                 d.compact_at
             } else {
                 self.compact_at
+            },
+            compact_keep_ratio: if self.compact_keep_ratio <= 0.0 || self.compact_keep_ratio > 1.0
+            {
+                d.compact_keep_ratio
+            } else {
+                self.compact_keep_ratio
             },
             compact_keep_turns: if self.compact_keep_turns == 0 {
                 d.compact_keep_turns
@@ -783,14 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn max_tool_runden_hat_default_und_lasst_sich_setzen() {
-        let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
-        assert_eq!(cfg.max_tool_rounds, 100, "Default");
-        let cfg2: Config = toml::from_str("max_tool_rounds = 4").expect("TOML lesbar");
-        assert_eq!(cfg2.max_tool_rounds, 4, "konfigurierbar");
-        assert_eq!(cfg2.with_defaults().max_tool_rounds, 4);
-        let zero: Config = toml::from_str("max_tool_rounds = 0").expect("TOML lesbar");
-        assert_eq!(zero.with_defaults().max_tool_rounds, 100, "0 -> Default");
+    fn max_tool_runden_wird_ignoriert() {
+        // Das Runden-Limit ist entfernt: alte Configs mit dem Schlüssel laden
+        // weiterhin (unbekannte Felder werden nicht abgelehnt), er wird nur
+        // nicht mehr ausgewertet.
+        let cfg: Config =
+            toml::from_str("max_tool_rounds = 4\ntimeout_secs = 42").expect("TOML lesbar");
+        assert_eq!(cfg.timeout_secs, 42, "andere Felder wirken weiter");
     }
 
     #[test]
@@ -829,12 +833,13 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
         assert_eq!(cfg.context_window, 200_000);
         assert!((cfg.compact_at - 0.8).abs() < 1e-9);
+        assert!((cfg.compact_keep_ratio - 0.2).abs() < 1e-9);
         assert_eq!(cfg.compact_keep_turns, 3);
         assert_eq!(cfg.compact_summary_tokens, 4_000);
         assert!(cfg.compact_auto);
 
         let nulldaten: Config =
-            toml::from_str("context_window = 0\ncompact_at = 2\ncompact_keep_turns = 0\ncompact_summary_tokens = 0\ncompact_auto = false")
+            toml::from_str("context_window = 0\ncompact_at = 2\ncompact_keep_ratio = 0\ncompact_keep_turns = 0\ncompact_summary_tokens = 0\ncompact_auto = false")
                 .expect("TOML lesbar");
         let d = nulldaten.with_defaults();
         assert_eq!(d.context_window, 200_000, "0 -> Default");
@@ -842,16 +847,21 @@ mod tests {
             (d.compact_at - 0.8).abs() < 1e-9,
             "außerhalb (0,1] -> Default"
         );
+        assert!(
+            (d.compact_keep_ratio - 0.2).abs() < 1e-9,
+            "0 -> Default"
+        );
         assert_eq!(d.compact_keep_turns, 3, "0 -> Default");
         assert_eq!(d.compact_summary_tokens, 4_000, "0 -> Default");
         assert!(!d.compact_auto, "false bleibt false (kein Default-Zwang)");
 
         let gesetzt: Config = toml::from_str(
-            "context_window = 32000\ncompact_at = 0.9\ncompact_keep_turns = 5\ncompact_summary_tokens = 999\ncompact_auto = false",
+            "context_window = 32000\ncompact_at = 0.9\ncompact_keep_ratio = 0.15\ncompact_keep_turns = 5\ncompact_summary_tokens = 999\ncompact_auto = false",
         )
         .expect("TOML lesbar");
         assert_eq!(gesetzt.context_window, 32_000);
         assert!((gesetzt.compact_at - 0.9).abs() < 1e-9);
+        assert!((gesetzt.compact_keep_ratio - 0.15).abs() < 1e-9);
         assert_eq!(gesetzt.compact_keep_turns, 5);
         assert_eq!(gesetzt.compact_summary_tokens, 999);
         assert!(!gesetzt.compact_auto);
@@ -1243,8 +1253,7 @@ mod tests {
         assert_eq!(zen.api_key.as_deref(), Some("public"));
         // Modell-Alias "pig-pickle" zeigt auf zen/big-pickle
         assert_eq!(cfg.models["pig-pickle"].id(), "zen/big-pickle");
-        // max_tool_rounds und timeout
-        assert_eq!(cfg.max_tool_rounds, 100);
+        // timeout
         assert_eq!(cfg.timeout_secs, 500);
         // Default-Modell ist auflösbar
         let ep = cfg.resolve(None).expect("Default-Modell auflösbar");

@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// Nachricht im Wire-Format.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub(crate) struct WireMessage {
     pub(crate) role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -14,6 +14,13 @@ pub(crate) struct WireMessage {
     pub(crate) tool_calls: Option<Vec<WireToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
+    /// Bestätigte Tokenzahl dieser Nachricht aus dem Event-Log (die `num_tokens*`-
+    /// Felder der Events sind >> 0), falls vorhanden. Existiert nur für die
+    /// Kompaktierungs-Planung (dort bevorzugt vor der Zeichen-Schätzung), wird
+    /// NICHT an den Server serialisiert (`skip`). `None` = keine gemessene Zahl →
+    /// Zeichen-Schätzung.
+    #[serde(skip)]
+    pub(crate) num_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

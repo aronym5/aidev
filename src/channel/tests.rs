@@ -463,6 +463,49 @@ fn workdir_join_ohne_escape() {
 }
 
 #[test]
+fn to_rel_bildet_absolute_pfade_unter_mount_ab() {
+    // Relative Pfade bleiben unverändert.
+    assert_eq!(
+        resolve::to_rel(Some("/usr/src/app"), "src/main.rs").unwrap(),
+        Path::new("src/main.rs")
+    );
+    // Genau der Mount-Punkt → Workingdir selbst.
+    assert_eq!(
+        resolve::to_rel(Some("/usr/src/app"), "/usr/src/app").unwrap(),
+        Path::new("")
+    );
+    // Darunter → Rest wird relativ.
+    assert_eq!(
+        resolve::to_rel(Some("/usr/src/app"), "/usr/src/app/src/main.rs").unwrap(),
+        Path::new("src/main.rs")
+    );
+    // Trailing Slash im Mount-Punkt wird toleriert.
+    assert_eq!(
+        resolve::to_rel(Some("/usr/src/app/"), "/usr/src/app/a.txt").unwrap(),
+        Path::new("a.txt")
+    );
+    // Mount-Punkt "/" fängt jeden absoluten Pfad ab.
+    assert_eq!(
+        resolve::to_rel(Some("/"), "/a/b").unwrap(),
+        Path::new("a/b")
+    );
+}
+
+#[test]
+fn to_rel_weist_fremde_absolute_pfade_ab() {
+    // Außerhalb des Mount-Punkts.
+    assert!(resolve::to_rel(Some("/usr/src/app"), "/etc/passwd").is_err());
+    // Präfix-Grenze: /usr/src/apple liegt NICHT unter /usr/src/app.
+    assert!(resolve::to_rel(Some("/usr/src/app"), "/usr/src/apple/x").is_err());
+    // Kein bekannter Mount-Punkt → absolute Pfade sind nicht zuordenbar.
+    assert!(resolve::to_rel(None, "/etc/passwd").is_err());
+    // Ein `..` im akzeptierten Rest bleibt erhalten und wird von `resolve`
+    // weiterhin abgewiesen (kein Ausbruch aus dem Arbeitsverzeichnis).
+    let rel = resolve::to_rel(Some("/app"), "/app/../../etc/passwd").unwrap();
+    assert_eq!(rel, Path::new("../../etc/passwd"));
+}
+
+#[test]
 fn sanitize_macht_wortnamen() {
     assert_eq!(run::sanitize("Mein Kanal 2"), "mein-kanal-2");
     assert_eq!(run::sanitize("!!!"), "channel");
@@ -1187,6 +1230,59 @@ fn schnelles_kind_mit_erbe_blockiert_nicht() {
         elapsed < Duration::from_secs(2),
         "kein Blockieren an der geerbten Pipe: {elapsed:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_antwort_beendet_auch_nohup_hintergrundprozess() {
+    struct KillOnDrop(u32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // Nur für den Fehlerfall: Ein fehlgeschlagener Test darf keinen
+            // 60-Sekunden-Prozess im Testsystem zurücklassen.
+            unsafe {
+                libc::kill(self.0 as i32, libc::SIGKILL);
+            }
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!("aidev-nohup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pidfile = dir.join("background.pid");
+    let command = format!(
+        "nohup sleep 60 >/dev/null 2>&1 & echo $! > '{}'",
+        pidfile.display()
+    );
+
+    let out = run::run_with_timeout(
+        "sh",
+        &["-c".into(), command],
+        Path::new("."),
+        Duration::from_secs(5),
+    )
+    .expect("Kommando startbar");
+    assert_eq!(out.exit_code, Some(0), "Shell-Ausgabe: {out:?}");
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .expect("Hintergrund-PID geschrieben")
+        .trim()
+        .parse()
+        .expect("numerische Hintergrund-PID");
+    let _cleanup = KillOnDrop(pid);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match proc_state(pid) {
+            None | Some('Z') => break,
+            Some(_) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    assert!(
+        matches!(proc_state(pid), None | Some('Z')),
+        "nohup-Prozess wurde nach Shell-Antwort nicht beendet"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(target_os = "linux")]

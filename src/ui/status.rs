@@ -233,27 +233,36 @@ pub(crate) fn key_help_full_width(bindings: &[(&str, &str)]) -> usize {
 ///
 /// Sobald live neue Daten eintreffen (mid-stream `UsageUpdate` bzw. Runden-
 /// `Usage`), zeigt die Statusleiste deren `total_tokens` an dieser Stelle –
-/// nicht die der letzten abgeschlossenen Runde. Hat die letzte Runde KEIN
-/// bestätigtes Usage (z. B. vom User abgebrochen oder mit einem Fehler
-/// beendet), liefert `last_usage_current` einen Null-Usage. Statt dann „0T“
-/// zu zeigen, fällt die Anzeige auf die Schätzung `prompt_tokens` zurück:
-/// die letzte bestätigte Kontextlänge + Schätzung der seither angefügten
-/// Token (partieller Inhalte, neue Nachricht) – grau, weil nicht bestätigt.
+/// nicht die der letzten abgeschlossenen Runden. Hat die letzte Runde KEIN
+/// bestätigtes Usage (z. B. vom User abgebrochen, mit einem Fehler beendet oder
+/// vor einer Kompaktierung gemessen), liefert `last_usage_current` nichts.
+/// Statt dann „0T“ zu zeigen, fällt die Anzeige auf die Schätzung `prompt_tokens`
+/// zurück: die Kontextlänge des NEUESTEN Events der History + Schätzung der
+/// seither angefügten Token (partieller Inhalte, neue Nachricht) – grau, weil
+/// nicht bestätigt.
+///
+/// Nach einer Kompaktierung ist das der Normalfall: Live-Wert und Usage der
+/// überlebenden Runden messen noch die alte, größere Historie. Die Statusleiste
+/// springt deshalb mit auf den neuen Kontext – Summary + überlebende Turns, plus
+/// was gerade in Verarbeitung ist – und zeigt ihn bis zur nächsten Runde mit
+/// Usage als Schätzung (grau).
 fn context_tokens(s: &Session) -> Option<(u64, bool)> {
     // Live-Wert hat Vorrang, sobald er gesetzt ist: neue Daten zeigen sofort
     // deren `total_tokens`, statt bis zum Rundenende zu warten.
     if let Some(t) = s.live_usage_total.filter(|&t| t > 0) {
         return Some((t, true));
     }
-    // Letzte abgeschlossene Runde mit bestätigtem Usage (Null-Usage abgebrochener/
-    // fehlgeschlagener Runden überspringen → sonst käme „0T“).
+    // Letzte abgeschlossene Runde mit bestätigtem Usage. `last_usage_current`
+    // liefert bewusst NICHTS, wenn diese Runde abgebrochen/fehlgeschlagen ist
+    // oder vor einer Kompaktierung gemessen wurde (dann käme „0T“ bzw. der
+    // alte, zu große Wert) – wir springen direkt auf die Schätzung.
     if let Some(u) = s.last_usage_current().filter(|u| u.total_tokens > 0) {
         return Some((u.total_tokens, true));
     }
     // Nach (oder ohne) Compaction / nach abgebrochener letzter Runde:
-    // geschätzte Kontext-Tokens aus dem Event-Log (letzte bestätigte
-    // Kontextlänge + angefügte Schätzung), sonst `prompt_base` als obere
-    // Schranke.
+    // geschätzte Kontext-Tokens aus dem Event-Log (Kontextlänge des neuesten
+    // Events – nach einer Kompaktierung also Summary + Überlebende – plus die
+    // Beiträge der offenen Events), sonst `prompt_base` als obere Schranke.
     let est = prompt_tokens(s);
     if est > 0 {
         return Some((est, false));
@@ -402,6 +411,7 @@ pub(crate) fn channel_status_color(status: ChannelStatus) -> Color {
 #[cfg(test)]
 mod tests {
     use super::context_tokens;
+    use crate::app::prompt_tokens;
     use crate::app::Session;
     use crate::llm::Usage;
     use crate::perm::Permission;
@@ -454,9 +464,58 @@ mod tests {
         let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
         assert!(!green, "nach Abbruch → Schätzung (grau)");
         assert!(t > 0, "kein 0T nach Abbruch: {t}");
+        // Deutlich unter beiden Altwerten (Live 190_000, letzte Usage 170_000).
+        assert!(t < 170_000, "deutlich unter den Altwerten: {t}");
+    }
+
+    /// Nach einer Kompaktierung beschreiben die alten Werte den aktuellen
+    /// Kontext nicht mehr: der zuletzt *live* gemeldete `total_tokens`-Wert und
+    /// die Usage der überlebenden Runden (beide gegen die alte, größere Historie
+    /// gemessen). Die Statusleiste muss auf den neuen Kontext springen – den
+    /// Wert des NEUESTEN Events der History (nach dem Shift) plus die Schätzung
+    /// der noch offenen Events, also `prompt_tokens` – und ihn als Schätzung
+    /// (grau) kennzeichnen.
+    #[test]
+    fn kompaktierung_springt_auf_den_neuen_kontext() {
+        let turn = |s: &mut Session, frage: &str, p: u64, c: u64| {
+            s.push_user_message(frage.into(), Some(Permission::Read), "m".into());
+            let a = s.open_assistant("gedanke".into(), "antwort".into());
+            s.chat
+                .finalize_assistant(a, std::time::Instant::now(), usage(p, c), 0, 0, false);
+        };
+        let mut s = Session::new(0);
+        turn(&mut s, "frage eins", 90_000, 10_000); // Kontext 100_000
+        turn(&mut s, "frage zwei", 150_000, 20_000); // Kontext 170_000
+        s.live_usage_total = Some(190_000); // Live-Messung der laufenden Runde
+        assert_eq!(context_tokens(&s).expect("live").0, 190_000);
+
+        // Reaktive Kompaktierung: Turn 1 wird durch die Summary (1_000 Token)
+        // ersetzt, Turn 2 überlebt. Dessen `context_len` wandert um den
+        // abgeschnittenen Teil (100_000 - 1_000) nach unten.
+        s.apply_compaction("zusammenfassung".into(), 1_000, 0, None);
+        let erwartet = prompt_tokens(&s);
+        let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
+        assert!(!green, "nach Kompaktierung → Schätzung (grau)");
+        assert_eq!(t, erwartet, "Statusleiste folgt der History");
+        assert_eq!(
+            t, 71_000,
+            "Summary + überlebender Turn, ohne den alten Rest"
+        );
+        // Deutlich unter beiden Altwerten (Live 190_000, letzte Usage 170_000).
+        assert!(t < 170_000, "deutlich unter den Altwerten: {t}");
+
+        // Offene (noch verarbeitete) Nachricht: ihr Beitrag kommt obendrauf.
+        s.open_assistant("halb".into(), String::new());
+        let offen = s.chat.order().last().copied().expect("offenes Event");
+        let (t_laufend, _) = context_tokens(&s).expect("Kontext vorhanden");
+        assert_eq!(
+            t_laufend,
+            erwartet + s.chat.estimate_contribution(offen),
+            "in Verarbeitung befindliche Nachricht zählt als Schätzung dazu"
+        );
         assert!(
-            t < 100_000 + 1_000,
-            "Anker + Append-Schätzung, nicht der alte Gesamtwert: {t}"
+            t_laufend > erwartet,
+            "offene Nachricht erhöht die Anzeige: {t_laufend}"
         );
     }
 }

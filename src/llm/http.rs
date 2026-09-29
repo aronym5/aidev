@@ -18,7 +18,22 @@ use super::helpers::{
 };
 use super::tools_def::{apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation};
 use super::wire::{WireFunction, WireMessage, WireToolCall};
-use super::{CompletionParts, RoundMetrics, Usage, WorkerEvent};
+use super::{ApiProtocol, CompletionParts, RoundMetrics, Usage, WorkerEvent};
+
+/// Sendet ein Modell-Probe-Ergebnis (für den Statusindikator im Picker) an die
+/// UI. `model` ist der Registry-Key (`ep.model` = `provider/alias`), `shape`
+/// das getestete API-Protokoll, `ok` ob das Modell darauf korrekt geantwortet
+/// hat.
+fn send_probe(tx: &Sender<WorkerEvent>, model: &str, shape: api::ApiShape, ok: bool) {
+    let _ = tx.send(WorkerEvent::ModelProbe {
+        model: model.to_string(),
+        protocol: match shape {
+            api::ApiShape::ChatCompletions => ApiProtocol::ChatCompletions,
+            api::ApiShape::Responses => ApiProtocol::Responses,
+        },
+        ok,
+    });
+}
 
 /// Prozessweit geteilter blocking-HTTP-Client. Die Verbindung zum Endpunkt
 /// bleibt als Keep-Alive im Pool liegen und wird für den nächsten Turn
@@ -48,21 +63,51 @@ pub(crate) fn shared_client() -> &'static reqwest::blocking::Client {
 /// `data:`-Zeilen; jede einzelne ist dann kein gültiges JSON. Die übliche
 /// „eine Zeile = ein Event“-Form bleibt unverändert (ein solches Fragment ist
 /// sofort gültig und wird direkt geliefert).
+///
+/// Beim Zusammensetzen werden zwei Verbindungen erprobt:
+/// - **ohne Trennzeichen** (leer): nötig, wenn der Schnitt mitten in einem
+///   JSON-String-Wert liegt – jedes eingefügte Zeichen würde den Wert
+///   verfälschen. So bleiben z. B. mehrzeilige `edit`-/`write`-Argumente
+///   verlustfrei erhalten.
+/// - **mit `\n`**: das historische Verhalten, wenn die Fragmente erst mit
+///   Zeilenumbruch gültig werden (Schnitt zwischen zwei JSON-Tokens, wo `\n`
+///   nur als Whitespace zählt).
+///
+/// Schlägt beides fehl, bleibt das Fragment mit `\n` im Puffer und kommt zur
+/// nächsten `data:`-Zeile (unverändert).
 pub(crate) fn accumulate_sse_event(
     pending: &mut String,
     payload: &str,
 ) -> Option<serde_json::Value> {
-    if !pending.is_empty() {
-        pending.push('\n');
-    }
-    pending.push_str(payload);
-    match serde_json::from_str::<serde_json::Value>(pending) {
-        Ok(v) => {
+    for joined in [format!("{pending}{payload}"), format!("{pending}\n{payload}")] {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&joined) {
             pending.clear();
-            Some(v)
+            return Some(v);
         }
-        Err(_) => None,
     }
+    // Noch unvollständig: falls bisher nichts anhängt war, beginnt `pending`
+    // mit dem aktuellen Fragment; die Trennungssuche oben nutzt es direkt.
+    if pending.is_empty() {
+        pending.push_str(payload);
+    } else {
+        pending.push('\n');
+        pending.push_str(payload);
+    }
+    None
+}
+
+/// Prüft, ob die per Deltas akkumulierten Tool-Argumente unvollständig sind.
+///
+/// `true` bei leerem Eingang und bei jedem Eingang, der kein gültiges JSON
+/// ergibt – etwa ein vom Delta-Strom abgeschnittenes Präfix. Ein Präfix eines
+/// einzelnen Objekts kann per Definition nie gültiges JSON sein (die äußere
+/// `{` bliebe ungeöffnet), daher bedeutet „gültiges JSON“ hier immer auch
+/// „vollständig“. Nur dann dürfen die vollständigen `.done`-Argumente die
+/// akkumulierten ersetzen; sonst würden die über die Deltas bereits gebuchten
+/// Token doppelt zählen.
+pub(crate) fn arguments_incomplete(accumulated: &str) -> bool {
+    let trimmed = accumulated.trim();
+    trimmed.is_empty() || serde_json::from_str::<serde_json::Value>(trimmed).is_err()
 }
 
 /// Eine HTTP-Runde. Bei (vermuteter) fehlender Werkzeug-Unterstützung des
@@ -81,11 +126,31 @@ pub(crate) fn request_once(
 ) -> (Step, bool) {
     if !with_tools {
         return (
-            do_request(tx, session, client, ep, msgs, cancel, false, permission, has_channel),
+            do_request(
+                tx,
+                session,
+                client,
+                ep,
+                msgs,
+                cancel,
+                false,
+                permission,
+                has_channel,
+            ),
             false,
         );
     }
-    let first = do_request(tx, session, client, ep, msgs, cancel, true, permission, has_channel);
+    let first = do_request(
+        tx,
+        session,
+        client,
+        ep,
+        msgs,
+        cancel,
+        true,
+        permission,
+        has_channel,
+    );
     if let Step::Err(msg) = &first {
         // Nur eine 400-Antwort mit Tool-/Funktions-Hinweis deutet auf fehlende
         // Werkzeug-Unterstützung hin – DANN ohne `tools` wiederholen. Andere
@@ -98,7 +163,17 @@ pub(crate) fn request_once(
         {
             // Retry ohne Tools: die Info geht sonst als WorkerEvent/Fehler
             // in die UI; ein Konsolen-Print würde das TUI-Layout zerschießen.
-            let retry = do_request(tx, session, client, ep, msgs, cancel, false, permission, has_channel);
+            let retry = do_request(
+                tx,
+                session,
+                client,
+                ep,
+                msgs,
+                cancel,
+                false,
+                permission,
+                has_channel,
+            );
             return (retry, false);
         }
     }
@@ -183,9 +258,26 @@ pub(crate) fn do_request(
     // Shape wird unten bei einem Server-Fehler (5xx) auch die andere API probiert.
     let shape_info = api::resolve_shape_info(ep);
     let mut shape = shape_info.shape;
-    let (mut url, mut body) =
-        api::build_body(ep, shape, msgs, with_tools, permission, has_channel, true, None);
+    let offer = || -> api::ToolOffer {
+        if with_tools {
+            api::ToolOffer::Session {
+                permission,
+                has_channel,
+            }
+        } else {
+            api::ToolOffer::None
+        }
+    };
+    let (mut url, mut body) = api::build_body(ep, shape, msgs, offer(), true, None);
     let mut shape_flipped = false;
+    // Protokolle, die in dieser Runde versucht wurden – für das gezielte
+    // Verbuchen von Fehl-Probes beim endgültigen Scheitern (max. 2 Einträge).
+    let mut tried_shapes: Vec<api::ApiShape> = Vec::new();
+    let note_tried = |s: api::ApiShape, tried: &mut Vec<api::ApiShape>| {
+        if !tried.contains(&s) {
+            tried.push(s);
+        }
+    };
 
     // Eine neue HTTP-Runde beginnt: Die Statusleiste setzt ihre
     // Streaming-Metrik-Felder zurück und zählt ab hier „thinking…“ hoch
@@ -207,6 +299,7 @@ pub(crate) fn do_request(
         if cancel.load(Ordering::Relaxed) {
             return Step::Cancelled;
         }
+        note_tried(shape, &mut tried_shapes);
         let req = client
             .post(&url)
             .bearer_auth(&ep.api_key)
@@ -257,6 +350,9 @@ pub(crate) fn do_request(
             // nachfolgende Requests (und andere Pfade) direkt dieses Format
             // nutzen, statt bei jedem Turn erneut zu raten.
             api::remember_shape(ep, shape);
+            // Das Modell hat auf diesem Protokoll korrekt geantwortet →
+            // positives Probe-Ergebnis für den Statusindikator.
+            send_probe(tx, &ep.model, shape, true);
             break resp;
         }
         let status = resp.status();
@@ -283,9 +379,7 @@ pub(crate) fn do_request(
         {
             shape_flipped = true;
             shape = shape.flipped();
-            let (u, b) = api::build_body(
-                ep, shape, msgs, with_tools, permission, has_channel, true, None,
-            );
+            let (u, b) = api::build_body(ep, shape, msgs, offer(), true, None);
             url = u;
             body = b;
             continue;
@@ -311,6 +405,12 @@ pub(crate) fn do_request(
         // (Chat, inkl. Debug-Pfad über `with_debug`); ein Konsolen-Print
         // würde das TUI-Layout zerschießen.
         if final_failure {
+            // Beim endgültigen Scheitern alle in dieser Runde versuchten
+            // Protokolle als Fehl-Probe verbuchen (nur Fehlermeldungen →
+            // gelb bzw. nach Test auf allen Protokollen rot).
+            for s in &tried_shapes {
+                send_probe(tx, &ep.model, *s, false);
+            }
             return Step::Err(with_debug(
                 format!("API error ({status}): {summary}"),
                 debug,
@@ -580,6 +680,7 @@ pub(crate) fn do_request(
                 reasoning_content: reasoning,
                 tool_calls: calls,
                 tool_call_id: None,
+                num_tokens: None,
             }
         };
 
@@ -920,15 +1021,28 @@ fn stream_responses(
                     .map(|n| n as usize)
                     .unwrap_or(0);
                 if let Some(args) = json.get("arguments").and_then(|a| a.as_str()) {
-                    let slot = ensure_tool_slot(&mut tool_accs, index);
-                    // Falls Deltas unvollständig waren: vollständige Arguments setzen.
-                    // Nur wenn NICHT schon über Deltas gemessen (slot leer) – dann
-                    // gehören die Argument-Tokens in die usage-Verteilung.
-                    if slot.arguments.is_empty() && !args.is_empty() {
-                        slot.arguments = args.to_string();
-                        parts_acc.track_tool(index, args.len() as u64);
-                        timer.on_chars(args.chars().count() as u64);
-                        timer.send_progress(tx, session);
+                    if !args.is_empty() {
+                        let slot = ensure_tool_slot(&mut tool_accs, index);
+                        // Die vollständigen Argumente aus `.done` haben
+                        // Vorrang, solange die per Deltas akkumulierten
+                        // unvollständig sind (leer oder kein gültiges JSON –
+                        // z. B. abgeschnittener Delta-Strom). Vollständige
+                        // Deltas bleiben unangetastet, damit die darüber schon
+                        // gebuchten Token nicht doppelt zählen.
+                        if arguments_incomplete(&slot.arguments) {
+                            let acc_bytes = slot.arguments.len();
+                            let acc_chars = slot.arguments.chars().count();
+                            slot.arguments = args.to_string();
+                            // Nur die noch fehlenden Bytes/Zeichen ergänzen;
+                            // bei leeren Deltas ist das die volle Länge, also
+                            // unverändert das frühere Verhalten.
+                            parts_acc
+                                .track_tool(index, args.len().saturating_sub(acc_bytes) as u64);
+                            timer.on_chars(
+                                args.chars().count().saturating_sub(acc_chars) as u64,
+                            );
+                            timer.send_progress(tx, session);
+                        }
                     }
                 }
             }
@@ -1001,6 +1115,7 @@ fn finish_round(
                 reasoning_content: reasoning,
                 tool_calls: calls,
                 tool_call_id: None,
+                num_tokens: None,
             }
         };
 

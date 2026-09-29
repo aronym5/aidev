@@ -24,12 +24,12 @@ use crate::perm::Permission;
 
 /// Liegt ein Kanal vor, darf das Modell Werkzeuge über `channel` ausführen –
 /// aber nur die, die `permission` freigibt (Filter der Tool-Definitionen UND
-/// Berechtigungsprüfung vor jeder Ausführung). Der Loop läuft bis zur finalen
-/// Antwort. Das Runden-Limit
-/// (`config.max_tool_rounds`) schützt davor, dass das Modell unendlich Tools
-/// aufruft. Wird es erreicht, gibt es KEINEN harten Abbruch: Das Modell
-/// bekommt eine letzte Runde OHNE Werkzeuge mit der verbalen Aufforderung,
-/// die Antwort jetzt anhand der bisherigen Ergebnisse abzuschließen.
+/// Berechtigungsprüfung vor jeder Ausführung). Der Loop läuft ohne Runden-Limit
+/// bis zur finalen Antwort; er endet also nur, wenn das Modell selbst keine
+/// Werkzeuge mehr anfordert, ein Fehler auftritt oder der Turn abgebrochen wird
+/// (Cancel-Flag – vor jeder Runde und vor jedem einzelnen Werkzeug geprüft).
+/// Dem Context ist das unproblematisch: die proaktive/reaktive Kompaktierung
+/// hält die Anfrage im Fenster.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     tx: Sender<WorkerEvent>,
@@ -45,7 +45,6 @@ pub fn spawn_worker(
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = shared_client();
-        let max_rounds = config.max_tool_rounds as usize;
 
         // Wire-Format ist bereits die Chat-Projektion (`api_messages(&chat)`).
         let mut msgs = messages;
@@ -91,7 +90,9 @@ pub fn spawn_worker(
             }
         }
 
-        for _ in 0..max_rounds {
+        // Ohne Runden-Limit: der Loop endet über die `return`s in den
+        // match-Armen (finale Antwort, Fehler, Abbruch).
+        loop {
             if cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerEvent::Cancelled(session));
                 return;
@@ -290,6 +291,7 @@ pub fn spawn_worker(
                             reasoning_content: None,
                             tool_calls: None,
                             tool_call_id: Some(t.id),
+                            num_tokens: None,
                         });
                     }
                     // Alle Werkzeuge dieser Runde sind beendet – der Worker kennt
@@ -301,51 +303,6 @@ pub fn spawn_worker(
                     let _ = tx.send(WorkerEvent::RoundEnd(session));
                     msgs.extend(round);
                 }
-            }
-        }
-
-        // Runden-Limit erreicht: Statt hart abzubrechen, wird das Modell
-        // VERBAL und strukturell zum Abschluss gezwungen. Werkzeuge sind für
-        // diese letzte Runde deaktiviert, daher kann es nicht weiter Tools
-        // aufrufen, sondern muss die Nutzerfrage anhand der bisherigen
-        // Werkzeug-Ergebnisse beantworten.
-        if cancel.load(Ordering::Relaxed) {
-            let _ = tx.send(WorkerEvent::Cancelled(session));
-            return;
-        }
-        msgs.push(WireMessage {
-            role: "system".into(),
-            content: Some(format!(
-                "You have reached the limit of {max_rounds} tool rounds. \
-                 Answer the user's question now, using the tool results so far. \
-                 No further tool calls are possible."
-            )),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        let (step, _) = request_once(&tx, session, client, &ep, &msgs, &cancel, false, permission, has_channel);
-        match step {
-            Step::Final { usage, parts } => {
-                if let Some(u) = usage {
-                    let _ = tx.send(WorkerEvent::Usage(session, u, parts.clone()));
-                }
-                let _ = tx.send(WorkerEvent::Done(session));
-            }
-            Step::Cancelled => {
-                let _ = tx.send(WorkerEvent::Cancelled(session));
-            }
-            Step::Err(err) => {
-                let _ = tx.send(WorkerEvent::Error(session, err));
-            }
-            Step::Tools { .. } => {
-                let _ = tx.send(WorkerEvent::Error(
-                    session,
-                    format!(
-                        "Das Modell hat das Werkzeug-Runden-Limit ({max_rounds}) erreicht \
-                         und danach keine abschließende Antwort geliefert – abgebrochen."
-                    ),
-                ));
             }
         }
     })

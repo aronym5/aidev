@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "aidev"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "crossterm 0.28.1",
  "indexmap",

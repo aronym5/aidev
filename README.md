@@ -90,8 +90,12 @@ The status line shows a channel indicator: green = running, yellow = starting, r
 problem, grey = not yet checked.
 
 All paths are relative to the channel root; escapes (`..`) and out-of-root symlinks are
-rejected. The `config.toml` can pre-register channel **paths** (optionally with a
-container image) that the channel builder offers — see [Configuration](#configuration).
+rejected. For `read`/`write`/`edit`/`grep`/`glob`, an absolute path (or, for `glob`, an
+absolute pattern) is also accepted — but only if it points into the working directory (the
+container's mount point); it is then reduced to the corresponding relative path. Any other
+absolute path is rejected and no file operation is performed. The `config.toml` can
+pre-register channel **paths** (optionally with a container image) that the channel builder
+offers — see [Configuration](#configuration).
 
 ---
 

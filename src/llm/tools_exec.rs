@@ -84,7 +84,8 @@ pub(crate) fn run_tool_live(
                 .and_then(|x| x.as_i64())
                 .unwrap_or(1)
                 .clamp(0, MAX_GREP_CONTEXT as i64) as usize;
-            let result = ch.grep(&pattern, Path::new(&path), include.as_deref(), content)?;
+            let rel = ch.tool_path(&path)?;
+            let result = ch.grep(&pattern, &rel, include.as_deref(), content)?;
             let mut text = String::new();
             if let Some(note) = &result.note {
                 text.push_str(note);
@@ -144,7 +145,11 @@ pub(crate) fn run_tool_live(
             })
         }
         "glob" => {
+            // Der `pattern` ist pfadförmig: ein absoluter Pattern (führendes `/`)
+            // wird – wie bei den Datei-Werkzeugen – nur akzeptiert, wenn er unter
+            // dem Mount-Punkt der Arbeitskopie liegt, und um diesen gekürzt.
             let pattern = arg_str(&v, "pattern")?;
+            let pattern = ch.tool_path(&pattern)?.to_string_lossy().into_owned();
             let paths = ch.glob(&pattern, Path::new("."))?;
             let mut text = String::new();
             if paths.is_empty() {
@@ -173,7 +178,8 @@ pub(crate) fn run_tool_live(
         "webfetch" => webfetch_out(&v),
         "read" => {
             let path = arg_str(&v, "path")?;
-            let content = ch.read(Path::new(&path))?;
+            let rel = ch.tool_path(&path)?;
+            let content = ch.read(&rel)?;
             let lines: Vec<&str> = content.lines().collect();
             // Leere Datei: keinen Nummernblock erzeugen, nur den Kopf.
             if lines.is_empty() {
@@ -264,9 +270,10 @@ pub(crate) fn run_tool_live(
                 .get("replace_all")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
-            let content = ch.read(Path::new(&path))?;
+            let rel = ch.tool_path(&path)?;
+            let content = ch.read(&rel)?;
             let out = crate::diff::edit(&content, &old, &new, replace_all)?;
-            ch.write(Path::new(&path), &out.text)?;
+            ch.write(&rel, &out.text)?;
             let mut info = out.diff;
             info.path = path.clone();
             Ok(ToolOut {
@@ -278,7 +285,8 @@ pub(crate) fn run_tool_live(
         "write" => {
             let path = arg_str(&v, "path")?;
             let content = arg_str(&v, "content")?;
-            ch.write(Path::new(&path), &content)?;
+            let rel = ch.tool_path(&path)?;
+            ch.write(&rel, &content)?;
             Ok(ToolOut {
                 text: format!("Written: {path}"),
                 ..Default::default()

@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
-use super::tools_def::tool_definitions;
+use super::tools_def::{force_tool_definitions, tool_definitions};
 use super::wire::{ensure_reasoning_for_tool_calls, WireMessage};
 use super::Usage;
 use crate::config::ResolvedEndpoint;
@@ -103,46 +103,72 @@ pub(crate) fn remember_shape(ep: &ResolvedEndpoint, shape: ApiShape) {
 
 /// Soll bei einem fehlgeschlagenen Request die ANDERE Shape probiert werden?
 ///
-/// Zwei Fälle:
-/// - **Eindeutiger Format-Fehler** (`looks_like_wrong_api`): explizites Signal
-///   des Servers, dass er das andere Format will.
-/// - **Default ohne Signal + Server-Fehler (5xx)**: Wir haben nur geraten
-///   (kein Bestätigung im Cache) und der Server antwortet generisch – dann kann
-///   ein Responses-/Chat-Server dahinterstehen, der das gesendete Format nicht
-///   kennt. Ein Versuch in der anderen Shape ist ein günstiger, einmaliger
-///   Test. Bewusst NICHT bei Auth-/Rate-Limit-/bereits-eindeutigen Fehlern.
+/// **HARTE INVARIANTE:** Eine einmal *bestätigte* Shape (`determined == true` –
+/// ein erfolgreicher Request hat sie in den Cache geschrieben) wird **nie**
+/// wieder verändert, unabhängig von Statuscode und Fehlertext. Der Cache ist
+/// der Ort, an dem wir etwas *wissen*; eine Fehlermeldung ist nur eine
+/// Beobachtung, und ein Provider-Fehler (Free-Tier-Sperre, 500, Auth) sagt
+/// nichts darüber, welche API der Endpunkt spricht. Ohne diese Regel hat ein
+/// einzelner unpassender Fehler die Shape verdreht: der Zusammenfassungs-
+/// Aufruf (non-streaming, ohne `tools`) bekam vom Free Tier
+/// `403 {"type":"error",…}`, das Envelope wurde als "der Server will die
+/// Responses-API" gelesen, und der Retry auf `/responses` endete in einem
+/// namenlosen 500, der als Endpunkt-Problem daherkam.
+///
+/// Nur eine **geratene** Shape (kein Cache-Eintrag, Default Chat Completions)
+/// darf einmalig die andere Shape probieren – und auch das nur bei einem
+/// Signal, das wirklich die Form betrifft:
+///
+/// - **Eindeutiger Format-Hinweis** (`looks_like_wrong_api`): die Meldung
+///   nennt die jeweils andere API, oder der Endpunkt lehnt den Pfad selbst ab
+///   (404/405/415) und antwortet im Fehlerformat der anderen API.
+/// - **Default ohne Signal + Server-Fehler (5xx)**: dann kann ein Server
+///   dahinterstehen, der das gesendete Format nicht kennt. Bewusst NICHT bei
+///   Auth-/Rate-Limit-/bereits-eindeutigen Fehlern.
 pub(crate) fn should_try_other_shape(
     status: reqwest::StatusCode,
     raw: &str,
     shape: ApiShape,
     determined: bool,
 ) -> bool {
-    if looks_like_wrong_api(raw, shape) {
+    if determined {
+        return false; // bestätigt – die Shape bleibt, für immer
+    }
+    if looks_like_wrong_api(status, raw, shape) {
         return true;
     }
-    !determined && status.is_server_error()
+    status.is_server_error()
 }
 
 /// Erkennt an der Roh-Fehlermeldung eines HTTP-Fehlers, dass der Endpunkt die
 /// ANDERE API-Shape erwartet. Zwei Signale, jeweils bewusst eng gefasst, um
-/// echte Fehler (Auth, Schema, Rate-Limit …) NICHT als Format-Probleme zu
-/// maskieren und keine doppelten Requests ohne Grund auszulösen:
+/// echte Fehler (Auth, Free Tier, Schema, Rate-Limit …) NICHT als
+/// Format-Probleme zu maskieren und keine doppelten Requests ohne Grund zu
+/// auslösen:
 ///
-/// - textuelle Hinweise (`input_text` / `responses`+`"input"` bzw. `messages`),
-/// - das **Responses-Fehler-Envelope** `{"type":"error", …}`: Chat-Completions-
-///   Fehler tragen ihr `type` NICHT auf oberster Ebene – ein Top-Level
-///   `"type":"error"` (z. B. bei einem generischen 500) stammt also mit hoher
-///   Wahrscheinlichkeit von einem Responses-Server und ist ein starkes Signal,
-///   das Chat-Pendant zu probieren.
-pub(crate) fn looks_like_wrong_api(raw: &str, used: ApiShape) -> bool {
+/// - **textuelle Hinweise** (`input_text` / `responses`+`"input"` bzw.
+///   `messages`+`chat/completions`) – die Meldung benennt die API, die
+///   gemeint war. Stärkstes Signal, gilt bei jedem Status.
+/// - **Responses-Fehler-Envelope `{"type":"error", …}` NUR bei Pfad-Fehlern
+///   (404/405/415)**: Chat-Completions-Fehler tragen ihr `type` nicht auf
+///   oberster Ebene, ein Top-Level `"type":"error"` stammt also mit hoher
+///   Wahrscheinlichkeit von einem Responses-Server – aber nur, wenn die
+///   Beschwerde den *Pfad* betrifft. Ein eingewickelter Provider-Fehler
+///   (`FreeTierError`, generisches `Internal server error`) steckt in derselben
+///   Hülle und sagt über die API-Form **nichts** aus. Ihn als Format-Problem zu
+///   lesen schickt den Retry auf einen Pfad, den der Endpunkt für dieses Modell
+///   gar nicht bedient (Live-Beleg: zen/`big-pickle` – Chat-Completions 403
+///   `FreeTierError`, `/responses` 500 "Internal server error").
+pub(crate) fn looks_like_wrong_api(status: reqwest::StatusCode, raw: &str, used: ApiShape) -> bool {
     let l = raw.to_lowercase();
     match used {
         ApiShape::ChatCompletions => {
             if l.contains("input_text") || (l.contains("responses") && l.contains("\"input\"")) {
                 return true;
             }
-            // Top-Level `type == "error"` in der Antwort-JSON → Responses-Envelope.
-            is_responses_error_envelope(raw)
+            // Top-Level `type == "error"` → Responses-Envelope, aber nur als
+            // Signal, wenn der Endpunkt selbst beanstandet wurde.
+            is_path_error(status) && is_responses_error_envelope(raw)
         }
         ApiShape::Responses => {
             // Server will Chat Completions: spricht von `messages`.
@@ -150,6 +176,12 @@ pub(crate) fn looks_like_wrong_api(raw: &str, used: ApiShape) -> bool {
                 && l.contains("messages")
         }
     }
+}
+
+/// Client-Fehler, die den **Pfad** selbst betreffen (nicht die Anfrage):
+/// 404 unbekannter Endpunkt, 405 falsche Methode, 415 falscher Medientyp.
+fn is_path_error(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 404 | 405 | 415)
 }
 
 /// `true`, wenn die Roh-Antwort JSON mit Top-Level-Feld `"type":"error"` ist
@@ -166,41 +198,85 @@ fn is_responses_error_envelope(raw: &str) -> bool {
 // Request-Body in beiden Formaten
 // ---------------------------------------------------------------------------
 
+/// Welche Werkzeugdefinitionen ein Request anbietet.
+///
+/// Der Umfang ist bewusst als *Scope* modelliert und nicht als zwei Booleans –
+/// die drei Fälle lassen sich so nicht verwechseln:
+///
+/// - [`None`](ToolOffer::None): gar kein `tools`-Feld.
+/// - [`Session`](ToolOffer::Session): der Chat-Pfad – mit Kanal die volle,
+///   permissions-gefilterte Menge, ohne Kanal nur `webfetch`, dazu die
+///   `force_tools` als Dummies.
+/// - [`ForceOnly`](ToolOffer::ForceOnly): die Kompaktierung – **ausschließlich**
+///   die `force_tools` als Dummies. Weder Kanal-Zustand noch `webfetch`
+///   beeinflussen das; ist `force_tools` für den Provider leer, entfällt das
+///   Feld ganz. Zweck: Der Provider (zen/opencode) beantwortet die
+///   Zusammenfassung nur, wenn `tools` nicht-leer ist, die Zusammenfassung
+///   selbst soll aber keine echten Werkzeuge sehen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolOffer {
+    None,
+    Session {
+        permission: Permission,
+        has_channel: bool,
+    },
+    ForceOnly,
+}
+
+impl ToolOffer {
+    /// Die Definitionen für diesen Scope – leer heißt: kein `tools`-Feld.
+    fn definitions(self, ep: &ResolvedEndpoint) -> Vec<Value> {
+        match self {
+            ToolOffer::None => Vec::new(),
+            ToolOffer::Session {
+                permission,
+                has_channel,
+            } => tool_definitions(permission, &ep.force_tools, has_channel),
+            ToolOffer::ForceOnly => force_tool_definitions(&ep.force_tools),
+        }
+    }
+}
+
 /// Baut URL + Body für eine Anfrage in der gewählten Shape.
-/// `max_output_tokens` ist nur für nicht-streamende (Kompaktierungs-)Aufrufe.
-/// `has_channel` entscheidet, ob die volle Kanal-Werkzeugmenge (gebundener
-/// Kanal) oder nur die kanallose Minimalmenge (webfetch + Force-Dummies)
-/// in die `tools` geht – siehe `tool_definitions`.
-#[allow(clippy::too_many_arguments)]
+/// `tools` bestimmt den Werkzeugumfang (siehe [`ToolOffer`]),
+/// `max_output_tokens` ist die Obergrenze für die Länge einer Zusammenfassung.
 pub(crate) fn build_body(
     ep: &ResolvedEndpoint,
     shape: ApiShape,
     msgs: &[WireMessage],
-    with_tools: bool,
-    permission: Permission,
-    has_channel: bool,
+    tools: ToolOffer,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> (String, Value) {
     let base = ep.base_url.trim_end_matches('/');
     let url = format!("{base}{}", shape.endpoint_path());
     let body = match shape {
-        ApiShape::ChatCompletions => {
-            chat_body(ep, msgs, with_tools, permission, has_channel, stream, max_output_tokens)
-        }
-        ApiShape::Responses => {
-            responses_body(ep, msgs, with_tools, permission, has_channel, stream, max_output_tokens)
-        }
+        ApiShape::ChatCompletions => chat_body(ep, msgs, tools, stream, max_output_tokens),
+        ApiShape::Responses => responses_body(ep, msgs, tools, stream, max_output_tokens),
     };
     (url, body)
+}
+
+/// Setzt `tools` nur, wenn der Scope welche liefert – ein leeres Array würde
+/// vom Provider als „Werkzeuge angeboten, aber keine" gelesen und ist für den
+/// Free-Tier-Nachweis wertlos.
+fn put_tools(body: &mut Value, tools: ToolOffer, ep: &ResolvedEndpoint, to_responses: bool) {
+    let defs = tools.definitions(ep);
+    if defs.is_empty() {
+        return;
+    }
+    let defs = if to_responses {
+        into_responses_tools(defs)
+    } else {
+        defs
+    };
+    body["tools"] = json!(defs);
 }
 
 fn chat_body(
     ep: &ResolvedEndpoint,
     msgs: &[WireMessage],
-    with_tools: bool,
-    permission: Permission,
-    has_channel: bool,
+    tools: ToolOffer,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> Value {
@@ -217,18 +293,14 @@ fn chat_body(
     if stream {
         body["stream_options"] = json!({ "include_usage": true });
     }
-    if with_tools {
-        body["tools"] = json!(tool_definitions(permission, &ep.force_tools, has_channel));
-    }
+    put_tools(&mut body, tools, ep, false);
     body
 }
 
 fn responses_body(
     ep: &ResolvedEndpoint,
     msgs: &[WireMessage],
-    with_tools: bool,
-    permission: Permission,
-    has_channel: bool,
+    tools: ToolOffer,
     stream: bool,
     max_output_tokens: Option<u64>,
 ) -> Value {
@@ -241,9 +313,7 @@ fn responses_body(
         // Responses nennt das Feld `max_output_tokens` (statt `max_tokens`).
         body["max_output_tokens"] = json!(toks);
     }
-    if with_tools {
-        body["tools"] = json!(responses_tools(permission, &ep.force_tools, has_channel));
-    }
+    put_tools(&mut body, tools, ep, true);
     body
 }
 
@@ -325,9 +395,9 @@ fn responses_input(msgs: &[WireMessage]) -> Vec<Value> {
     out
 }
 
-/// Konvertiert die (Chat-förmigen) Tool-Definitionen in das Responses-Format.
-fn responses_tools(permission: Permission, force_tools: &[String], has_channel: bool) -> Vec<Value> {
-    tool_definitions(permission, force_tools, has_channel)
+/// Konvertiert Chat-förmige Tool-Definitionen in das Responses-Format.
+fn into_responses_tools(chat_form: Vec<Value>) -> Vec<Value> {
+    chat_form
         .into_iter()
         .map(|t| {
             let f = &t["function"];
@@ -486,6 +556,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_string),
             tool_calls,
             tool_call_id: tool_call_id.map(str::to_string),
+            num_tokens: None,
         }
     }
     fn call(id: &str, name: &str, args: &str) -> WireToolCall {
@@ -577,5 +648,92 @@ mod tests {
             parse_usage(&json!({"type":"response.output_text.delta"})),
             None
         );
+    }
+
+    // ── Shape-Wechsel: harte Invariante bei bestätigter Shape ─────────────
+
+    /// Body, den ein Free-Tier-Gateway in die Responses-Fehlerhülle packt
+    /// (Live-Beleg zen/`big-pickle`, 403 auf `/chat/completions`).
+    const FREE_TIER_403: &str = r#"{"type":"error","error":{"type":"FreeTierError","message":"OpenCode's free tier can only be used from within OpenCode"}}"#;
+    /// Der namenlose 500er, den derselbe Endpunkt auf `/responses` liefert.
+    const GENERIC_500: &str =
+        r#"{"type":"error","error":{"type":"error","message":"Internal server error"}}"#;
+    /// Ein Responses-Server, der den Chat-Pfad nicht kennt (404 + Envelope).
+    const RESPONSES_ONLY_404: &str = r#"{"type":"error","error":{"message":"unknown endpoint"}}"#;
+
+    #[test]
+    fn bestaetigte_shape_wird_nie_gewechselt() {
+        use reqwest::StatusCode;
+        // HARTE REGEL: `determined == true` → kein Wechsel, egal was der Server
+        // sagt. Genau dieser Fehlpfad hat den Zusammenfassungs-Aufruf von der
+        // funktionierenden Chat-Shape auf `/responses` umgeleitet, wo der
+        // Endpunkt das Modell gar nicht bedient (500 ohne Aussage).
+        for (status, raw) in [
+            (StatusCode::FORBIDDEN, FREE_TIER_403),
+            (StatusCode::INTERNAL_SERVER_ERROR, GENERIC_500),
+            (StatusCode::NOT_FOUND, RESPONSES_ONLY_404),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"type":"error","error":{"message":"input_text expected"}}"#,
+            ),
+        ] {
+            assert!(
+                !should_try_other_shape(status, raw, ApiShape::ChatCompletions, true),
+                "bestätigte Chat-Shape darf bei {status} nicht wechseln: {raw}"
+            );
+            assert!(
+                !should_try_other_shape(status, raw, ApiShape::Responses, true),
+                "bestätigte Responses-Shape darf bei {status} nicht wechseln: {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn geraetete_shape_wechselt_nur_echten_format_signalen() {
+        use reqwest::StatusCode;
+        // Provider-Fehler in der Responses-Hülle: KEIN Format-Signal → bei
+        // geratener Shape kein Wechsel (403 ist kein 5xx, 500 bleibt 5xx).
+        assert!(!should_try_other_shape(
+            StatusCode::FORBIDDEN,
+            FREE_TIER_403,
+            ApiShape::ChatCompletions,
+            false
+        ));
+        // Pfad-Fehler MIT Envelope → starker Hinweis, dass ein Responses-Server
+        // dahintersteckt → Wechsel ist richtig.
+        assert!(should_try_other_shape(
+            StatusCode::NOT_FOUND,
+            RESPONSES_ONLY_404,
+            ApiShape::ChatCompletions,
+            false
+        ));
+        // Textueller Hinweis wirkt bei jedem Status.
+        assert!(should_try_other_shape(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"unknown field input_text"}}"#,
+            ApiShape::ChatCompletions,
+            false
+        ));
+        // Gegenrichtung: Responses-Server will `messages`.
+        assert!(should_try_other_shape(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"unknown path /responses, use /v1/chat/completions with messages"}}"#,
+            ApiShape::Responses,
+            false
+        ));
+        // Generischer 5xx bei gerateter Shape → einmal probieren (alt, gewollt).
+        assert!(should_try_other_shape(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            GENERIC_500,
+            ApiShape::ChatCompletions,
+            false
+        ));
+        // 403 ohne Formbezug bleibt auch bei gerateter Shape unangetastet.
+        assert!(!should_try_other_shape(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"message":"Invalid API key"}}"#,
+            ApiShape::ChatCompletions,
+            false
+        ));
     }
 }

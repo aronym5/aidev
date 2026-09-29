@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::fsops;
 use super::glob;
-use super::resolve::resolve;
+use super::resolve::{absolutize, resolve};
 use super::run::run_with_timeout_live;
 use super::search::search_files;
 use super::{Channel, ChannelKind, ChannelStatus, RunOut, SearchResult};
@@ -64,6 +64,13 @@ impl Channel for Local {
 
     fn write(&self, rel: &Path, content: &str) -> Result<(), String> {
         fsops::write_at(&resolve(&self.root, rel)?, content)
+    }
+
+    /// Mount-Punkt = der Host-Ordner selbst (der Local-Kanal läuft direkt auf
+    /// dem Host). Absolut gemacht, damit auch ein relativ konfiguriertes
+    /// `host_root` absolute Tool-Pfade zuordnen kann.
+    fn abs_root(&self) -> Option<String> {
+        Some(absolutize(&self.root).display().to_string())
     }
 
     fn grep(
