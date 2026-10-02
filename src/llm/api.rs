@@ -541,7 +541,7 @@ pub(crate) fn parse_usage(json: &Value) -> Option<Usage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{WireFunction, WireMessage, WireToolCall};
+    use crate::llm::{WireFunction, WireMessage, WireTokens, WireToolCall};
 
     fn wire(
         role: &str,
@@ -556,7 +556,7 @@ mod tests {
             reasoning_content: reasoning.map(str::to_string),
             tool_calls,
             tool_call_id: tool_call_id.map(str::to_string),
-            num_tokens: None,
+            tokens: WireTokens::default(),
         }
     }
     fn call(id: &str, name: &str, args: &str) -> WireToolCall {

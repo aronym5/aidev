@@ -430,8 +430,14 @@ mod tests {
         let mut s = Session::new(0);
         s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
         let a = s.open_assistant("gedanke".into(), "antwort".into());
-        s.chat
-            .finalize_assistant(a, std::time::Instant::now(), usage(90_000, 10_000), 0, 0, false);
+        s.chat.finalize_assistant(
+            a,
+            std::time::Instant::now(),
+            usage(90_000, 10_000),
+            0,
+            0,
+            false,
+        );
         let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
         assert_eq!(t, 100_000, "bestätigter Usage als Anker");
         assert!(green, "bestätigt → grün");
@@ -446,19 +452,19 @@ mod tests {
         // Abgeschlossener Turn mit Usage (Anker 100_000).
         s.push_user_message("frage eins".into(), Some(Permission::Read), "m".into());
         let a1 = s.open_assistant("g1".into(), "antwort eins".into());
-        s.chat
-            .finalize_assistant(a1, std::time::Instant::now(), usage(90_000, 10_000), 0, 0, false);
+        s.chat.finalize_assistant(
+            a1,
+            std::time::Instant::now(),
+            usage(90_000, 10_000),
+            0,
+            0,
+            false,
+        );
         // Nächster Turn wird abgebrochen → geschlossen mit Null-Usage.
         s.push_user_message("frage zwei".into(), Some(Permission::Read), "m".into());
         let a2 = s.open_assistant("halb fertig".into(), String::new());
-        s.chat.finalize_assistant(
-            a2,
-            std::time::Instant::now(),
-            usage(0, 0),
-            0,
-            0,
-            true,
-        );
+        s.chat
+            .finalize_assistant(a2, std::time::Instant::now(), usage(0, 0), 0, 0, true);
         // Neuer Prompt bereits gesendet (WaitingForLLM, live noch leer).
         s.push_user_message("frage drei".into(), Some(Permission::Read), "m".into());
         let (t, green) = context_tokens(&s).expect("Kontext vorhanden");

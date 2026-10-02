@@ -39,7 +39,6 @@ fn base_config() -> Config {
         channels: std::collections::HashMap::new(),
         context_window: 200_000,
         compact_at: 0.8,
-        compact_keep_turns: 3,
         compact_summary_tokens: 4_000,
         compact_auto: true,
         mouse: false,
@@ -51,7 +50,12 @@ fn base_config() -> Config {
 
 fn app() -> App {
     let (tx, rx) = mpsc::channel();
-    App::new(base_config(), ChannelRegistry::new_with_warnings(&base_config()).0, tx, rx)
+    App::new(
+        base_config(),
+        ChannelRegistry::new_with_warnings(&base_config()).0,
+        tx,
+        rx,
+    )
 }
 
 fn alt_d() -> KeyEvent {
@@ -686,22 +690,65 @@ fn abbruch_erzeugt_abort_event_und_phase_idle() {
 
 // ── Kompaktierung ─────────────────────────────────────────────────────────
 
+/// `compact_boundary` spiegelt `wire_compact_boundary` (Session zählt
+/// `UserPrompt`-Events, Wire zählt `user`-Nachrichten): `keep = k` bedeutet,
+/// dass GENAU die letzten `k` Turns überleben – der Schnitt liegt auf dem
+/// `k`-letzten `UserPrompt`. `keep = 0` wie `keep = 1` (der laufende Turn
+/// bleibt immer stehen); weniger Turns als `keep` → 0 (nichts zu ersetzen).
 #[test]
-fn compact_boundary_behaelt_letzte_turns() {
-    use crate::llm::Usage;
+fn compact_boundary_liefert_position_des_k_letzten_userprompts() {
     let mut a = app();
     {
         let s = &mut a.sessions[0];
         for i in 0..5 {
             s.push_user_message(format!("frage {i}"), Some(Permission::Read), "m".into());
             let aid = s.open_assistant(String::new(), format!("antwort {i}"));
+            s.chat
+                .finalize_assistant(aid, std::time::Instant::now(), zero_usage(), 0, 0, false);
+        }
+    }
+    let s = &a.sessions[0];
+    // 5 Turns à 2 Events: der k-letzte UserPrompt liegt bei 10 - 2k.
+    for k in 1..=5usize {
+        assert_eq!(
+            compact_boundary(s, k),
+            10 - 2 * k,
+            "keep={k}: Schnitt auf dem k-letzten UserPrompt"
+        );
+    }
+    // `keep = 0` wie `keep = 1`.
+    assert_eq!(compact_boundary(s, 0), 8, "keep=0 schützt den letzten Turn");
+    // Mehr Turns geschützt als vorhanden → nichts zu ersetzen.
+    assert_eq!(compact_boundary(s, 6), 0);
+}
+/// Kerninvariante: Summary an der Wire-Schnittstelle, und die Folge-Aktionen
+/// (einmaliger `context_len`-Shift) treffen NUR die Nachrichten danach.
+///
+/// `compact_boundary` (Session-Seite, zählt `UserPrompt`-Events) und
+/// `wire_compact_boundary` (Wire-Seite, zählt `user`-Nachrichten) müssen für
+/// dasselbe `keep` denselben Turn treffen: Der Kompaktierungs-Aufruf fasst
+/// `msgs[..wb]` zusammen, und dieselbe Stelle wird als `Archive`-Event
+/// eingebaut. Ein Versatz um einen Turn – die Summary einen Turn zu FRÜH –
+/// hieße: ein bereits zusammengefasster Turn bliebe im Kontext (ungekürzt
+/// mitgesendet) und der `context_len`-Shift griffe für zu viele Nachrichten.
+#[test]
+fn apply_compaction_setzt_summary_an_die_vom_wire_gewaehlte_grenze() {
+    const SUMMARY_TOKENS: u64 = 10;
+    for keep in 1..=3usize {
+        let mut s = Session::new(0);
+        for i in 0..5 {
+            s.push_user_message(format!("frage {i}"), Some(Permission::Read), "m".into());
+            let aid = s.open_assistant(format!("gedanken {i}"), format!("antwort {i}"));
+            // Gemessene Usage pro Turn: die `context_len` werden beim
+            // Abschluss bestätigt beglichen (1000er-Bereiche), sodass der
+            // Shift nach der Kompaktierung ablesbar ist.
             s.chat.finalize_assistant(
                 aid,
                 std::time::Instant::now(),
-                Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
+                llm::Usage {
+                    prompt_tokens: 1_000 * (i as u64 + 1),
+                    completion_tokens: 100,
+                    total_tokens: 1_000 * (i as u64 + 1) + 100,
                     cached_tokens: None,
                 },
                 0,
@@ -709,13 +756,103 @@ fn compact_boundary_behaelt_letzte_turns() {
                 false,
             );
         }
+        // Wire-Projektion + die Grenze, an der der Kompaktierungs-Aufruf schnitt.
+        let wire = crate::chat::api_messages(&s.chat);
+        let wb = llm::wire_compact_boundary(&wire, keep);
+        assert!(wb > 0, "keep={keep}: es muss etwas zu archivieren geben");
+        let tail: Vec<String> = wire[wb..]
+            .iter()
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        // Kontextlängen VOR dem Einbau (für den Shift-Vergleich).
+        let vorher: Vec<Option<u64>> = s
+            .chat
+            .order()
+            .iter()
+            .map(|id| s.chat.event(*id).and_then(|e| e.context_len))
+            .collect();
+
+        s.apply_compaction(
+            "[Compressed history - 5 earlier messages]\n\nzusammenfassung".into(),
+            SUMMARY_TOKENS,
+            keep,
+            None,
+        );
+
+        // (1) Der `Archive`-Event sitzt an der gewählten Stelle. Hier ist der
+        //     `order`-Index direkt mit dem Wire-Index vergleichbar: die Turns hier
+        //     haben keine Werkzeug-Runden, jedes Event projiziert also auf genau
+        //     eine Wire-Nachricht.
+        let order = s.chat.order().to_vec();
+        let arch = order
+            .iter()
+            .position(|id| {
+                matches!(
+                    s.chat.event(*id).map(|e| &e.kind),
+                    Some(EventKind::Archive { .. })
+                )
+            })
+            .expect("Archive-Event");
+        assert_eq!(
+            arch, wb,
+            "keep={keep}: Summary an der Wire-Schnittstelle, nicht einen Turn zu früh"
+        );
+        // (2) … und die Projektion ist exakt „Summary + überlebender Tail“:
+        //     alles Zusammengefasste ist VOR der Summary weg, der Rest DANACH
+        //     (Länge + Tail-Gleichstand schließen den Versatz komplett aus).
+        let neu: Vec<String> = crate::chat::api_messages(&s.chat)
+            .iter()
+            .map(|m| m.content.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            neu.len(),
+            1 + tail.len(),
+            "keep={keep}: Summary + genau der überlebende Tail"
+        );
+        assert!(
+            neu[0].starts_with("[Compressed history"),
+            "keep={keep}: Summary steht am Kopf der Projektion"
+        );
+        for (i, m) in tail.iter().enumerate() {
+            assert_eq!(
+                &neu[1 + i],
+                m,
+                "keep={keep}: Tail unverändert NACH der Summary"
+            );
+        }
+        // (3) Der `context_len`-Shift gilt nur für die NACH der Summary
+        //     stehenden Nachrichten, um `base - summary_tokens`; die
+        //     archivierten Events behalten ihre alte Zahl.
+        let base = vorher[wb - 1].expect("Kontextlänge des letzten archivierten Events");
+        let shift = base - SUMMARY_TOKENS;
+        for (i, &id) in order.iter().enumerate() {
+            let cl = s.chat.event(id).and_then(|e| e.context_len);
+            if i == arch {
+                // Die Summary selbst ist der neue Anker: exakt ihre Tokenzahl.
+                assert_eq!(
+                    cl,
+                    Some(SUMMARY_TOKENS),
+                    "keep={keep}: Summary-Anker unverschoben"
+                );
+            } else if i < arch {
+                assert_eq!(
+                    cl, vorher[i],
+                    "keep={keep}: archiviertes Event {i} bleibt unangetastet"
+                );
+            } else {
+                // Index in `vorher`: die Events rutschen um 1 (die Summary).
+                assert_eq!(
+                    cl,
+                    vorher[i - 1].map(|c| c.saturating_sub(shift)),
+                    "keep={keep}: überlebendes Event {i} wird um {shift} verschoben"
+                );
+            }
+        }
     }
-    let b = compact_boundary(&a.sessions[0], 3);
-    assert!(b > 0, "mindestens ein Turn ist kompaktierbar");
 }
 
 #[test]
-fn prompt_tokens_nach_compaction_zaehlt_nur_aktuellen_kontext() {
+fn prompt_tokens_nach_compaction_zählt_nur_aktuellen_kontext() {
     let mut s = Session::new(0);
     // Alter Turn (wird kompaktiert, bleibt im Chat erhalten, zählt nicht mehr).
     s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
@@ -902,11 +1039,7 @@ fn done_startet_auto_kompaktierung_nach_finaler_antwort() {
         // Fünf Turns (letzter Usage über der Schwelle 160_000) – genug, dass
         // die Projektion überhaupt einen Schnitt zulässt (≥ 3 user).
         for i in 0..5 {
-            s.push_user_message(
-                format!("frage {i}"),
-                Some(Permission::Read),
-                "m".into(),
-            );
+            s.push_user_message(format!("frage {i}"), Some(Permission::Read), "m".into());
             let aid = s.open_assistant(format!("g{i}"), format!("a{i}"));
             s.chat.finalize_assistant(
                 aid,
@@ -1511,7 +1644,10 @@ fn default_model_alias_vorrang_in_resolve_und_display() {
     let ep = a.resolve_endpoint(0).expect("Default auflösbar");
     assert_eq!(ep.model, "prov/mod", "Anzeige-Form provider/alias");
     assert_eq!(ep.api_model, "bla", "Servername aus dem Alias");
-    assert_eq!(ep.context_window, 4096, "context_window aus dem Alias-Eintrag");
+    assert_eq!(
+        ep.context_window, 4096,
+        "context_window aus dem Alias-Eintrag"
+    );
 
     // display_model zeigt dieselbe Alias-Form.
     assert_eq!(a.display_model(0), "prov/mod");
@@ -1520,7 +1656,8 @@ fn default_model_alias_vorrang_in_resolve_und_display() {
     // es wird kein zusätzlicher "(Standard)"-Eintrag eingefügt.
     let list = a.model_pick_list();
     assert!(
-        list.iter().any(|p| matches!(p, ModelPick::Model { key, .. } if key == "prov/mod")),
+        list.iter()
+            .any(|p| matches!(p, ModelPick::Model { key, .. } if key == "prov/mod")),
         "Alias-Eintrag im Picker gelistet"
     );
     assert!(
@@ -1926,30 +2063,37 @@ fn model_probe_event_aktualisiert_registry_status_gelb_dann_rot() {
     // Modell per Refresh in die Registry holen.
     apply_refresh(&mut a, &[("test/fast", None)]);
     let key = "test/fast";
-    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::None);
+    assert_eq!(
+        a.model_registry.health(key),
+        crate::app::models::ModelHealth::None
+    );
 
     // Erste Fehlermeldung (Chat Completions) → gelb.
-    a.tx
-        .send(llm::WorkerEvent::ModelProbe {
-            model: key.into(),
-            protocol: llm::ApiProtocol::ChatCompletions,
-            ok: false,
-        })
-        .unwrap();
+    a.tx.send(llm::WorkerEvent::ModelProbe {
+        model: key.into(),
+        protocol: llm::ApiProtocol::ChatCompletions,
+        ok: false,
+    })
+    .unwrap();
     assert!(a.drain_events(), "Probe-Ereignis verarbeitet");
-    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Yellow);
+    assert_eq!(
+        a.model_registry.health(key),
+        crate::app::models::ModelHealth::Yellow
+    );
 
     // Zweite Fehlermeldung (Responses) → auf allen Protokollen getestet, nur
     // Fehler, war bereits gelb → rot.
-    a.tx
-        .send(llm::WorkerEvent::ModelProbe {
-            model: key.into(),
-            protocol: llm::ApiProtocol::Responses,
-            ok: false,
-        })
-        .unwrap();
+    a.tx.send(llm::WorkerEvent::ModelProbe {
+        model: key.into(),
+        protocol: llm::ApiProtocol::Responses,
+        ok: false,
+    })
+    .unwrap();
     assert!(a.drain_events(), "Probe-Ereignis verarbeitet");
-    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Red);
+    assert_eq!(
+        a.model_registry.health(key),
+        crate::app::models::ModelHealth::Red
+    );
 }
 
 #[test]
@@ -1958,13 +2102,99 @@ fn model_probe_event_korrekte_antwort_gibt_gruen() {
     apply_refresh(&mut a, &[("test/fast", None)]);
     let key = "test/fast";
 
-    a.tx
-        .send(llm::WorkerEvent::ModelProbe {
-            model: key.into(),
-            protocol: llm::ApiProtocol::ChatCompletions,
-            ok: true,
-        })
-        .unwrap();
+    a.tx.send(llm::WorkerEvent::ModelProbe {
+        model: key.into(),
+        protocol: llm::ApiProtocol::ChatCompletions,
+        ok: true,
+    })
+    .unwrap();
     a.drain_events();
-    assert_eq!(a.model_registry.health(key), crate::app::models::ModelHealth::Green);
+    assert_eq!(
+        a.model_registry.health(key),
+        crate::app::models::ModelHealth::Green
+    );
+}
+
+// ── Channel Builder: Pfad- und Identitätsregel (Regressionsfall „Branch ohne
+//    Worktree → Kanal des Haupt-Checkouts“) ─────────────────────────────────
+
+#[test]
+fn builder_probe_path_fragt_nur_bei_vorhandenem_worktree_ab() {
+    // Repo, Cursor auf „feat (Kein Worktree)“: Es gibt noch gar keinen Pfad,
+    // auf dem ein Container mounten könnte. Der frühere Fallback auf den
+    // Host-Pfad lieferte den Container des Haupt-Checkouts – und damit beim
+    // Bestätigen den Kanal des falschen Branchs.
+    let b = builder_state_with_repo();
+    assert_eq!(
+        b.worktrees.selected().map(|w| w.branch.as_str()),
+        Some("feat")
+    );
+    assert!(
+        crate::app::builder::builder_probe_path(&b).is_none(),
+        "Branch ohne Worktree darf nicht auf den Host-Pfad zurückfallen"
+    );
+
+    // Cursor auf „main“ (Worktree vorhanden) → dessen Pfad wird geprüft.
+    let mut b = builder_state_with_repo();
+    b.worktrees.nav.set_cursor(0);
+    assert_eq!(
+        crate::app::builder::builder_probe_path(&b).map(|p| p.display().to_string()),
+        Some("/a".into())
+    );
+
+    // Repo ohne Branch-Auswahl (leere Liste) → der Host-Pfad gilt.
+    let mut b = builder_state_with_repo();
+    b.worktrees = Selection::wrap_at(Vec::new(), 0);
+    assert_eq!(
+        crate::app::builder::builder_probe_path(&b).map(|p| p.display().to_string()),
+        Some("/a".into()),
+        "ohne Auswahl in der Branch-Spalte zählt der Host-Pfad"
+    );
+
+    // Kein Repo (keine Branch-Spalte) → der Host-Pfad gilt wie bisher.
+    let b = builder_state();
+    assert_eq!(
+        crate::app::builder::builder_probe_path(&b).map(|p| p.display().to_string()),
+        Some("/a".into())
+    );
+}
+
+#[test]
+fn container_wird_nur_wiederverwendet_wenn_pfad_und_auswahl_passen() {
+    use std::path::{Path, PathBuf};
+
+    let info = |mount: &str| crate::channel::builder::ContainerInfo {
+        name: "aidev-proj-main-alpine".into(),
+        status: "running".into(),
+        mount_destination: Some("/usr/src/app".into()),
+        mount_path: PathBuf::from(mount),
+    };
+    use crate::app::builder::may_reuse_container;
+
+    // Der gemeldete Fall: Container des Haupt-Checkouts („/a“) liegt vor, es
+    // wurde gerade der Worktree eines anderen Branchs angelegt (Effective-Root
+    // „/repo/.aidev/worktrees/feat“). Keine Wiederverwendung – sonst landet
+    // der User im Kanal des Haupt-Checkouts.
+    assert!(
+        !may_reuse_container(
+            Some(&info("/a")),
+            Path::new("/repo/.aidev/worktrees/feat"),
+            true
+        ),
+        "frisch angelegter Worktree darf den Container des Host-Pfades nicht übernehmen"
+    );
+    // Auch ohne neuen Worktree gehört ein fremder Pfad nicht zu dieser Auswahl
+    // (`container_info` wird asynchron nachgeladen und kann veraltet sein).
+    assert!(
+        !may_reuse_container(Some(&info("/a")), Path::new("/b"), false),
+        "Container auf einem anderen Pfad gehört nicht zu dieser Auswahl"
+    );
+    // Der Normalfall bleibt erhalten: Worktree gewählt, Container mountet
+    // genau diesen Pfad → Kanal darf wiederverwendet werden.
+    assert!(
+        may_reuse_container(Some(&info("/wt-feat")), Path::new("/wt-feat"), false),
+        "passender Container auf dem Worktree-Pfad wird wiederverwendet"
+    );
+    // Ohne Container-Info gibt es nichts zu übernehmen.
+    assert!(!may_reuse_container(None, Path::new("/wt-feat"), false));
 }

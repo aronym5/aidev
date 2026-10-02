@@ -326,8 +326,11 @@ pub(crate) fn build_history_cache(
 
 /// User-Eingabe im Detail-Modus: volles Eingabe-Band mit Berechtigungsfarbe.
 fn user_input_block_chat(text: &str, p: Permission, width: usize) -> ChatBlock {
-    let mut lines =
-        wrap_markdown(&decorate_emphasis(logical_lines(&preserve_breaks(text))), width, PAD);
+    let mut lines = wrap_markdown(
+        &decorate_emphasis(logical_lines(&preserve_breaks(text))),
+        width,
+        PAD,
+    );
     let color = permission_color(p);
     lines = lines
         .into_iter()
@@ -558,10 +561,7 @@ fn grep_result_block(kind: &ToolKind, output: &str, width: usize) -> ChatBlock {
 
     // Ohne Einträge → nur das Label (Einzeiler).
     if entries.is_empty() {
-        let line = Line::from(Span::styled(
-            format!("{pad}{label}"),
-            color_style,
-        ));
+        let line = Line::from(Span::styled(format!("{pad}{label}"), color_style));
         return ChatBlock {
             lines: wrap_block(&[line], width, PAD),
             bg: None,
@@ -662,9 +662,13 @@ fn tool_block_chat(ev: &ChatEvent, width: usize, view: ViewLevel) -> ChatBlock {
         return def_tool_line(width);
     };
     match kind {
-        ToolKind::Run { .. } if !output.trim().is_empty() => {
-            live_run_block(&tool_kind_label(kind), output, width, view.boxes_open(), false)
-        }
+        ToolKind::Run { .. } if !output.trim().is_empty() => live_run_block(
+            &tool_kind_label(kind),
+            output,
+            width,
+            view.boxes_open(),
+            false,
+        ),
         // Ab dem Dialog-Level (Detailed/Dialog) → die Diff-Box aus `diff_block`;
         // Compact bleibt die Einzeiler-Zusammenfassung (`✎ edit <pfad> +N -M`).
         ToolKind::Edit { path, rows } if view.boxes_open() => {
@@ -674,7 +678,13 @@ fn tool_block_chat(ev: &ChatEvent, width: usize, view: ViewLevel) -> ChatBlock {
             };
             // Im neuen Event-Log ist der Erfolg (`ok`) nicht persistiert; ein
             // Edit mit Diff-Zeilen ist in der Praxis erfolgreich ausgeführt.
-            diff_block(&tool_kind_label(kind), true, &diff, width, view.boxes_open())
+            diff_block(
+                &tool_kind_label(kind),
+                true,
+                &diff,
+                width,
+                view.boxes_open(),
+            )
         }
         // grep/glob im Detail-Modus: alle Vorkommen in kompakter Spaltenansicht.
         ToolKind::Grep { .. } | ToolKind::Glob { .. }

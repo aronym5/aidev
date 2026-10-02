@@ -158,9 +158,9 @@ pub enum WorkerEvent {
     /// grenze eingefügt wird: die älteren Nachrichten bleiben im Speicher/der
     /// UI erhalten, werden aber von `api_messages` nicht mehr mitgesendet.
     /// `tokens` ist die Token-Zahl der Summary (`completion_tokens` des
-    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung), `keep` das dabei
-    /// verwendete (über die Kandidaten entschiedene) `compact_keep_turns` und
-    /// `log_path` der Protokollordner der Kompaktierung (falls geschrieben).
+    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung), `keep` die dabei
+    /// verwendete Zahl überlebender Turns (über die Kandidaten entschieden)
+    /// und `log_path` der Protokollordner der Kompaktierung (falls geschrieben).
     Compacted(usize, String, u64, usize, Option<String>),
     /// Hintergrund-Laden des Channel Builders abgeschlossen: (images_with_wd, container_info, worktrees)
     BuilderLoaded(
@@ -267,7 +267,7 @@ mod worker;
 // Externe API: von app.rs / ui.rs genutzt
 pub(crate) use compact::{can_compact, spawn_compact, CompactTrigger};
 pub(crate) use http::shared_client;
-pub(crate) use wire::{WireFunction, WireMessage, WireToolCall};
+pub(crate) use wire::{WireFunction, WireMessage, WireTokens, WireToolCall};
 pub(crate) use worker::{spawn_user_run, spawn_worker};
 
 // Test-Hilfsre-exports: nur für das Testmodul (tests.rs) dieses Moduls
@@ -283,9 +283,9 @@ pub(crate) use helpers::{
 #[cfg(test)]
 pub(crate) use http::{distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator};
 #[cfg(test)]
-pub(crate) use tools_def::{apply_tool_delta, sanitize_arguments, tool_definitions, ToolCallAcc};
-#[cfg(test)]
 pub(crate) use tools_def::dummy_tool;
+#[cfg(test)]
+pub(crate) use tools_def::{apply_tool_delta, sanitize_arguments, tool_definitions, ToolCallAcc};
 #[cfg(test)]
 pub(crate) use wire::ensure_reasoning_for_tool_calls;
 

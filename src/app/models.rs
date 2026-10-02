@@ -374,11 +374,19 @@ mod tests {
 
         // Erste Fehlermeldung auf EINEM Protokoll → gelb.
         r.record_probe(key, ApiProtocol::ChatCompletions, false);
-        assert_eq!(r.health(key), ModelHealth::Yellow, "erste Fehlermeldung → gelb");
+        assert_eq!(
+            r.health(key),
+            ModelHealth::Yellow,
+            "erste Fehlermeldung → gelb"
+        );
 
         // Auf allen Protokollen getestet, war gelb, nur Fehlermeldungen → rot.
         r.record_probe(key, ApiProtocol::Responses, false);
-        assert_eq!(r.health(key), ModelHealth::Red, "alle Protokolle getestet, nur Fehler → rot");
+        assert_eq!(
+            r.health(key),
+            ModelHealth::Red,
+            "alle Protokolle getestet, nur Fehler → rot"
+        );
     }
 
     #[test]
@@ -393,7 +401,11 @@ mod tests {
 
         // Ein einmal bestätigtes grün wird durch spätere Fehler NICHT rot.
         r.record_probe(key, ApiProtocol::Responses, false);
-        assert_eq!(r.health(key), ModelHealth::Green, "grün bleibt grün trotz späteren Fehlers");
+        assert_eq!(
+            r.health(key),
+            ModelHealth::Green,
+            "grün bleibt grün trotz späteren Fehlers"
+        );
     }
 
     #[test]

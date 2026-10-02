@@ -172,11 +172,10 @@ fn line_starts_block(trimmed: &str) -> bool {
         Some(c) if c.is_ascii_digit() => {
             // Geordnete Liste: Ziffern, dann `.`/`)`, dann Whitespace/Ende.
             let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
-            (after_digits.starts_with('.') || after_digits.starts_with(')'))
-                && {
-                    let rest = after_digits.get(1..).unwrap_or("");
-                    rest.is_empty() || rest.starts_with(char::is_whitespace)
-                }
+            (after_digits.starts_with('.') || after_digits.starts_with(')')) && {
+                let rest = after_digits.get(1..).unwrap_or("");
+                rest.is_empty() || rest.starts_with(char::is_whitespace)
+            }
         }
         _ => false,
     }

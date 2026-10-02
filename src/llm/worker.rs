@@ -7,13 +7,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::compact::{can_compact, compact_chat_messages, looks_like_context_error, CompactTrigger};
+use super::compact::{
+    can_compact, compact_chat_messages, looks_like_context_error, CompactTrigger,
+};
 use super::http::{request_once, shared_client};
 use super::tools_def::{Step, ToolInvocation};
 use super::tools_exec::{
     run_command_display, run_tool_live, run_webfetch, tool_activity, tool_label, ToolOut,
 };
-use super::wire::WireMessage;
+use super::wire::{WireMessage, WireTokens};
 use super::{ExecConfirmReply, WorkerEvent};
 use crate::app::LiveChannel;
 use crate::app::LocalExecMode;
@@ -52,10 +54,7 @@ pub fn spawn_worker(
         // ODER der Provider force_tools gesetzt hat (Dummy-Definitionen für
         // nicht-permissions-erlaubte Tools, die trotzdem immer angeboten werden).
         let has_force_tools = !ep.force_tools.is_empty();
-        let has_channel = channel_cell
-            .lock()
-            .expect("channel cell lock")
-            .is_some();
+        let has_channel = channel_cell.lock().expect("channel cell lock").is_some();
         let mut with_tools = has_channel || has_force_tools;
         // Reaktive Kompaktierung (bei context_length-Fehler) nur EINMAL pro Turn.
         let mut reactive_compacted = false;
@@ -80,7 +79,9 @@ pub fn spawn_worker(
                 None,
             ) {
                 Ok((repl, content, tokens, keep, log_path)) => {
-                    let _ = tx.send(WorkerEvent::Compacted(session, content, tokens, keep, log_path));
+                    let _ = tx.send(WorkerEvent::Compacted(
+                        session, content, tokens, keep, log_path,
+                    ));
                     msgs = repl;
                 }
                 Err(_) => {
@@ -100,7 +101,15 @@ pub fn spawn_worker(
             // Request-Runde starten. `with_tools` schaltet um, wenn der Endpunkt
             // keine Werkzeug-Unterstützung meldet.
             let (step, supported) = request_once(
-                &tx, session, client, &ep, &msgs, &cancel, with_tools, permission, has_channel,
+                &tx,
+                session,
+                client,
+                &ep,
+                &msgs,
+                &cancel,
+                with_tools,
+                permission,
+                has_channel,
             );
             // Endpunkt ohne Werkzeug-Unterstützung? Dann ohne Tools weiter.
             with_tools = with_tools && supported;
@@ -148,8 +157,9 @@ pub fn spawn_worker(
                             None,
                         ) {
                             Ok((repl, content, tokens, keep, log_path)) => {
-                                let _ = tx
-                                    .send(WorkerEvent::Compacted(session, content, tokens, keep, log_path));
+                                let _ = tx.send(WorkerEvent::Compacted(
+                                    session, content, tokens, keep, log_path,
+                                ));
                                 msgs = repl;
                                 reactive_compacted = true;
                                 continue;
@@ -291,7 +301,7 @@ pub fn spawn_worker(
                             reasoning_content: None,
                             tool_calls: None,
                             tool_call_id: Some(t.id),
-                            num_tokens: None,
+                            tokens: WireTokens::default(),
                         });
                     }
                     // Alle Werkzeuge dieser Runde sind beendet – der Worker kennt

@@ -303,7 +303,11 @@ impl App {
                         self.update_builder_container();
                     }
                 }
-                WorkerEvent::ModelProbe { model, protocol, ok } => {
+                WorkerEvent::ModelProbe {
+                    model,
+                    protocol,
+                    ok,
+                } => {
                     // Probe-Ergebnis eines Modell-Tests verbuchen – treibt den
                     // grün/gelb/rot-Status im Modell-Picker.
                     self.model_registry.record_probe(&model, protocol, ok);

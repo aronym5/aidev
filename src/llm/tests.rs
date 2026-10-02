@@ -104,9 +104,15 @@ fn tool_definitions_mit_force_tools_fuegt_dummies_hinzu() {
         .filter_map(|d| d["function"]["name"].as_str())
         .collect();
     // read ist ein normales (vollständiges) Tool.
-    assert!(names.contains(&"read"), "read muss als normales Tool vorhanden sein");
+    assert!(
+        names.contains(&"read"),
+        "read muss als normales Tool vorhanden sein"
+    );
     // bash ist als Dummy vorhanden.
-    assert!(names.contains(&"bash"), "bash muss als Dummy vorhanden sein");
+    assert!(
+        names.contains(&"bash"),
+        "bash muss als Dummy vorhanden sein"
+    );
     // grep/glob/webfetch sind ebenfalls vorhanden (Permission::Read).
     assert!(names.contains(&"grep"));
     assert!(names.contains(&"glob"));
@@ -124,7 +130,10 @@ fn tool_definitions_force_tools_bereits_erlaubt_kein_duplikat() {
         .iter()
         .filter(|d| d["function"]["name"].as_str() == Some("bash"))
         .count();
-    assert_eq!(bash_count, 1, "bash darf nur EINMAL vorkommen (nicht als Dummy)");
+    assert_eq!(
+        bash_count, 1,
+        "bash darf nur EINMAL vorkommen (nicht als Dummy)"
+    );
 }
 
 #[test]
@@ -314,7 +323,7 @@ fn ensure_reasoning_fuellt_leeres_feld_fuer_tool_calls_nach() {
             },
         }]),
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     };
     let norm = ensure_reasoning_for_tool_calls(std::slice::from_ref(&assistant));
     assert_eq!(norm[0].reasoning_content.as_deref(), Some(""));
@@ -379,7 +388,8 @@ fn sse_fragment_in_string_wert_wird_ohne_verfaelschung_zusammengesetzt() {
     });
 
     // Schnitt mitten in `...new\":\"zwei` – also mitten im neuen Wert.
-    let cut = full.find("{\\\"path").unwrap() + "{\\\"path\\\":\\\"a.txt\\\",\\\"old\\\":\\\"alt\\\",\\\"new\\\":\\\"zwei".len();
+    let cut = full.find("{\\\"path").unwrap()
+        + "{\\\"path\\\":\\\"a.txt\\\",\\\"old\\\":\\\"alt\\\",\\\"new\\\":\\\"zwei".len();
     let part1 = &full[..cut];
     let part2 = &full[cut..];
 
@@ -388,7 +398,8 @@ fn sse_fragment_in_string_wert_wird_ohne_verfaelschung_zusammengesetzt() {
         super::http::accumulate_sse_event(&mut pending, part1).is_none(),
         "erstes Fragment muss noch unvollständig sein"
     );
-    let ev = super::http::accumulate_sse_event(&mut pending, part2).expect("zweites Fragment schließt Event ab");
+    let ev = super::http::accumulate_sse_event(&mut pending, part2)
+        .expect("zweites Fragment schließt Event ab");
     let args = ev["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
         .as_str()
         .expect("arguments als String");
@@ -404,8 +415,14 @@ fn sse_fragment_in_string_wert_wird_ohne_verfaelschung_zusammengesetzt() {
 
     // Puffer ist danach leer – das nächste (unabhängige) Event kommt sauber durch.
     assert!(pending.is_empty());
-    let ok = super::http::accumulate_sse_event(&mut pending, r#"{"choices":[],"usage":{"completion_tokens":1}}"#);
-    assert!(ok.is_some(), "nächstes eigenständiges Event muss parsebar sein");
+    let ok = super::http::accumulate_sse_event(
+        &mut pending,
+        r#"{"choices":[],"usage":{"completion_tokens":1}}"#,
+    );
+    assert!(
+        ok.is_some(),
+        "nächstes eigenständiges Event muss parsebar sein"
+    );
 }
 
 #[test]
@@ -485,9 +502,15 @@ fn abgeschnittene_tool_argumente_gelten_als_unvollstaendig() {
     // Präfix eines Objekts – der Fall eines abgebrochenen Delta-Stroms: `path`
     // und `old` sind da, `new` fehlt noch. Ein solches Präfix kann nie
     // gültiges JSON sein (die äußere `{` bliebe ungeöffnet).
-    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt""#));
-    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt","new""#));
-    assert!(super::http::arguments_incomplete(r#"{"path":"a.txt","old":"alt","new":""#));
+    assert!(super::http::arguments_incomplete(
+        r#"{"path":"a.txt","old":"alt""#
+    ));
+    assert!(super::http::arguments_incomplete(
+        r#"{"path":"a.txt","old":"alt","new""#
+    ));
+    assert!(super::http::arguments_incomplete(
+        r#"{"path":"a.txt","old":"alt","new":""#
+    ));
     // Ungültiges bzw. nachgeschobenes JSON.
     assert!(super::http::arguments_incomplete("{'path':'a.txt'}"));
     assert!(super::http::arguments_incomplete(r#"{"path":"a.txt"}x"#));
@@ -498,7 +521,9 @@ fn vollstaendige_tool_argumente_bleiben_unangetastet() {
     assert!(!super::http::arguments_incomplete(
         r#"{"path":"a.txt","old":"alt","new":"neu"}"#
     ));
-    assert!(!super::http::arguments_incomplete("  {\"path\":\"a.txt\"}  "));
+    assert!(!super::http::arguments_incomplete(
+        "  {\"path\":\"a.txt\"}  "
+    ));
 }
 
 // ── Edit-Werkzeug: Happy Path + Argument-Prüfung (tools_exec) ────────────────
@@ -597,7 +622,10 @@ impl Channel for MockChannel {
 #[test]
 fn edit_happy_path_wendet_austausch_an() {
     let mut files = HashMap::new();
-    files.insert("a.txt".to_string(), "alt-text zeile\nzweite zeile\n".to_string());
+    files.insert(
+        "a.txt".to_string(),
+        "alt-text zeile\nzweite zeile\n".to_string(),
+    );
     let ch = MockChannel::new(files);
 
     let out = super::tools_exec::run_tool_live(
@@ -618,10 +646,7 @@ fn edit_happy_path_wendet_austausch_an() {
 #[test]
 fn edit_happy_path_mit_replace_all() {
     let mut files = HashMap::new();
-    files.insert(
-        "b.txt".to_string(),
-        "x\nx\n".to_string(),
-    );
+    files.insert("b.txt".to_string(), "x\nx\n".to_string());
     let ch = MockChannel::new(files);
 
     let out = super::tools_exec::run_tool_live(
@@ -648,7 +673,10 @@ fn edit_ohne_new_wird_als_missing_gemeldet() {
         &mut |_| {},
         None,
     );
-    assert_eq!(out.text, r#"ERROR: Argument "new" missing or not a string."#);
+    assert_eq!(
+        out.text,
+        r#"ERROR: Argument "new" missing or not a string."#
+    );
 
     // `new` ist vorhanden, aber kein String (z. B. `null`) → dieselbe Ablehnung.
     let out = super::tools_exec::run_tool_live(
@@ -658,7 +686,10 @@ fn edit_ohne_new_wird_als_missing_gemeldet() {
         &mut |_| {},
         None,
     );
-    assert_eq!(out.text, r#"ERROR: Argument "new" missing or not a string."#);
+    assert_eq!(
+        out.text,
+        r#"ERROR: Argument "new" missing or not a string."#
+    );
 }
 
 // ── Absolute Pfade (read/write/edit): nur unter dem Mount-Punkt ─────────────
@@ -813,7 +844,7 @@ fn wire_compact_boundary_zaehlt_turns_an_user_nachrichten() {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     };
     // Turn 1 mit Werkzeug-Runde: user → assistant(tool_calls) → tool → tool
     let mut tool = w("assistant");
@@ -860,7 +891,7 @@ fn wire_compact_boundary_erlaubt_schnitt_an_letzter_user_nachricht() {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     };
     // 5 User bei Index 0,1,5,127,194 – danach folgen weitere tool/assistant-
     // Nachrichten (bis 232), damit die letzte User-Nachricht nicht am Ende steht.
@@ -908,7 +939,7 @@ fn kompaktierung_zu_kurze_historie_meldet_abbruch() {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     }];
     let err = compact_chat_messages(
         0,
@@ -924,8 +955,11 @@ fn kompaktierung_zu_kurze_historie_meldet_abbruch() {
     assert!(!err.is_empty());
 }
 
-// ── Kompaktierungs-Planung & -Entscheidung (variables compact_keep_turns) ──
+// ── Kompaktierungs-Planung & -Entscheidung ──────────────────────────────
 
+/// Testnachricht mit Text – bewertet wie die echte Projektion
+/// (`api_messages`): bestätigte Zahl, sonst Schätzung über den Text. Ohne das
+/// hätten die Nachrichten hier 0 Tokens und die Schnitt-Tests prüften nichts.
 fn wm(role: &str, content: &str) -> WireMessage {
     WireMessage {
         role: role.into(),
@@ -933,7 +967,10 @@ fn wm(role: &str, content: &str) -> WireMessage {
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens {
+            content: WireTokens::part(0, content),
+            ..Default::default()
+        },
     }
 }
 
@@ -968,10 +1005,7 @@ fn plan_candidates_listet_schnitte_mit_kontextgroessen() {
             w[0].dropped_tokens > w[1].dropped_tokens,
             "dropped sinkt mit keep"
         );
-        assert!(
-            w[0].kept_tokens < w[1].kept_tokens,
-            "kept steigt mit keep"
-        );
+        assert!(w[0].kept_tokens < w[1].kept_tokens, "kept steigt mit keep");
     }
     // keep=4: Schnitt am 4.-letzten User → die ersten 4 Nachrichten (Turn 0+1)
     // werden archiviert.
@@ -985,7 +1019,11 @@ fn plan_candidates_ohne_moeglichen_schnitt_leer() {
     // Nur 1 user → kein Kandidat mit echtem Schnitt (mind. 2 nötig: keep=1
     // ließe nur den letzten Turn überleben → nichts zu archivieren).
     assert_eq!(plan_candidates(&turns(1, 10), 8).len(), 0);
-    assert_eq!(plan_candidates(&turns(2, 10), 8).len(), 1, "keep=1 → nur letzter Turn weg, einer bleibt");
+    assert_eq!(
+        plan_candidates(&turns(2, 10), 8).len(),
+        1,
+        "keep=1 → nur letzter Turn weg, einer bleibt"
+    );
 }
 
 /// Wire-Projektion wie nach einer Kompaktierung: die Summary der letzten
@@ -1037,12 +1075,12 @@ fn decide_keep_waehlt_schnitt_naechst_am_freiziel() {
     cfg.context_window = 100_000;
     cfg.compact_keep_ratio = 0.2; // Ziel: ~20 000 T bleiben, ~80 000 T frei
     cfg.compact_summary_tokens = 1_000;
-    cfg.compact_keep_turns = 3;
     // 6 gleich große Turns (~10 002 T je Turn; `keep=k` behält genau k davon):
     // Ziel 20 000 T liegt konkret zwischen keep=1 (1 Turn, ~10 000 T) und
     // keep=2 (2 Turns, ~20 004 T) – näher ist keep=2.
     let msgs = turns(6, 20_000);
-    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window)
+        .expect("Schnitt vorhanden");
     assert_eq!(keep, 2, "Schnitt, dessen Tail dem Ziel am nächsten liegt");
     let chosen = cands.iter().find(|c| c.keep_turns == keep).unwrap();
     let kept = chosen.kept_tokens;
@@ -1059,13 +1097,19 @@ fn decide_keep_waehlt_schnitt_naechst_am_freiziel() {
     // gefüllt war; maßgeblich ist der Zielwert selbst – hier bleiben ~20 % des
     // Fensters stehen, der Rest der ~60 000 T Historie fällt weg.
     assert_eq!(chosen.dropped_tokens + kept, total);
-    assert!(chosen.dropped_tokens > 39_000, "mehr als die Hälfte fällt weg");
+    assert!(
+        chosen.dropped_tokens > 39_000,
+        "mehr als die Hälfte fällt weg"
+    );
     assert!(
         kept < 20_000 + 1_000,
         "Ziel wird nicht nach oben überschritten (Ziel {kept})"
     );
     // Ausdrücklich NICHT mehr „maximaler Erhalt“ (z. B. keep=4/5).
-    assert_ne!(keep, 4, "Kriterium ist das Freiziel, nicht der größte Erhalt");
+    assert_ne!(
+        keep, 4,
+        "Kriterium ist das Freiziel, nicht der größte Erhalt"
+    );
 }
 
 #[test]
@@ -1074,14 +1118,15 @@ fn decide_keep_waehlt_staerksten_schnitt_wenn_ziel_unerreichbar() {
     cfg.context_window = 10_000;
     cfg.compact_keep_ratio = 0.2; // Ziel 2 000 T
     cfg.compact_summary_tokens = 1_000;
-    cfg.compact_keep_turns = 2;
     // Riesige Historie: selbst der stärkste Schnitt (keep=1) lässt ~20 000 T
     // stehen, das Ziel 2 000 T ist unerreichbar → es wird so weit wie
     // möglich geschnitten.
     let msgs = turns(6, 40_000);
-    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window)
+        .expect("Schnitt vorhanden");
     assert_eq!(keep, 1, "unerreichbares Ziel → stärkster Schnitt");
-    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::Manual, cfg.context_window);
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::Manual, cfg.context_window)
+        .expect("Schnitt vorhanden");
     assert_eq!(keep, 1, "unerreichbares Ziel → stärkster Schnitt (manuell)");
 }
 
@@ -1090,13 +1135,13 @@ fn decide_keep_waehlt_mehr_erhalt_wenn_ziel_bereits_unterschritten() {
     let mut cfg = test_config("http://127.0.0.1:1");
     cfg.context_window = 100_000;
     cfg.compact_keep_ratio = 0.2; // Ziel 20 000 T
-    cfg.compact_keep_turns = 3;
-    // Winzige Historie (~2400 T gesamt): das Ziel ist unerreichbar, alles liegt
-    // weit darunter → es wird der schwächste Schnitt gewählt (maximaler
-    // Erhalt, `possible_max_keep = users - 1 = 5`), also nur der älteste Turn
-    // archiviert.
+                                  // Winzige Historie (~2400 T gesamt): das Ziel ist unerreichbar, alles liegt
+                                  // weit darunter → es wird der schwächste Schnitt gewählt (maximaler
+                                  // Erhalt, `possible_max_keep = users - 1 = 5`), also nur der älteste Turn
+                                  // archiviert.
     let msgs = turns(6, 100);
-    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let (keep, _cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window)
+        .expect("Schnitt vorhanden");
     assert_eq!(keep, 5, "Ziel weit unterboten → größtes zulässiges keep");
 }
 
@@ -1106,13 +1151,13 @@ fn decide_keep_schneidet_nie_wieder_an_der_letzten_stelle() {
     cfg.context_window = 100_000;
     cfg.compact_keep_ratio = 0.2; // Ziel 20 000 T
     cfg.compact_summary_tokens = 500;
-    cfg.compact_keep_turns = 3;
     // Summary am Kopf + 4 Turns → 5 `user`-Nachrichten → `max_keep = 4`. Der
     // Kandidat `keep=4` schneidet unmittelbar hinter der Summary, also exakt an
     // der Stelle der letzten Kompaktierung: er würde nichts als die bereits
     // komprimierte Historie erneut zusammenfassen und ist ausgeschlossen.
     let msgs = turns_after_summary(4, 5_000);
-    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window)
+        .expect("Schnitt vorhanden");
     let blocked = cands
         .iter()
         .find(|c| c.previous_cut)
@@ -1123,7 +1168,7 @@ fn decide_keep_schneidet_nie_wieder_an_der_letzten_stelle() {
     assert_eq!(keep, 3, "nächststärkster erlaubter Schnitt");
     // Für alle nicht-reaktiven Auslöser gilt dieselbe Sperre.
     for t in [CompactTrigger::Proactive, CompactTrigger::Manual] {
-        let (k, _) = decide_keep(&msgs, &cfg, t, cfg.context_window);
+        let (k, _) = decide_keep(&msgs, &cfg, t, cfg.context_window).expect("Schnitt vorhanden");
         assert_eq!(k, keep, "Sperre gilt auch für {t:?}");
     }
     // Der Kandidat bleibt im Protokoll sichtbar, nur markiert.
@@ -1131,22 +1176,22 @@ fn decide_keep_schneidet_nie_wieder_an_der_letzten_stelle() {
 }
 
 #[test]
-fn decide_keep_ohne_moeglichen_schnitt_liefert_konfiguriertes() {
-    let mut cfg = test_config("http://127.0.0.1:1");
-    cfg.compact_keep_turns = 2;
+fn decide_keep_ohne_moeglichen_schnitt_liefert_keinen() {
+    let cfg = test_config("http://127.0.0.1:1");
     // Summary + 1 Query (wie direkt nach `/compact`): jeder mögliche Schnitt
-    // wäre eine Wiederholung der letzten Kompaktierung.
-    let (keep, cands) = decide_keep(
-        &turns_after_summary(1, 10),
-        &cfg,
-        CompactTrigger::AutoTurn,
-        100_000,
-    );
+    // wäre eine Wiederholung der letzten Kompaktierung → nichts zu tun.
     assert!(
-        cands.iter().all(|c| c.previous_cut),
-        "alle Kandidaten liegen auf der letzten Schnittstelle"
+        decide_keep(
+            &turns_after_summary(1, 10),
+            &cfg,
+            CompactTrigger::AutoTurn,
+            100_000,
+        )
+        .is_none(),
+        "nur die Stelle der letzten Kompaktierung infrage → kein Schnitt"
     );
-    assert_eq!(keep, cfg.compact_keep_turns, "meldet 'nichts zu kompaktieren'");
+    // Auch eine leere/einturnige Historie liefert keinen Schnitt.
+    assert!(decide_keep(&turns(1, 10), &cfg, CompactTrigger::AutoTurn, 100_000).is_none());
 }
 
 #[test]
@@ -1156,28 +1201,32 @@ fn decide_keep_reaktiv_waehlt_staerksten_schnitt() {
     cfg.compact_at = 0.8;
     cfg.compact_keep_ratio = 0.2;
     cfg.compact_summary_tokens = 500;
-    cfg.compact_keep_turns = 3;
     // Bei einem context_length-Fehler zählt das VOLLE Fenster (nicht das
     // Freiziel und nicht die 80%-Schwelle): unter allen Kandidaten, die
     // kept+budget ins Fenster bringen, wählt Reactive das kleinste keep
     // (stärkster Schnitt) – hier 1.
     let msgs = turns(6, 20_000);
-    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window);
-    assert_eq!(keep, 1, "Reactive wählt das kleinste keep unter dem vollen Fenster");
+    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window)
+        .expect("Schnitt vorhanden");
+    assert_eq!(
+        keep, 1,
+        "Reactive wählt das kleinste keep unter dem vollen Fenster"
+    );
 }
 
 #[test]
-fn decide_keep_reaktiv_faellt_auf_konfiguriertes_zurueck() {
+fn decide_keep_reaktiv_faellt_auf_staerksten_schnitt_zurueck() {
     let mut cfg = test_config("http://127.0.0.1:1");
     cfg.context_window = 10_000;
     cfg.compact_keep_ratio = 0.2;
     cfg.compact_summary_tokens = 1_000;
-    cfg.compact_keep_turns = 2;
     // Selbst der stärkste Schnitt passt nicht ins volle Fenster → Rückfall auf
-    // das konfigurierte `compact_keep_turns`.
+    // den stärksten Schnitt überhaupt (die Tokengrößen sind Schätzungen –
+    // ein Besserungsversuch ist besser als keiner).
     let msgs = turns(6, 40_000);
-    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window);
-    assert_eq!(keep, 2, "Rückfall auf das konfigurierte compact_keep_turns");
+    let (keep, _) = decide_keep(&msgs, &cfg, CompactTrigger::Reactive, cfg.context_window)
+        .expect("Rückfall liefert den stärksten Schnitt");
+    assert_eq!(keep, 1, "Rückfall auf den stärksten Schnitt (keep=1)");
 }
 
 #[test]
@@ -1186,9 +1235,9 @@ fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung(
     cfg.context_window = 100_000;
     cfg.compact_at = 0.8;
     cfg.compact_summary_tokens = 500;
-    cfg.compact_keep_turns = 3;
     let msgs = turns(6, 200);
-    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window);
+    let (keep, cands) = decide_keep(&msgs, &cfg, CompactTrigger::AutoTurn, cfg.context_window)
+        .expect("Schnitt vorhanden");
     let chosen = cands
         .iter()
         .find(|c| c.keep_turns == keep)
@@ -1219,7 +1268,14 @@ fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung(
     };
     let files: std::collections::HashMap<String, String> =
         render_compaction_log(&log).into_iter().collect();
-    for want in ["meta.txt", "overview.txt", "plan.txt", "summary.txt", "request.json", "response.txt"] {
+    for want in [
+        "meta.txt",
+        "overview.txt",
+        "plan.txt",
+        "summary.txt",
+        "request.json",
+        "response.txt",
+    ] {
         assert!(files.contains_key(want), "Protokoll fehlt {want}");
     }
 
@@ -1233,12 +1289,18 @@ fn kompaktierungs_protokoll_enthaelt_ausloeser_randbedingungen_und_entscheidung(
     assert!(meta.contains("target_tokens:   20000"));
     assert!(meta.contains("current_tokens:  93000"));
     assert!(meta.contains(&format!("decided_keep:    {keep}")));
-    assert!(meta.contains("summary_tokens:  17"), "erreichte Summary: {meta}");
+    assert!(
+        meta.contains("summary_tokens:  17"),
+        "erreichte Summary: {meta}"
+    );
 
-    // Kandidaten-Tabelle (variables compact_keep_turns) mit gewählter
-    // Markierung + Kontextgrößen (wegfallend/bleibend) + Abstand zum Ziel.
+    // Kandidaten-Tabelle mit gewählter Markierung + Kontextgrößen
+    // (wegfallend/bleibend) + Abstand zum Ziel.
     let plan = &files["plan.txt"];
-    assert!(plan.contains(&format!("keep={keep}")), "gewählte Zeile: {plan}");
+    assert!(
+        plan.contains(&format!("keep={keep}")),
+        "gewählte Zeile: {plan}"
+    );
     assert!(plan.contains("<-- gewählt"));
     assert!(plan.contains("T weg"));
     assert!(plan.contains("T bleiben"));
@@ -1263,9 +1325,10 @@ fn overview_from_wire(msgs: &[WireMessage]) -> String {
     for (i, m) in msgs.iter().enumerate() {
         let _ = writeln!(
             out,
-            "[{i:3}] {:<10} T  {}",
+            "[{i:3}] {:<10} {:>6} T  {}",
             m.role,
-            llm::estimate_tokens(m.content.as_deref().unwrap_or_default())
+            m.tokens.total(),
+            m.content.as_deref().unwrap_or_default()
         );
     }
     out

@@ -630,11 +630,7 @@ fn worktree_mountchain_ist_in_ordnung_und_oeffnet_keinen_dialog() {
     // Mountpunkt `/home/work`: Änderungen an `/home/work` selbst sowie den
     // „Zwischenordnern“ `/home` (und `/`) sind nur Mount-Artefakte → herausfiltern.
     // Ausschließlich solche Pfade ⇒ Ergebnis leer ⇒ kein Dialog.
-    let paths = container::essential_diff_paths(
-        "C /home/work\nA /home\n",
-        "/home/work",
-        "/tmp",
-    );
+    let paths = container::essential_diff_paths("C /home/work\nA /home\n", "/home/work", "/tmp");
     assert!(paths.is_empty(), "nur Mount-Artefakte: {paths:?}");
 
     let paths = container::essential_diff_paths("A /home\n", "/home/work", "/tmp");
@@ -673,7 +669,8 @@ fn worktree_mountchain_unterscheidet_echte_vorfahren_von_teilprefixen() {
 
     // Tief verschachtelter Unterpfad des Mounts bleibt (wie bisher) verworfen –
     // er lebt im gemounteten Host-Ordner und geht beim Stoppen nicht verloren.
-    let paths = container::essential_diff_paths("A /home/work/z\nC /home/work\n", "/home/work", "/tmp");
+    let paths =
+        container::essential_diff_paths("A /home/work/z\nC /home/work\n", "/home/work", "/tmp");
     assert!(paths.is_empty(), "{paths:?}");
 }
 

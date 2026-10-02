@@ -17,7 +17,7 @@ use super::helpers::{
     take_head, truncate, with_debug, ERROR_SUMMARY_MAX,
 };
 use super::tools_def::{apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation};
-use super::wire::{WireFunction, WireMessage, WireToolCall};
+use super::wire::{WireFunction, WireMessage, WireTokens, WireToolCall};
 use super::{ApiProtocol, CompletionParts, RoundMetrics, Usage, WorkerEvent};
 
 /// Sendet ein Modell-Probe-Ergebnis (für den Statusindikator im Picker) an die
@@ -79,7 +79,10 @@ pub(crate) fn accumulate_sse_event(
     pending: &mut String,
     payload: &str,
 ) -> Option<serde_json::Value> {
-    for joined in [format!("{pending}{payload}"), format!("{pending}\n{payload}")] {
+    for joined in [
+        format!("{pending}{payload}"),
+        format!("{pending}\n{payload}"),
+    ] {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&joined) {
             pending.clear();
             return Some(v);
@@ -680,7 +683,7 @@ pub(crate) fn do_request(
                 reasoning_content: reasoning,
                 tool_calls: calls,
                 tool_call_id: None,
-                num_tokens: None,
+                tokens: WireTokens::default(),
             }
         };
 
@@ -1038,9 +1041,7 @@ fn stream_responses(
                             // unverändert das frühere Verhalten.
                             parts_acc
                                 .track_tool(index, args.len().saturating_sub(acc_bytes) as u64);
-                            timer.on_chars(
-                                args.chars().count().saturating_sub(acc_chars) as u64,
-                            );
+                            timer.on_chars(args.chars().count().saturating_sub(acc_chars) as u64);
                             timer.send_progress(tx, session);
                         }
                     }
@@ -1115,7 +1116,7 @@ fn finish_round(
                 reasoning_content: reasoning,
                 tool_calls: calls,
                 tool_call_id: None,
-                num_tokens: None,
+                tokens: WireTokens::default(),
             }
         };
 

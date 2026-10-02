@@ -1,4 +1,4 @@
-//! Kontext-Kompaktierung: Planung (variables `compact_keep_turns`), Entscheidung,
+//! Kontext-Kompaktierung: Planung, Entscheidung,
 //! Ausführung und Protokoll (Debug-Ablage wie bei Fehlerantworten).
 
 use std::fmt::Write as _;
@@ -15,7 +15,7 @@ use super::helpers::{
     ERROR_SUMMARY_MAX,
 };
 use super::http::{accumulate_sse_event, shared_client};
-use super::wire::WireMessage;
+use super::wire::{WireMessage, WireTokens};
 use super::{Usage, WorkerEvent};
 use crate::config::{Config, ResolvedEndpoint};
 
@@ -40,7 +40,7 @@ no introduction, no comment, and no continuation of the dialogue. Write the \
 summary in the language of the conversation / the user.";
 
 /// Auslöser der Kompaktierung – bestimmt die Entscheidung über den Schnitt
-/// (variables `compact_keep_turns`) und wird im Protokoll festgehalten.
+/// und wird im Protokoll festgehalten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactTrigger {
     /// Automatisch direkt nach Abschluss der finalen Antwort – läuft parallel
@@ -94,6 +94,7 @@ impl CompactTrigger {
 /// überleben (Schnitt am `k`-letzten User). Damit ist `k = 1` (nur der letzte
 /// Turn bleibt) exakt derselbe normale Fall wie jedes andere `k` – kein
 /// Sonderfall. Größeres `k` lässt mehr überleben (schwächerer Schnitt).
+/// `keep_turns = 0` verhält sich wie `keep_turns = 1`: der laufende Turn bleibt immer stehen.
 pub(crate) fn wire_compact_boundary(msgs: &[WireMessage], keep_turns: usize) -> usize {
     let mut users = 0;
     let mut i = msgs.len();
@@ -185,24 +186,25 @@ pub(crate) fn can_compact(msgs: &[WireMessage]) -> bool {
     cut_limit(msgs) > 0
 }
 
-/// Grobe Token-Schätzung einer einzelnen Wire-Nachricht (4 Zeichen ≈ 1 Token)
-/// für die Planung/den Schnitt-Vergleich und das Protokoll. Liegt eine bestätigte
-/// Zahl aus dem Event-Log (`num_tokens`, via `api_messages` eingetragen)
-/// vor, wird diese verwendet – sonst die Zeichen-Heuristik.
+/// Tokenzahl einer einzelnen Wire-Nachricht – die Summe der Bestandteile, die
+/// `api_messages` je Nachricht bereits bewertet hat: pro Bestandteil die
+/// bestätigte Zahl aus dem Event-Log, sonst die Zeichenschätzung über genau
+/// diesen Text (also auch Reasoning und Tool-Aufrufe; siehe `WireTokens`).
+/// reine Summenfunktion – die Entscheidung „bestätigt oder geschätzt“ fällt in
+/// der Projektion, damit Protokoll und Planung exakt dieselbe Zahl sehen.
 fn wire_tokens_of(m: &WireMessage) -> u64 {
-    m.num_tokens
-        .unwrap_or_else(|| crate::llm::estimate_tokens(m.content.as_deref().unwrap_or_default()))
+    m.tokens.total()
 }
 
-/// Geschätzte Tokens einer Wire-Nachrichtenliste.
+/// Tokens einer Wire-Nachrichtenliste (bestätigt, wo gemessen – sonst geschätzt).
 fn wire_tokens(msgs: &[WireMessage]) -> u64 {
     msgs.iter().map(wire_tokens_of).sum()
 }
 
-/// Ein möglicher Schnitt (variables `compact_keep_turns`): wo der Schnitt
-/// läge (`boundary`), wie viel wegfällt (`dropped_tokens`) und was übrig
-/// bliebe (`kept_tokens`). Die Größen sind bewusst Schätzungen (Zeichen-
-/// Heuristik), damit die Entscheidung ohne LLM-Aufruf möglich ist.
+/// Ein möglicher Schnitt: wo der Schnitt läge (`boundary`), wie viel wegfällt
+/// (`dropped_tokens`) und was übrig bliebe (`kept_tokens`). Die Größen kommen
+/// je Bestandteil aus dem Event-Log (bestätigte Usage), sonst aus der
+/// Zeichen-Heuristik – die Entscheidung kommt damit ohne LLM-Aufruf aus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CutCandidate {
     pub keep_turns: usize,
@@ -210,9 +212,9 @@ pub(crate) struct CutCandidate {
     pub boundary: usize,
     /// Anzahl der archivierten Wire-Nachrichten (alles vor `boundary`).
     pub archived_msgs: usize,
-    /// Geschätzte Tokens des entfernten Teils.
+    /// Tokens des entfernten Teils.
     pub dropped_tokens: u64,
-    /// Geschätzte Tokens des überlebenden Tails.
+    /// Tokens des überlebenden Tails.
     pub kept_tokens: u64,
     /// Dieser Schnitt läge auf der Stelle der letzten Kompaktierung (Summary
     /// am Kopf) und ist damit vom Spiel ausgeschlossen – siehe `cut_limit`.
@@ -220,9 +222,11 @@ pub(crate) struct CutCandidate {
 }
 
 /// Plant alle möglichen Schnitte für `keep_turns = 1..=max_keep`. Es werden
-/// nur Kandidaten mit echtem Schnitt (`boundary > 0`) geliefert; die
-/// Ausschlussregel aus `cut_limit` markiert `decide_keep`.
+/// nur Kandidaten mit echtem Schnitt (`boundary > 0`) geliefert; Schnitte an
+/// der Stelle der letzten Kompaktierung sind als `previous_cut` markiert
+/// (siehe `cut_limit`) und werden von `decide_keep` ausgeschlossen.
 pub(crate) fn plan_candidates(msgs: &[WireMessage], max_keep: usize) -> Vec<CutCandidate> {
+    let limit = cut_limit(msgs);
     let mut out = Vec::new();
     for k in 1..=max_keep {
         let boundary = wire_compact_boundary(msgs, k);
@@ -235,7 +239,7 @@ pub(crate) fn plan_candidates(msgs: &[WireMessage], max_keep: usize) -> Vec<CutC
             archived_msgs: boundary,
             dropped_tokens: msgs[..boundary].iter().map(wire_tokens_of).sum(),
             kept_tokens: msgs[boundary..].iter().map(wire_tokens_of).sum(),
-            previous_cut: false,
+            previous_cut: k > limit,
         });
     }
     out
@@ -252,23 +256,10 @@ fn target_kept_tokens(config: &Config, context_window: u64) -> u64 {
     (context_window as f64 * ratio) as u64
 }
 
-/// Notauswahl, wenn kein Kandidat sein Ziel erreicht: das konfigurierte
-/// `compact_keep_turns`, sofern es im zulässigen Bereich liegt, sonst der
-/// stärkste (kleinste `keep`) zulässige Schnitt.
-fn fallback_keep(selectable: &[&CutCandidate], configured: usize) -> usize {
-    if selectable.iter().any(|c| c.keep_turns == configured) {
-        configured
-    } else {
-        selectable
-            .iter()
-            .map(|c| c.keep_turns)
-            .min()
-            .unwrap_or(configured)
-    }
-}
-
 /// Entscheidet über die konkrete Schnittstelle (`keep_turns`) aus den
-/// Kandidaten. Liefert die gewählte `keep_turns`-Zahl und die vollständige
+/// Kandidaten. Liefert `None`, wenn es nichts zu kompaktieren gibt (kein
+/// echter Schnitt möglich, oder nur die Stelle der letzten Kompaktierung
+/// infrage käme); sonst die gewählte `keep_turns`-Zahl und die vollständige
 /// Kandidaten-Tabelle (für das Protokoll).
 ///
 /// Der Spielraum ist `1..=cut_limit(msgs)`: `keep_turns` zählt die GENAU
@@ -288,7 +279,9 @@ fn fallback_keep(selectable: &[&CutCandidate], configured: usize) -> usize {
 ///   es wird also nie weniger archiviert als nötig, um ins Ziel zu kommen.
 /// - **Reaktiv (context_length-Fehler):** Stärkster Schnitt – kleinstes
 ///   `keep`, dessen Folge-Kontext sicher unter das VOLLE Fenster
-///   (`context_window`) passt, damit der Retry nicht erneut überläuft.
+///   (`context_window`) passt, damit der Retry nicht erneut überläuft. Passt
+///   keiner, der stärkste überhaupt – die Tokengrößen sind Schätzungen, ein
+///   Besserungsversuch ist besser als keiner.
 ///
 /// Bei Gleichstand im Normalfall gewinnt das GRÖßERE `keep_turns`: von
 /// zwei gleich weit vom Ziel entfernten Schnitten bleibt beim schwächeren mehr
@@ -298,28 +291,11 @@ pub(crate) fn decide_keep(
     config: &Config,
     trigger: CompactTrigger,
     context_window: u64,
-) -> (usize, Vec<CutCandidate>) {
-    let max_keep = possible_max_keep(msgs);
-    if max_keep == 0 {
-        // Nichts zu schneiden – es bleibt beim konfigurierten Wunsch (der
-        // wird von `compact_chat_messages` als „keine zu kompaktierenden
-        // Turns“ abgefangen).
-        return (config.compact_keep_turns, Vec::new());
-    }
+) -> Option<(usize, Vec<CutCandidate>)> {
     // Vollständige Tabelle für das Protokoll – inklusive des ggf.
     // ausgeschlossenen Schnitts an der letzten Kompaktierungsstelle.
-    let mut candidates = plan_candidates(msgs, max_keep);
-    let limit = cut_limit(msgs);
-    for c in &mut candidates {
-        c.previous_cut = c.keep_turns > limit;
-    }
+    let candidates = plan_candidates(msgs, possible_max_keep(msgs));
     let selectable: Vec<&CutCandidate> = candidates.iter().filter(|c| !c.previous_cut).collect();
-    if selectable.is_empty() {
-        // Nur die Summary am Kopf, seitdem kein weiterer Turn: es gibt nichts
-        // Neues zu kompaktieren (`compact_chat_messages` fängt das ab).
-        return (config.compact_keep_turns, candidates);
-    }
-
     let budget = config.compact_summary_tokens;
     let chosen = match trigger {
         // Reaktiv: stärkster Schnitt, der das volle Fenster sicher einhält.
@@ -327,8 +303,11 @@ pub(crate) fn decide_keep(
             .iter()
             .filter(|c| c.kept_tokens.saturating_add(budget) <= context_window)
             .min_by_key(|c| c.keep_turns)
-            .map(|c| c.keep_turns)
-            .unwrap_or_else(|| fallback_keep(&selectable, config.compact_keep_turns)),
+            .or_else(|| {
+                // Rückfall: kein Kandidat passt – stärkster Schnitt überhaupt.
+                selectable.iter().min_by_key(|c| c.keep_turns)
+            })
+            .map(|c| c.keep_turns),
         // Normal: der Schnitt, dessen Tail dem Freiziel am nächsten liegt.
         // `Reverse` im Schlüssel löst Gleichstände zugunsten des schwächeren
         // Schnitts (mehr unangetasteter Originalkontext).
@@ -344,10 +323,9 @@ pub(crate) fn decide_keep(
                 })
                 .min()
                 .map(|(_, std::cmp::Reverse(k))| k)
-                .unwrap_or_else(|| fallback_keep(&selectable, config.compact_keep_turns))
         }
     };
-    (chosen, candidates)
+    chosen.map(|keep| (keep, candidates))
 }
 
 /// Ergebnis-Objekt des Zusammenfassungs-Aufrufs: Inhalt, Tokenlänge und die
@@ -398,7 +376,7 @@ pub(crate) fn request_summary(
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     });
     compact_msgs.extend_from_slice(msgs);
     compact_msgs.push(WireMessage {
@@ -407,7 +385,7 @@ pub(crate) fn request_summary(
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: None,
+        tokens: WireTokens::default(),
     });
 
     // API-Shape aus dem Cache ermitteln (Default Chat Completions); der
@@ -574,8 +552,8 @@ fn summary_from_response(shape: ApiShape, raw: &str) -> Result<(String, Option<U
 }
 
 /// Kurzübersicht der für die Kompaktierung relevanten Historie (eine Zeile je
-/// Wire-Nachricht: Index, Rolle, geschätzte Tokens, gekürzter Inhalt) – für
-/// das Protokoll.
+/// Wire-Nachricht: Index, Rolle, Tokens – bestätigt, wo der Server gemessen
+/// hat, sonst geschätzt –, gekürzter Inhalt) – für das Protokoll.
 fn message_overview(msgs: &[WireMessage]) -> String {
     let mut out = String::new();
     for (i, m) in msgs.iter().enumerate() {
@@ -633,7 +611,7 @@ pub(crate) struct CompactionLog {
 /// - `meta.txt`      – Auslöser, Randbedingungen (Kontextgröße, Konfiguration)
 ///   und getroffene Entscheidung samt erreichten Summary-Tokens.
 /// - `overview.txt`  – Kurzübersicht der relevanten Historie.
-/// - `plan.txt`      – Kandidaten-Tabelle (variables `compact_keep_turns`).
+/// - `plan.txt`      – Kandidaten-Tabelle.
 /// - `summary.txt`   – die erreichte Zusammenfassung mit ihrer Tokenlänge.
 /// - `request.json` / `response.txt` – der Zusammenfassungs-Aufruf.
 pub(crate) fn render_compaction_log(log: &CompactionLog) -> Vec<(String, String)> {
@@ -693,7 +671,7 @@ pub(crate) fn render_compaction_log(log: &CompactionLog) -> Vec<(String, String)
         format!("Relevante Historie (Wire-Projektion):\n\n{}", log.overview),
     ));
 
-    // ── plan.txt: Kandidaten (variables compact_keep_turns) ────────────────
+    // ── plan.txt: Kandidaten ──────────────────────────────────────────────
     let mut plan = String::new();
     match log.trigger {
         // Normalfall: das Freiziel bestimmt die Wahl, der Summary-Budget ist
@@ -701,7 +679,7 @@ pub(crate) fn render_compaction_log(log: &CompactionLog) -> Vec<(String, String)
         CompactTrigger::Reactive => {
             let _ = writeln!(
                 plan,
-                "Kandidaten (variables compact_keep_turns) – Ziel: kleinstes keep, dessen \
+                "Kandidaten – Ziel: kleinstes keep, dessen \
                  Folge-Kontext (Tail + Summary-Budget {}) ins volle Fenster ({}) passt:",
                 log.summary_budget, log.context_window,
             );
@@ -709,7 +687,7 @@ pub(crate) fn render_compaction_log(log: &CompactionLog) -> Vec<(String, String)
         _ => {
             let _ = writeln!(
                 plan,
-                "Kandidaten (variables compact_keep_turns) – Ziel: ~{} T (~{} % des Fensters) \
+                "Kandidaten – Ziel: ~{} T (~{} % des Fensters) \
                  bleiben; gewählt wird der Schnitt mit dem kleinsten Abstand dazu:",
                 log.target_tokens,
                 log.keep_ratio * 100.0,
@@ -811,21 +789,12 @@ pub(crate) fn compact_chat_messages(
     trigger: CompactTrigger,
     current_tokens: Option<u64>,
 ) -> Result<CompactionResult, String> {
-    let (keep, candidates) = decide_keep(msgs, config, trigger, ep.context_window);
-    let boundary = wire_compact_boundary(msgs, keep);
-    if boundary == 0 {
-        return Err("Die Konversation hat noch keine zu kompaktierenden Turns.".into());
-    }
-    if keep > cut_limit(msgs) {
-        // Sicherheitsnetz: `decide_keep` liefert nie einen ausgeschlossenen
-        // Schnitt. Sollte das je passieren, wird abgelehnt, statt die bereits
-        // komprimierte Summary ein zweites Mal zusammenzufassen.
+    let Some((keep, candidates)) = decide_keep(msgs, config, trigger, ep.context_window) else {
         return Err(
-            "Seit der letzten Kompaktierung ist kein weiterer Turn hinzugekommen – \
-             es gibt nichts Neues zusammenzufassen."
-                .into(),
+            "Es gibt nichts zu kompaktieren – dafür braucht es mindestens zwei Turns.".into(),
         );
-    }
+    };
+    let boundary = wire_compact_boundary(msgs, keep);
     let old = &msgs[..boundary];
     let tail = &msgs[boundary..];
     let res = request_summary(
@@ -848,24 +817,31 @@ pub(crate) fn compact_chat_messages(
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
-        num_tokens: Some(res.tokens),
+        // Die Summary ist das Ergebnis des Komprimierungs-Aufrufs: dessen
+        // gemeldete Tokenzahl ist bestätigt, ohne Messung wird über den Text
+        // geschätzt – nie 0, damit die bereits komprimierte Historie in der
+        // Planung nicht als kostenlos erscheint.
+        tokens: WireTokens {
+            content: WireTokens::part(res.tokens, &content),
+            ..Default::default()
+        },
     });
     out.extend_from_slice(tail);
 
     // Protokoll (Debug-Ablage wie bei Fehlerantworten): Randbedingungen,
-    // Kandidaten, Entscheidung, erreichte Summary + Tokenlänge.
-    let chosen = candidates
-        .iter()
-        .find(|c| c.keep_turns == keep)
-        .copied()
-        .unwrap_or(CutCandidate {
-            keep_turns: keep,
-            boundary,
-            archived_msgs: old.len(),
-            dropped_tokens: wire_tokens(old),
-            kept_tokens: wire_tokens(tail),
-            previous_cut: false,
-        });
+    // Kandidaten, Entscheidung, erreichte Summary + Tokenlänge. Der gewählte
+    // Schnitt wird direkt aus dem tatsächlich ausgeführten Cut gebaut –
+    // identisch zum gleichnamigen Kandidaten (`plan_candidates` berechnet
+    // boundary/archiviert/Tokens über dieselben Werte), ohne erneuten Lookup.
+    let chosen = CutCandidate {
+        keep_turns: keep,
+        boundary,
+        archived_msgs: old.len(),
+        dropped_tokens: wire_tokens(old),
+        kept_tokens: wire_tokens(tail),
+        // `decide_keep` wählt nur zulässige Schnitte – nie ein `previous_cut`.
+        previous_cut: false,
+    };
     let log = CompactionLog {
         trigger,
         model: ep.model.clone(),
@@ -1064,7 +1040,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
-            num_tokens: None,
+            tokens: WireTokens::default(),
         }];
         crate::llm::api::build_body(
             &ep,

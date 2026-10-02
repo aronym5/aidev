@@ -1,5 +1,6 @@
 use super::*;
 use crossterm::event::{self, KeyCode};
+use std::path::{Path, PathBuf};
 
 impl App {
     pub(crate) fn open_channel_builder(&mut self) {
@@ -151,37 +152,26 @@ impl App {
         }
     }
 
-    pub(crate) fn update_builder_container(&self) {
+    pub(crate) fn update_builder_container(&mut self) {
         use crate::channel::builder::*;
 
-        let (bg_path, current_image) = match self.channel_builder.as_ref() {
-            Some(b) => {
-                let tunnel = match b.tunnels.selected() {
-                    Some(t) => t,
-                    None => return,
-                };
-                // Nur bei Podman-Images prüfen, nicht bei Local
-                let image_name = match tunnel.image_name() {
-                    Some(name) => name.to_string(),
-                    None => return, // Local → kein Container-Check
-                };
-                // Effektiven Pfad bestimmen (Worktree bevorzugen)
-                let host_path = b.host_paths.selected().map(|hp| hp.path.clone());
-                let wt_path = if b.current_is_git {
-                    b.worktrees
-                        .selected()
-                        .filter(|w| w.has_worktree && !w.path.as_os_str().is_empty())
-                        .map(|w| w.path.clone())
-                } else {
-                    None
-                };
-                let path = wt_path.or(host_path);
-                match path {
-                    Some(p) => (p, Some(image_name)),
-                    None => return,
-                }
+        let probe = self.channel_builder.as_ref().and_then(|b| {
+            let tunnel = b.tunnels.selected()?;
+            // Nur bei Podman-Images prüfen, nicht bei Local
+            let image_name = tunnel.image_name()?.to_string();
+            // Effektiven Pfad bestimmen (Worktree bevorzugen)
+            builder_probe_path(b).map(|p| (p, Some(image_name)))
+        });
+        let Some((bg_path, current_image)) = probe else {
+            // Nichts zu prüfen: kein Builder, Local (dort gibt es keinen
+            // Container), kein Host-Pfad – oder ein Branch OHNE Worktree, für
+            // den es noch gar keinen Mount-Pfad gibt. Die bisherige Info gehört
+            // dann zu einer anderen Auswahl und bliebe stehen; die Statuszeile
+            // zeigte weiter den Container des Haupt-Checkouts.
+            if let Some(b) = self.channel_builder.as_mut() {
+                b.container_info = None;
             }
-            None => return,
+            return;
         };
 
         let tx = self.tx.clone();
@@ -409,12 +399,21 @@ impl App {
         };
 
         // Existierenden Container berücksichtigen: mount_destination
-        // hat Vorrang
-        let has_existing_container = builder
-            .container_info
-            .as_ref()
-            .and_then(|i| i.mount_destination.as_ref())
-            .is_some_and(|d| !d.is_empty());
+        // hat Vorrang – aber nur, wenn er zu DIESER Auswahl gehört (Pfad-
+        // Identität, siehe `may_reuse_container`). Sonst würde die Mount-
+        // Destination eines Containers übernommen, der einen ganz anderen
+        // Pfad mountet (z. B. den Haupt-Checkout).
+        let same_selection = may_reuse_container(
+            builder.container_info.as_ref(),
+            &effective_root,
+            created_worktree.is_some(),
+        );
+        let has_existing_container = same_selection
+            && builder
+                .container_info
+                .as_ref()
+                .and_then(|i| i.mount_destination.as_ref())
+                .is_some_and(|d| !d.is_empty());
 
         if has_existing_container {
             // Container existiert → dessen mount_destination verwenden
@@ -450,11 +449,18 @@ impl App {
         // diesen Container nutzt – statt einen Duplikat-Kanal anzulegen. Erst
         // wenn kein solcher Kanal existiert, erzeugen wir einen neuen, der an
         // den bestehenden Container andockt (Attach-Modus).
+        //
+        // Nur bei nachgewiesener Zugehörigkeit zur Auswahl (`same_selection`,
+        // siehe `may_reuse_container`): Sonst wurde hier der Kanal des
+        // Haupt-Checkouts übernommen, obwohl gerade der Worktree eines ganz
+        // anderen Branchs angelegt worden war – `effective_root`, `branch` und
+        // `created_worktree` waren dann berechnet und wurden nie benutzt.
         let running_container = builder
             .container_info
             .as_ref()
             .filter(|i| {
-                i.status == "running"
+                same_selection
+                    && i.status == "running"
                     && i.mount_destination
                         .as_deref()
                         .is_some_and(|d| !d.is_empty())
@@ -790,4 +796,58 @@ impl App {
             _ => {}
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pfad- und Identitätsregeln des Channel Builders (frei, damit testbar)
+// ---------------------------------------------------------------------------
+
+/// Host-Pfad, für den im Channel Builder ein Container gesucht wird: der Pfad
+/// des in der Branch-Spalte gewählten Worktrees – oder, außerhalb eines Repos
+/// bzw. ohne Auswahl in der Branch-Spalte, der Host-Pfad aus der mittleren
+/// Spalte.
+///
+/// **`None` bei einem Repo mit markiertem Branch OHNE Worktree.** Dafür gibt es
+/// noch gar keinen Pfad, auf den ein Container zeigen könnte – der darf auch
+/// nicht durch den Host-Pfad ersetzt werden: Das lieferte den Container des
+/// Haupt-Checkouts (er mountet den Host-Pfad) und führte beim Bestätigen dazu,
+/// dass der Kanal des Haupt-Checkouts statt eines neuen für den gewählten
+/// Branch übernommen wurde. Seit der Kanal erst beim Bestätigen entsteht, gibt
+/// es für „(Kein Worktree)“ schlicht keinen Container – die Statuszeile bleibt
+/// leer, und `builder_select` baut einen eigenen.
+pub(crate) fn builder_probe_path(b: &ChannelBuilderState) -> Option<PathBuf> {
+    let host_path = b.host_paths.selected().map(|hp| hp.path.clone());
+    if !b.current_is_git {
+        return host_path;
+    }
+    match b.worktrees.selected() {
+        // Worktree gewählt → dessen Pfad (Quelle der Container-Suche).
+        Some(w) if w.has_worktree && !w.path.as_os_str().is_empty() => Some(w.path.clone()),
+        // Branch ohne Worktree → noch kein Pfad, also kein Container.
+        Some(_) => None,
+        // Keine Auswahl in der Branch-Spalte → der Host-Pfad gilt.
+        None => host_path,
+    }
+}
+
+/// Darf der gefundene Container (und damit dessen Kanal) für die aktuelle
+/// Auswahl wiederverwendet werden?
+///
+/// * **Pfadidentität:** `container_info` wird asynchron nachgeladen (siehe
+///   `update_builder_container`) und kann noch zu einer früheren
+///   Cursor-Position gehören. Wiederverwendet werden darf nur Container, die
+///   auf genau dem Pfad der bestätigten Auswahl mounten – der alte Vergleich
+///   lief nur über den Containernamen und traf deshalb den Kanal des
+///   Haupt-Checkouts mit, obwohl für einen ganz anderen Branch gerade ein
+///   Worktree angelegt worden war.
+/// * **Kein Worktree gerade angelegt:** Dann kann ein laufender Container nur
+///   der des Host-Pfades sein (des Haupt-Checkouts). Der neue Kanal für den
+///   gewählten Branch muss ein eigener werden – sonst bekäme der User wieder
+///   den Kanal des falschen Branchs, nur jetzt mit einem Worktree daneben.
+pub(crate) fn may_reuse_container(
+    info: Option<&crate::channel::builder::ContainerInfo>,
+    effective_root: &Path,
+    created_worktree: bool,
+) -> bool {
+    !created_worktree && info.is_some_and(|i| i.mount_path == effective_root)
 }

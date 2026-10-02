@@ -134,7 +134,8 @@ mod tests {
         let para = Paragraph::new(lines).style(Style::default().bg(theme().band_bg));
         let backend = TestBackend::new(width, height);
         let mut term = Terminal::new(backend).expect("TestBackend");
-        term.draw(|f| f.render_widget(para, f.area())).expect("render");
+        term.draw(|f| f.render_widget(para, f.area()))
+            .expect("render");
         let buf = term.backend().buffer();
         (0..height)
             .map(|y| {

@@ -57,9 +57,9 @@ fn ueberlebende_events_nach_summary_werden_verschoben() {
         false,
     );
     // Kompaktierung über die Session (macht den echten Shift): Turn 1 archiviert.
-    // `keep=0`: nichts wird als „letzter Turn“ geschützt – nur Turn 1 wird
-    // kompaktiert, Turn 2 bleibt als überlebendes Event zwischen Summary und
-    // neuem Turn stehen.
+    // `keep=0` wird wie `keep=1` behandelt (wie im Wire-Pfad
+    // `wire_compact_boundary`): der LETZTE Turn bleibt IMMER stehen – also
+    // Turn 2 als überlebendes Event zwischen Summary und neuem Turn.
     s.apply_compaction(
         "[Compressed history - 1 earlier messages]\n\nzusammen".into(),
         10,
@@ -1326,7 +1326,8 @@ fn grep_detail_zeigt_vorkommen_in_spalten() {
         .collect();
     // Label-Zeile ist vorhanden.
     assert!(
-        text.iter().any(|l| l.contains("grep") && l.contains("TODO")),
+        text.iter()
+            .any(|l| l.contains("grep") && l.contains("TODO")),
         "Label mit Tool-Name und Query: {text:?}"
     );
     // Alle drei Treffer sind sichtbar.
@@ -1441,7 +1442,8 @@ fn grep_compact_bleibt_einzeiler() {
         "Compact: keine individuellen Treffer: {text:?}"
     );
     assert!(
-        text.iter().any(|l| l.contains("grep") && l.contains("TODO")),
+        text.iter()
+            .any(|l| l.contains("grep") && l.contains("TODO")),
         "Compact: Label bleibt: {text:?}"
     );
 }
@@ -1540,7 +1542,10 @@ fn preserve_breaks_behaelt_absatzgrenzen_und_markdown() {
     // Zitate bleiben Zitate.
     assert_eq!(show("> q eins\n> q zwei"), ["> q eins", "> q zwei"]);
     // Bestehender harter Umbruch (zwei Spaces) bleibt unverändert.
-    assert_eq!(show("Zeile eins  \nZeile zwei"), ["Zeile eins", "Zeile zwei"]);
+    assert_eq!(
+        show("Zeile eins  \nZeile zwei"),
+        ["Zeile eins", "Zeile zwei"]
+    );
 }
 
 #[test]
@@ -1555,7 +1560,13 @@ fn preserve_breaks_tabellen_und_code_bleiben_unangetastet() {
     let t = show("| a | b |\n---|---\n| 1 | 2 |");
     assert_eq!(
         t,
-        ["┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘"]
+        [
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘"
+        ]
     );
     // Fenced-Codeblock bleibt zeichengetreu (keine eingefügten Spaces).
     let src = "```rs\nlet a = 1;\nlet b = 2;\n```";
@@ -1573,7 +1584,8 @@ fn preserve_breaks_blockzitate_bleiben_zeilengetreu() {
     // Aufeinanderfolgende `>`-Zeilen sind Markdown-EIN Absatz und würden sonst
     // verschmelzen – preserve_breaks hält sie getrennt, wie im Eingabefeld.
     assert_eq!(show("> q eins\n> q zwei"), ["> q eins", "> q zwei"]);
-    assert_eq!(show("> eins\n> zwei\nnormal text"), ["> eins", "> zwei", "> normal text"]);
+    assert_eq!(
+        show("> eins\n> zwei\nnormal text"),
+        ["> eins", "> zwei", "> normal text"]
+    );
 }
-
-

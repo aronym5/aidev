@@ -173,6 +173,13 @@ pub struct ContainerInfo {
     pub status: String,
     /// Tatsächlicher Mount-Destination-Pfad (z.B. "/usr/src/app")
     pub mount_destination: Option<String>,
+    /// Host-Pfad, auf den der Container gemountet ist – der Pfad, gegen den
+    /// geprüft wurde (also der angefragte, für `podman inspect` normalisiert).
+    /// Der Channel Builder braucht ihn als Identitätsnachweis: `container_info`
+    /// wird asynchron nachgeladen und kann zu einer früheren Cursor-Position
+    /// gehören; wiederverwendet wird ein Container deshalb nur, wenn er zu
+    /// genau der Auswahl gehört, die gerade bestätigt wird.
+    pub mount_path: PathBuf,
 }
 
 /// Sucht einen laufenden oder gestoppten Container, dessen Mount auf `mount_path`
@@ -257,6 +264,7 @@ pub fn find_container_for(mount_path: &Path, image: Option<&str>) -> Option<Cont
                 name: name.to_string(),
                 status: status.to_string(),
                 mount_destination: matched_destination,
+                mount_path: mount_path.to_path_buf(),
             });
         }
     }

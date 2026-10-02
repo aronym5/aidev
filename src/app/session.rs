@@ -666,26 +666,25 @@ impl Session {
             return;
         }
         self.chat.compact(boundary, content, tokens, log_path);
-        // Einmaliger Shift auf die überlebenden Events: alte Kontextlänge des
-        // letzten Events vor der Summary minus Summary-Länge. Dadurch zeigen die
-        // Survivors ihre alte (ggf. bestätigte) Kontextlänge im neuen
-        // Koordinatensystem. Mit einem einzigen gespeicherten `context_len`
-        // entfällt die Green/Grey-Unterscheidung hier komplett:
-        // `context_is_green` wird falsch (weicht von der bestätigten Zahl ab).
+        // Einmaliger Shift auf die überlebenden Events (alles NACH der Summary):
+        // alte Kontextlänge des letzten Events vor der Summary minus Summary-
+        // Länge. Dadurch zeigen die Survivors ihre alte (ggf. bestätigte)
+        // Kontextlänge im neuen Koordinatensystem. Mit einem einzigen
+        // gespeicherten `context_len` entfällt die Green/Grey-Unterscheidung
+        // hier komplett: `context_is_green` wird falsch (weicht von der
+        // bestätigten Zahl ab).
         let order = self.chat.order().to_vec();
-        if boundary >= 1 {
-            let base = self
-                .chat
-                .event(order[boundary - 1])
-                .and_then(|e| e.context_len)
-                .unwrap_or(0);
-            let shift = base.saturating_sub(tokens);
-            if shift > 0 {
-                for &eid in &order[boundary + 1..] {
-                    if let Some(ev) = self.chat.event_mut(eid) {
-                        if let Some(cl) = ev.context_len {
-                            ev.context_len = Some(cl.saturating_sub(shift));
-                        }
+        let base = self
+            .chat
+            .event(order[boundary - 1])
+            .and_then(|e| e.context_len)
+            .unwrap_or(0);
+        let shift = base.saturating_sub(tokens);
+        if shift > 0 {
+            for &eid in &order[boundary + 1..] {
+                if let Some(ev) = self.chat.event_mut(eid) {
+                    if let Some(cl) = ev.context_len {
+                        ev.context_len = Some(cl.saturating_sub(shift));
                     }
                 }
             }
@@ -826,12 +825,26 @@ pub(crate) fn prompt_tokens(s: &Session) -> u64 {
 }
 
 /// Kompaktierungs-Grenze: rückwärts durch `order` die letzten `keep` Turns
-/// (UserPrompt-Events) zählen; manuelle Tools zählen nicht. Liefert den
-/// `order`-Index, ab dem die Survivors beginnen (0 = nichts zu ersetzen).
+/// (UserPrompt-Events) zählen; manuelle Tools (`/run`, `parent_id == None`)
+/// zählen nicht – sie sind auch in der Wire-Projektion nicht vorhanden.
+///
+/// Semantik: `keep = k` ⇒ GENAU die letzten `k` Turns überleben, der Schnitt
+/// liegt auf dem `k`-letzten `UserPrompt` (`k = 0` wie im Wire-Pfad
+/// (`wire_compact_boundary`) als 1 behandelt: der laufende Turn bleibt immer
+/// stehen). Liefert den `order`-Index, ab dem die Survivors beginnen – also die
+/// Position, an der das `Archive`-Event einzufügen ist. Kommt die Grenze nicht
+/// zustande (weniger als `k` Turns), liefert sie 0: nichts zu ersetzen.
+///
+/// **Muss `wire_compact_boundary` auf der Wire-Seite exakt spiegeln** (`src/
+/// llm/compact.rs`): Der Kompaktierungs-Aufruf fasst `msgs[..wire_boundary]`
+/// zusammen und die Zusammenfassung wird an dieser Stelle eingebaut. Ein
+/// Versatz um einen Turn ließe einen bereits zusammengefassten Turn im
+/// Kontext stehen (er würde ungekürzt mitgesendet) – die Summary stünde dann
+/// einen Turn zu FRÜH.
 pub(crate) fn compact_boundary(s: &Session, keep: usize) -> usize {
     let order = s.chat.order();
+    let want = keep.max(1);
     let mut seen_turns = 0usize;
-    let mut boundary = order.len();
     for (i, id) in order.iter().enumerate().rev() {
         let manual = s
             .chat
@@ -843,21 +856,21 @@ pub(crate) fn compact_boundary(s: &Session, keep: usize) -> usize {
         if let Some(ev) = s.chat.event(*id) {
             if matches!(ev.kind, EventKind::UserPrompt { .. }) {
                 seen_turns += 1;
-                if seen_turns > keep {
-                    boundary = i;
-                    break;
+                if seen_turns == want {
+                    return i;
                 }
             }
         }
     }
-    boundary
+    // Weniger Turns als `keep`: nichts zu kompaktieren (der Wire-Pfad lehnt
+    // denselben Fall mit `boundary == 0` ab).
+    0
 }
 
 /// Entscheidet vor dem Senden, ob der Kontext komprimiert werden soll: Sobald
 /// die gespeicherte, kumulative Kontextlänge (`context_len` über `prompt_tokens`,
 /// bestätigt wo vorhanden, nach Kompaktierung verschoben) den Anteil
-/// `compact_at` des Kontextfensters erreicht UND genug alte Turns für eine
-/// Zusammenfassung existieren.
+/// `compact_at` des Kontextfensters erreicht.
 ///
 /// Bewusst `prompt_tokens` statt rohen `reported_usage.total_tokens`: Die
 /// überlebenden Events behalten nach einer Kompaktierung ihr (gegen die ALTE,
@@ -867,12 +880,16 @@ pub(crate) fn compact_boundary(s: &Session, keep: usize) -> usize {
 /// der echte Kontext klein ist.
 /// `prompt_tokens` folgt den verschobenen `context_len`-Ankern und misst damit
 /// den aktuellen Kontext.
+///
+/// Ob überhaupt etwas zu kompaktieren IST (≥ 2 Turns seit der letzten
+/// Kompaktierung), prüfen die Aufrufstellen über `llm::can_compact` auf der
+/// Wire-Projektion – dort liegt die Autorität (der Kompaktierungs-Aufruf fasst
+/// die Wire-Nachrichten zusammen); eine zweite Zählung auf der Session-Seite
+/// würde nur die Gefahr eines Versatzes wieder einführen.
 pub(crate) fn should_compact(
     s: &Session,
     cfg: &Config,
     ep: &crate::config::ResolvedEndpoint,
 ) -> bool {
-    let threshold = (ep.context_window as f64 * cfg.compact_at) as u64;
-    let reached = prompt_tokens(s) >= threshold;
-    reached && compact_boundary(s, cfg.compact_keep_turns) > 0
+    prompt_tokens(s) >= (ep.context_window as f64 * cfg.compact_at) as u64
 }

@@ -374,12 +374,6 @@ pub struct Config {
     /// Turn sofort wieder aus.
     #[serde(default = "default_compact_keep_ratio")]
     pub compact_keep_ratio: f64,
-    /// Anzahl der letzten Turns (User+Assistant), die bei der Kompaktierung
-    /// unangetastet bleiben – die Zusammenfassung ersetzt nur ältere
-    /// Nachrichten. Dient als Rückfall, wenn kein Schnitt sein Ziel erreicht
-    /// (reaktiv) bzw. als Vorprüfung, ob überhaupt etwas zu schneiden ist.
-    #[serde(default = "default_compact_keep_turns")]
-    pub compact_keep_turns: usize,
     /// Token-Budget (`max_tokens`) für die Zusammenfassung – Obergrenze,
     /// nicht Zielgröße.
     #[serde(default = "default_compact_summary_tokens")]
@@ -438,10 +432,6 @@ fn default_compact_keep_ratio() -> f64 {
     0.2
 }
 
-fn default_compact_keep_turns() -> usize {
-    3
-}
-
 fn default_compact_summary_tokens() -> u64 {
     4_000
 }
@@ -485,7 +475,6 @@ impl Default for Config {
             context_window: default_context_window(),
             compact_at: default_compact_at(),
             compact_keep_ratio: default_compact_keep_ratio(),
-            compact_keep_turns: default_compact_keep_turns(),
             compact_summary_tokens: default_compact_summary_tokens(),
             compact_auto: default_compact_auto(),
             mouse: false,
@@ -683,16 +672,10 @@ impl Config {
             } else {
                 self.compact_at
             },
-            compact_keep_ratio: if self.compact_keep_ratio <= 0.0 || self.compact_keep_ratio > 1.0
-            {
+            compact_keep_ratio: if self.compact_keep_ratio <= 0.0 || self.compact_keep_ratio > 1.0 {
                 d.compact_keep_ratio
             } else {
                 self.compact_keep_ratio
-            },
-            compact_keep_turns: if self.compact_keep_turns == 0 {
-                d.compact_keep_turns
-            } else {
-                self.compact_keep_turns
             },
             compact_summary_tokens: if self.compact_summary_tokens == 0 {
                 d.compact_summary_tokens
@@ -834,12 +817,11 @@ mod tests {
         assert_eq!(cfg.context_window, 200_000);
         assert!((cfg.compact_at - 0.8).abs() < 1e-9);
         assert!((cfg.compact_keep_ratio - 0.2).abs() < 1e-9);
-        assert_eq!(cfg.compact_keep_turns, 3);
         assert_eq!(cfg.compact_summary_tokens, 4_000);
         assert!(cfg.compact_auto);
 
         let nulldaten: Config =
-            toml::from_str("context_window = 0\ncompact_at = 2\ncompact_keep_ratio = 0\ncompact_keep_turns = 0\ncompact_summary_tokens = 0\ncompact_auto = false")
+            toml::from_str("context_window = 0\ncompact_at = 2\ncompact_keep_ratio = 0\ncompact_summary_tokens = 0\ncompact_auto = false")
                 .expect("TOML lesbar");
         let d = nulldaten.with_defaults();
         assert_eq!(d.context_window, 200_000, "0 -> Default");
@@ -847,22 +829,17 @@ mod tests {
             (d.compact_at - 0.8).abs() < 1e-9,
             "außerhalb (0,1] -> Default"
         );
-        assert!(
-            (d.compact_keep_ratio - 0.2).abs() < 1e-9,
-            "0 -> Default"
-        );
-        assert_eq!(d.compact_keep_turns, 3, "0 -> Default");
+        assert!((d.compact_keep_ratio - 0.2).abs() < 1e-9, "0 -> Default");
         assert_eq!(d.compact_summary_tokens, 4_000, "0 -> Default");
         assert!(!d.compact_auto, "false bleibt false (kein Default-Zwang)");
 
         let gesetzt: Config = toml::from_str(
-            "context_window = 32000\ncompact_at = 0.9\ncompact_keep_ratio = 0.15\ncompact_keep_turns = 5\ncompact_summary_tokens = 999\ncompact_auto = false",
+            "context_window = 32000\ncompact_at = 0.9\ncompact_keep_ratio = 0.15\ncompact_summary_tokens = 999\ncompact_auto = false",
         )
         .expect("TOML lesbar");
         assert_eq!(gesetzt.context_window, 32_000);
         assert!((gesetzt.compact_at - 0.9).abs() < 1e-9);
         assert!((gesetzt.compact_keep_ratio - 0.15).abs() < 1e-9);
-        assert_eq!(gesetzt.compact_keep_turns, 5);
         assert_eq!(gesetzt.compact_summary_tokens, 999);
         assert!(!gesetzt.compact_auto);
     }
@@ -1121,46 +1098,38 @@ mod tests {
     #[test]
     fn model_ids_brauchen_genau_ein_slash() {
         // Ohne '/' → ungültig.
-        assert!(
-            toml::from_str::<Config>(
-                r#"
+        assert!(toml::from_str::<Config>(
+            r#"
             [models]
             a = "nur-name"
         "#
-            )
-            .is_err()
-        );
+        )
+        .is_err());
 
         // Mehr als ein '/' → ungültig.
-        assert!(
-            toml::from_str::<Config>(
-                r#"
+        assert!(toml::from_str::<Config>(
+            r#"
             [models]
             a = "prov/name/x"
         "#
-            )
-            .is_err()
-        );
+        )
+        .is_err());
 
         // Leerer Provider oder leerer Name → ungültig.
-        assert!(
-            toml::from_str::<Config>(
-                r#"
+        assert!(toml::from_str::<Config>(
+            r#"
             [models]
             a = "/name"
         "#
-            )
-            .is_err()
-        );
-        assert!(
-            toml::from_str::<Config>(
-                r#"
+        )
+        .is_err());
+        assert!(toml::from_str::<Config>(
+            r#"
             [models]
             a = "prov/"
         "#
-            )
-            .is_err()
-        );
+        )
+        .is_err());
 
         // Genau ein '/' mit beiden Teilen → gültig (Kurz- und Langform).
         let cfg: Config = toml::from_str(
@@ -1225,7 +1194,10 @@ mod tests {
         assert!(cfg.resolve_default_alias().is_none());
         let ep = cfg.resolve(None).expect("resolve Default");
         assert_eq!(ep.api_model, "mod", "echter Servername");
-        assert_eq!(ep.context_window, 131072, "Einstellungen von prov/mod-Eintrag");
+        assert_eq!(
+            ep.context_window, 131072,
+            "Einstellungen von prov/mod-Eintrag"
+        );
         // Anzeigename über die ID ermittelt in der Registry (prov/smart).
     }
 
@@ -1335,7 +1307,10 @@ mod tests {
             user_agent: None,
             force_tools: vec!["glob".into()],
         };
-        assert_eq!(effective_force_tools(&custom, "zen"), vec!["glob".to_string()]);
+        assert_eq!(
+            effective_force_tools(&custom, "zen"),
+            vec!["glob".to_string()]
+        );
         // leerer/Value hat keinen Vorrang → fällt auf den Default zurück.
         assert_eq!(
             effective_force_tools(&zen, "zen"),
@@ -1376,7 +1351,10 @@ mod tests {
         )
         .expect("TOML lesbar");
         let ep = cfg.resolve(None).expect("resolve ollama");
-        assert!(ep.force_tools.is_empty(), "nicht-zen ohne force_tools bleibt leer");
+        assert!(
+            ep.force_tools.is_empty(),
+            "nicht-zen ohne force_tools bleibt leer"
+        );
     }
 
     #[test]
@@ -1428,7 +1406,11 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Systemuhr vor 1970")
             .as_nanos();
-        p.push(format!("aidev-test-{prefix}-{}-{}", std::process::id(), nanos));
+        p.push(format!(
+            "aidev-test-{prefix}-{}-{}",
+            std::process::id(),
+            nanos
+        ));
         p
     }
 
@@ -1436,10 +1418,7 @@ mod tests {
     /// Zustand danach wieder her. Nötig, weil `Candidate-Pfade` aus
     /// `XDG_CONFIG_HOME`/`HOME` gelesen werden – der Test erzeugt also
     /// temporäre Verzeichnisse und lenkt `Config::load*` dorthin.
-    fn with_env_vars(
-        vars: &[(&str, std::ffi::OsString)],
-        f: impl FnOnce(),
-    ) {
+    fn with_env_vars(vars: &[(&str, std::ffi::OsString)], f: impl FnOnce()) {
         let old: Vec<_> = vars
             .iter()
             .map(|(name, _)| (*name, std::env::var_os(name)))
@@ -1484,8 +1463,16 @@ mod tests {
         // Warnungen sind da, statt im Alt-Screen auf stderr zu landen.
         assert_eq!(warnings.len(), 2, "unlesbar + kein Quelle mehr");
         assert!(warnings[0].contains("unreadable"), "{}", warnings[0]);
-        assert!(warnings[0].contains("trying next source"), "{}", warnings[0]);
-        assert!(warnings[1].contains("Keine Config gefunden"), "{}", warnings[1]);
+        assert!(
+            warnings[0].contains("trying next source"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("Keine Config gefunden"),
+            "{}",
+            warnings[1]
+        );
 
         // (2) Gültige config.toml → keine Warnungen, Werte übernommen.
         let xdg_gueltig = unique_temp_dir("gueltig");
