@@ -2,7 +2,7 @@
 #
 # aidev — install the latest release binary
 #
-# Downloads the newest aidev release, installs it to ~/bin, and makes it
+# Downloads the newest aidev release, installs it to ~/.local/bin, and makes it
 # available on your PATH (persistently via ~/.<shell>rc when needed).
 #
 # Written in POSIX sh so it runs on minimal systems without bash.
@@ -12,7 +12,7 @@ set -eu
 APP="aidev"
 OWNER="aronym5"
 REPO="aidev"
-BIN_DIR="${AIDEV_BIN_DIR:-$HOME/bin}"
+BIN_DIR="${AIDEV_BIN_DIR:-$HOME/.local/bin}"
 SHELLRC="${AIDEV_RC:-}"
 
 # --- Pick a suitable shell rc file for persistent PATH -----------------
