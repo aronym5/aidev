@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::llm::{CompletionParts, RoundMetrics, Usage, WireMessage};
 use crate::perm::Permission;
 
-use crate::llm::{estimate_tokens, WireFunction, WireTokens, WireToolCall};
+use crate::llm::{estimate_tokens, distribute_weights, WireFunction, WireTokens, WireToolCall};
 
 // ── Identität ─────────────────────────────────────────────────────────────
 
@@ -121,12 +121,7 @@ impl Chat {
                 tool_event_ids: Vec::new(),
                 num_tokens_reasoning: 0,
                 num_tokens_text: 0,
-                reported_usage: Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    cached_tokens: None,
-                },
+                reported_usage: Usage::default(),
                 completion_parts: None,
                 metrics: None,
             },
@@ -239,9 +234,10 @@ impl Chat {
         }
     }
 
-    /// Schließt ein OFFENES Tool-Event ab (Zeitstempel + endgültiger Inhalt –
-    /// der bereits via `append_tool_output` gesammelte Output wird belassen).
-    pub fn finish_tool(&mut self, id: EventId, time_end: Instant) {
+    /// Schließt ein OFFENES Event (Tool wie Assistant): setzt nur `time_end`.
+    /// Für Assistant-Runden markiert das das Ende des Streamings – die
+    /// Tool-Phase ihrer Runde läuft dann mit bereits geschlossener Runde.
+    pub fn close_event(&mut self, id: EventId, time_end: Instant) {
         if let Some(ev) = self.events.get_mut(&id) {
             if ev.time_end.is_none() {
                 ev.time_end = Some(time_end);
@@ -286,9 +282,12 @@ impl Chat {
         }
     }
 
-    /// Schließt ein OFFENES Assistant-Event ab: setzt `time_end` und die
-    /// abgeleiteten Token-Werte bzw. die Server-bestätigte Usage. Bei
-    /// `aborted` wird zusätzlich ein `Abort`-Event direkt danach eingefügt.
+    /// Schließt eine Assistant-Runde ab: setzt `time_end` und die abgeleiteten
+    /// Token-Werte bzw. die Server-bestätigte Usage. Bei `aborted` wird
+    /// zusätzlich ein `Abort`-Event direkt danach eingefügt. Der Aufrufer
+    /// (`Session::finish_assistant`) stellt sicher, dass jede Runde genau
+    /// einmal hier ankommt; die zuvor eventuell schon gesetzte `time_end`
+    /// (Streaming-Ende → Tool-Phase) bleibt dabei ohne Belang.
     pub fn finalize_assistant(
         &mut self,
         id: EventId,
@@ -298,39 +297,30 @@ impl Chat {
         num_tokens_text: u64,
         aborted: bool,
     ) {
-        let closed = if let Some(ev) = self.events.get_mut(&id) {
-            if ev.time_end.is_none() {
-                ev.time_end = Some(time_end);
-                if let EventKind::Assistant {
-                    num_tokens_reasoning: nr,
-                    num_tokens_text: nt,
-                    reported_usage: ru,
-                    ..
-                } = &mut ev.kind
-                {
-                    *nr = num_tokens_reasoning;
-                    *nt = num_tokens_text;
-                    *ru = reported_usage;
-                }
-                true
-            } else {
-                false
+        if let Some(ev) = self.events.get_mut(&id) {
+            ev.time_end = Some(time_end);
+            if let EventKind::Assistant {
+                num_tokens_reasoning: nr,
+                num_tokens_text: nt,
+                reported_usage: ru,
+                ..
+            } = &mut ev.kind
+            {
+                *nr = num_tokens_reasoning;
+                *nt = num_tokens_text;
+                *ru = reported_usage;
             }
-        } else {
-            false
-        };
-        if closed && aborted {
+        }
+        if aborted {
             push_control(self, EventKind::Abort, time_end);
         }
         // context_len des abgeschlossenen Turns begleichen (idempotent; läuft
         // sonst auch über `finish_assistant`): ab dem zugehörigen User-Prompt.
-        if closed {
-            let parent = self.events.get(&id).and_then(|e| e.parent_id);
-            let start = parent
-                .and_then(|pid| self.order.iter().position(|&i| i == pid))
-                .unwrap_or(0);
-            self.settle_context_tail(start);
-        }
+        let parent = self.events.get(&id).and_then(|e| e.parent_id);
+        let start = parent
+            .and_then(|pid| self.order.iter().position(|&i| i == pid))
+            .unwrap_or(0);
+        self.settle_context_tail(start);
     }
 
     /// Schreibt die beim Streaming gemessenen Completion-Token je Bereich auf
@@ -365,15 +355,8 @@ impl Chat {
     /// mehr: die Projektion `api_messages` startet bei der letzten Summary und
     /// reduziert so das Kontextfenster, ohne Inhalte zu löschen. Die
     /// `previous_id`-Verkettung wird auf die Summary umgebogen (primär bleibt
-    /// aber `Chat.order`). `log_path` hängt das Kompaktierungs-Protokoll ans
-    /// `Archive`-Event (nur Anzeige, kein LLM-Inhalt).
-    pub fn compact(
-        &mut self,
-        boundary: usize,
-        summary: String,
-        num_tokens: u64,
-        log_path: Option<String>,
-    ) {
+    /// aber `Chat.order`).
+    pub fn compact(&mut self, boundary: usize, summary: String, num_tokens: u64) {
         let id = self.next_id;
         self.next_id += 1;
         // Vorgänger der Summary = letzter abgedeckter Nachricht; der bisherige
@@ -398,7 +381,6 @@ impl Chat {
                 summary,
                 num_tokens,
                 archived_events: boundary,
-                log_path,
             },
             // Die Summary ist der neue Projektions-Anker: ihre eigene Länge.
             context_len: Some(num_tokens),
@@ -548,14 +530,8 @@ impl Chat {
             // completion_tokens der Runde → reasoning, text, tool_calls.
             let mut weights: Vec<u64> = vec![reasoning.len() as u64, text.len() as u64];
             weights.extend(tools.iter().map(|&t| call_len(self, t)));
-            let total_w: u64 = weights.iter().sum();
-            let shares: Vec<u64> = if completion > 0 && total_w > 0 {
-                let mut s: Vec<u64> = weights.iter().map(|w| completion * w / total_w).collect();
-                let used: u64 = s.iter().sum();
-                if let Some(i) = weights.iter().rposition(|w| *w > 0) {
-                    s[i] += completion - used;
-                }
-                s
+            let shares: Vec<u64> = if completion > 0 && weights.iter().any(|&w| w > 0) {
+                distribute_weights(completion, &weights)
             } else {
                 // Kein Usage → Schätzung je Bestandteil.
                 vec![estimate_tokens(reasoning), estimate_tokens(text)]
@@ -595,14 +571,8 @@ impl Chat {
                     let used = p.reasoning + p.content;
                     let rem = completion.saturating_sub(used);
                     let tool_w: Vec<u64> = tools.iter().map(|&t| call_len(self, t)).collect();
-                    let sum_w: u64 = tool_w.iter().sum();
-                    let ti: Vec<u64> = if rem > 0 && sum_w > 0 {
-                        let mut s: Vec<u64> = tool_w.iter().map(|w| rem * w / sum_w).collect();
-                        let used_w: u64 = s.iter().sum();
-                        if let Some(i) = tool_w.iter().rposition(|w| *w > 0) {
-                            s[i] += rem - used_w;
-                        }
-                        s
+                    let ti: Vec<u64> = if rem > 0 {
+                        distribute_weights(rem, &tool_w)
                     } else {
                         vec![0; tools.len()]
                     };
@@ -625,14 +595,8 @@ impl Chat {
                 _ => 0,
             };
             let out_len: Vec<u64> = tools.iter().map(|&t| output_len(self, t)).collect();
-            let total_out: u64 = out_len.iter().sum();
-            let out_share: Vec<u64> = if delta > 0 && total_out > 0 {
-                let mut s: Vec<u64> = out_len.iter().map(|w| delta * w / total_out).collect();
-                let used: u64 = s.iter().sum();
-                if let Some(i) = out_len.iter().rposition(|w| *w > 0) {
-                    s[i] += delta - used;
-                }
-                s
+            let out_share: Vec<u64> = if delta > 0 && out_len.iter().any(|&w| w > 0) {
+                distribute_weights(delta, &out_len)
             } else {
                 tools.iter().map(|&t| output_estimate(self, t)).collect()
             };
@@ -996,13 +960,11 @@ pub enum EventKind {
     /// Markiert einen abgebrochenen Turn (Anzeige "abgebrochen", Fußzeile).
     Abort,
     /// Ergebnis der Kompaktierung. `num_tokens` ist die Token-Zahl der Summary
-    /// (aus dem Kompaktierungs-Aufruf abgeleitet; Fallback: Zeichen-Schätzung),
-    /// `log_path` der Pfad des Kompaktierungs-Protokolls (falls geschrieben).
+    /// (aus dem Kompaktierungs-Aufruf abgeleitet; Fallback: Zeichen-Schätzung).
     Archive {
         summary: String,
         num_tokens: u64,
         archived_events: usize,
-        log_path: Option<String>,
     },
 }
 
@@ -1137,7 +1099,7 @@ pub fn api_messages(chat: &Chat) -> Vec<WireMessage> {
                                     arguments: arguments.clone(),
                                 },
                             },
-                            _ => unreachable!("tool_event_id verweist nicht auf ein Tool"),
+                            _ => unreachable!("tool_event_id does not reference a tool"),
                         })
                         .collect();
                     out.push(assistant_tokens(
@@ -1279,7 +1241,7 @@ mod tests {
             Instant::now(),
         );
         let aid = chat.open_assistant(None, String::new(), "hi".into(), Instant::now());
-        chat.finalize_assistant(aid, Instant::now(), zero(), 0, 0, false);
+        chat.finalize_assistant(aid, Instant::now(), Usage::default(), 0, 0, false);
 
         assert_eq!(
             api_messages(&chat),
@@ -1337,7 +1299,7 @@ mod tests {
             Instant::now(),
         );
         chat.set_tool_tokens(tid, 10, 123); // 10 = Aufruf, 123 = bestätigte Ausgabe
-        chat.finalize_assistant(aid, Instant::now(), zero(), 15, 22, false); // 15+22 Text/Reasoning
+        chat.finalize_assistant(aid, Instant::now(), Usage::default(), 15, 22, false); // 15+22 Text/Reasoning
 
         let msgs = api_messages(&chat);
         assert_eq!(msgs[0].tokens.content, 37, "user übernimmt num_tokens");
@@ -1379,7 +1341,7 @@ mod tests {
             },
             Instant::now(),
         );
-        chat.finalize_assistant(aid, Instant::now(), zero(), 0, 0, false);
+        chat.finalize_assistant(aid, Instant::now(), Usage::default(), 0, 0, false);
 
         let msgs = api_messages(&chat);
         assert_eq!(
@@ -1407,12 +1369,7 @@ mod tests {
         let a = chat.push_user_prompt("a".into(), Permission::Read, "m".into(), 0, Instant::now());
         let b = chat.push_user_prompt("b".into(), Permission::Read, "m".into(), 0, Instant::now());
         let c = chat.push_user_prompt("c".into(), Permission::Read, "m".into(), 0, Instant::now());
-        chat.compact(
-            2,
-            "[Compressed history - 2 earlier messages]\n\nalt".into(),
-            42,
-            Some("/tmp/kompaktierung".into()),
-        );
+        chat.compact(2, "[Compressed history - 2 earlier messages]\n\nalt".into(), 42);
         // Altbestand bleibt erhalten, Summary sitzt genau an der boundary:
         // a, b, Archive, c.
         assert_eq!(chat.order().len(), 4);
@@ -1444,17 +1401,6 @@ mod tests {
             Some("[Compressed history - 2 earlier messages]\n\nalt")
         );
         assert_eq!(wire[1].content.as_deref(), Some("c"));
-        // Der Protokollpfad hängt als reiner Anzeige-Zusatz am Archive-Event
-        // (geht NICHT in die API-Projektion).
-        assert_eq!(
-            chat.event(sum_id)
-                .and_then(|e| match &e.kind {
-                    EventKind::Archive { log_path, .. } => log_path.clone(),
-                    _ => None,
-                })
-                .as_deref(),
-            Some("/tmp/kompaktierung")
-        );
     }
 
     #[test]
@@ -1742,7 +1688,7 @@ mod tests {
             0,
             Instant::now(),
         );
-        chat.finalize_assistant(a, Instant::now(), zero(), 0, 0, false);
+        chat.finalize_assistant(a, Instant::now(), Usage::default(), 0, 0, false);
         let b = chat.open_assistant(Some(uid), String::new(), "fertig".into(), Instant::now());
         chat.finalize_assistant(
             b,
@@ -1784,15 +1730,6 @@ mod tests {
             tool_calls,
             tool_call_id,
             tokens,
-        }
-    }
-
-    fn zero() -> Usage {
-        Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            cached_tokens: None,
         }
     }
 }

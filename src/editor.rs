@@ -310,7 +310,7 @@ impl Editor {
                 return (r, c.saturating_sub(range.start));
             }
         }
-        let last = layout.ranges.last().expect("mindestens eine Zeile");
+        let last = layout.ranges.last().expect("at least one line");
         (layout.ranges.len() - 1, c.saturating_sub(last.start))
     }
 

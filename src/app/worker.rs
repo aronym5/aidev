@@ -12,14 +12,8 @@ impl App {
                 WorkerEvent::Chunk(id, chunk) => {
                     if let Some(s) = self.session_mut(id) {
                         s.retrying = None;
-                        // Beginnt eine NEUE Runde (finale Antwort nach einer
-                        // Tool-Runde), wird die abgeschlossene Tool-Runde zuerst
-                        // geschlossen – sonst hingen ihre Tokens/Runden falsch.
-                        if s.is_open_tool_round_done() {
-                            s.finish_assistant(false, None);
-                        }
-                        // Erste Text-Runde des Turns (oder nach einer Tool-Runde)
-                        // braucht ein offenes Assistant-Ziel.
+                        // Erste Text-Runde des Turns (oder eine Folge-Runde nach
+                        // einem Tool) braucht ein offenes Assistant-Ziel.
                         s.ensure_open_assistant();
                         s.append_text(&chunk);
                     }
@@ -27,23 +21,14 @@ impl App {
                 WorkerEvent::Reasoning(id, reasoning) => {
                     if let Some(s) = self.session_mut(id) {
                         s.retrying = None;
-                        if s.is_open_tool_round_done() {
-                            s.finish_assistant(false, None);
-                        }
                         s.ensure_open_assistant();
                         s.append_reasoning(&reasoning);
                     }
                 }
                 WorkerEvent::Usage(id, usage, parts) => {
                     if let Some(s) = self.session_mut(id) {
-                        // Beginnt nach einer abgeschlossenen Tool-Runde eine
-                        // neue (z. B. Tool-Runde ohne Text/Reasoning), schließt
-                        // das usage-EVENT die VORIGE Runde – deren
-                        // `pending_usage`/`pending_parts` sind an dieser Stelle
-                        // noch aktuell und werden erst danach überschrieben.
-                        if s.is_open_tool_round_done() {
-                            s.finish_assistant(false, None);
-                        }
+                        // Usage/parts der gerade gestreamten Runde parken; sie
+                        // werden beim Abschluss der Runde ans Event geschrieben.
                         s.pending_usage = Some(usage);
                         s.pending_parts = Some(parts);
                         // Der abgeschlossene Usage-Wert steht für die Statusleiste
@@ -108,15 +93,13 @@ impl App {
                     if let Some(s) = self.session_mut(session) {
                         s.retrying = None;
                         // Manuelles `/run` (Sentinel `tool_call_id == "user_run"`)
-                        // bleibt im neuen Event-Layout parent-los – es gehört
-                        // KEINEM Turn an und braucht keine Assistant-Sub-Runde
-                        // (die frühere Phantom-Runde entfällt). LLM-Tools hängen
-                        // als Kinder der (ggf. neu geöffneten) Sub-Runde.
+                        // bleibt parent-los – es gehört KEINEM Turn an. LLM-Tools
+                        // hängen als Kinder der Runde, deren Streaming soeben
+                        // endete (`tool_parent` schließt sie dabei).
                         let parent = if tool_call_id == "user_run" {
                             None
                         } else {
-                            s.ensure_open_assistant();
-                            s.open_assistant_id
+                            s.tool_parent()
                         };
                         // Platzhalter-Kind aus Name + Argumenten (noch ohne
                         // Ergebnisdaten); `ToolEnd` setzt über
@@ -167,12 +150,9 @@ impl App {
                     // `pending_usage` gehört genau zu dieser Runde. Sofort
                     // abschließen, damit `reported_usage` schon während der
                     // Folge-Anfrage auf dem Event steht – statt erst beim
-                    // ersten Chunk danach. Ohne offene Tool-Runde ein No-Op
-                    // (idempotent, z. B. nach Cancel/Error doppelt).
+                    // ersten Chunk danach. Ohne laufende Runde ein No-Op.
                     if let Some(s) = self.session_mut(id) {
-                        if s.is_open_tool_round_done() {
-                            s.finish_assistant(false, None);
-                        }
+                        s.finish_assistant(false, None);
                     }
                 }
                 WorkerEvent::ExecConfirm(id, label, command, reply) => {
@@ -233,10 +213,8 @@ impl App {
                 WorkerEvent::Error(id, err) => {
                     if let Some(s) = self.session_mut(id) {
                         // Offenen (angefangenen) Turn-Zustand abschließen, falls
-                        // schon Inhalte geflossen sind.
-                        if s.open_assistant_id.is_some() {
-                            s.finish_assistant(false, None);
-                        }
+                        // schon Inhalte geflossen sind (sonst No-Op).
+                        s.finish_assistant(false, None);
                         s.compacting = false;
                         s.retrying = None;
                         // Kurzfassung (einzeilig) und – falls der Worker ein
@@ -258,9 +236,9 @@ impl App {
                         s.compacting = true;
                     }
                 }
-                WorkerEvent::Compacted(id, content, tokens, keep, log_path) => {
+                WorkerEvent::Compacted(id, content, tokens, keep) => {
                     if let Some(s) = self.session_mut(id) {
-                        s.apply_compaction(content, tokens, keep, log_path);
+                        s.apply_compaction(content, tokens, keep);
                     }
                 }
                 WorkerEvent::BuilderLoaded(images_with_wd, container_info, worktrees) => {
@@ -303,14 +281,10 @@ impl App {
                         self.update_builder_container();
                     }
                 }
-                WorkerEvent::ModelProbe {
-                    model,
-                    protocol,
-                    ok,
-                } => {
+                WorkerEvent::ModelProbe { model, shape, ok } => {
                     // Probe-Ergebnis eines Modell-Tests verbuchen – treibt den
                     // grün/gelb/rot-Status im Modell-Picker.
-                    self.model_registry.record_probe(&model, protocol, ok);
+                    self.model_registry.record_probe(&model, shape, ok);
                 }
                 WorkerEvent::ModelsRefreshed(fetched_ids_vec) => {
                     // Registry aktualisieren (Status setzen/Deduplizierung).
@@ -332,11 +306,10 @@ impl App {
 
                     if added > 0 {
                         let s = self.active_mut();
-                        s.error = Some(format!(
+                        s.set_error(format!(
                             "Refreshed: {added} new model{} found.",
                             if added == 1 { "" } else { "s" }
                         ));
-                        s.error_debug = None;
                     }
                 }
             }
@@ -364,16 +337,12 @@ impl App {
             Ok(ep) => ep,
             Err(_) => return, // ohne Endpunkt keine automatische Kompaktierung
         };
-        let (current, messages, cancel) = {
+        let (messages, cancel) = {
             let s = &self.sessions[idx];
             if s.compacting || !should_compact(s, &cfg, &ep) {
                 return;
             }
-            (
-                prompt_tokens(s),
-                crate::chat::api_messages(&s.chat),
-                s.cancel.clone(),
-            )
+            (crate::chat::api_messages(&s.chat), s.cancel.clone())
         };
         // Kein echter Schnitt möglich? (z. B. Konversation besteht nur aus dem
         // einen Query, oder unmittelbar vor dem letzten Query wurde bereits
@@ -394,7 +363,6 @@ impl App {
             messages,
             cancel,
             llm::CompactTrigger::AutoTurn,
-            Some(current),
         );
     }
 }

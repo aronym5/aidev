@@ -11,7 +11,7 @@ fn truncate_output_haelt_das_ende_und_schneidet_ganze_zeilen_vorne() {
     let lang: String = (1..=8000).map(|i| format!("zeile {i}\n")).collect();
     assert!(lang.chars().count() > 64 * 1024, "Eingabe über dem Limit");
     let out = run::truncate_output(&lang);
-    assert!(out.starts_with("…\n[vorne gekürzt]\n"), "Markierung: {out}");
+    assert!(out.starts_with("…\n[truncated at the front]\n"), "marker: {out}");
     assert!(out.ends_with("zeile 8000"), "letzte Zeile bleibt: {out}");
     assert!(!out.contains("zeile 1"), "vorne wird abgeschnitten: {out}");
     assert!(
@@ -352,6 +352,7 @@ fn managed_worktree_gesetzt_wenn_worktree_gebunden() {
         name: "aidev-feature".into(),
         branch: "feature".into(),
         path: PathBuf::from("/tmp/x/.aidev/worktrees/aidev-feature"),
+        notice: None,
     };
     let cfg = ChannelConfig {
         kind: "local".into(),

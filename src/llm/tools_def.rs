@@ -194,16 +194,14 @@ pub(crate) fn apply_tool_delta(accs: &mut Vec<ToolCallAcc>, delta: &Value) {
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
             .unwrap_or(0);
-        let slot = match accs.iter_mut().find(|a| a.index == index) {
-            Some(s) => s,
+        let slot = match accs.iter().position(|a| a.index == index) {
+            Some(i) => &mut accs[i],
             None => {
                 accs.push(ToolCallAcc {
                     index,
                     ..ToolCallAcc::default()
                 });
-                accs.iter_mut()
-                    .find(|a| a.index == index)
-                    .expect("just inserted")
+                accs.last_mut().expect("just inserted")
             }
         };
         if let Some(id) = d.get("id").and_then(|v| v.as_str()) {

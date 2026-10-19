@@ -704,7 +704,7 @@ fn compact_boundary_liefert_position_des_k_letzten_userprompts() {
             s.push_user_message(format!("frage {i}"), Some(Permission::Read), "m".into());
             let aid = s.open_assistant(String::new(), format!("antwort {i}"));
             s.chat
-                .finalize_assistant(aid, std::time::Instant::now(), zero_usage(), 0, 0, false);
+                .finalize_assistant(aid, std::time::Instant::now(), llm::Usage::default(), 0, 0, false);
         }
     }
     let s = &a.sessions[0];
@@ -776,7 +776,6 @@ fn apply_compaction_setzt_summary_an_die_vom_wire_gewaehlte_grenze() {
             "[Compressed history - 5 earlier messages]\n\nzusammenfassung".into(),
             SUMMARY_TOKENS,
             keep,
-            None,
         );
 
         // (1) Der `Archive`-Event sitzt an der gewählten Stelle. Hier ist der
@@ -858,20 +857,19 @@ fn prompt_tokens_nach_compaction_zählt_nur_aktuellen_kontext() {
     s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
     let a1 = s.open_assistant("gedanken alt".into(), "antwort alt".into());
     s.chat
-        .finalize_assistant(a1, std::time::Instant::now(), zero_usage(), 0, 0, false);
+        .finalize_assistant(a1, std::time::Instant::now(), llm::Usage::default(), 0, 0, false);
     // Summary mit exakter (vom Compaction-Aufruf gelieferter) Token-Zahl.
     let summary_tokens = 5;
     s.chat.compact(
         2,
         "[Compressed history - 1 earlier messages]\n\nzusammenfassung".into(),
         summary_tokens,
-        None,
     );
     // Neuer Turn NACH der Summary.
     s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
     let a2 = s.open_assistant("gedanken neu".into(), "antwort neu".into());
     s.chat
-        .finalize_assistant(a2, std::time::Instant::now(), zero_usage(), 0, 0, false);
+        .finalize_assistant(a2, std::time::Instant::now(), llm::Usage::default(), 0, 0, false);
 
     let got = super::prompt_tokens(&s);
     // Nur Kontext ab der letzten Summary: exakte Summary-Tokens + Heuristik
@@ -938,7 +936,7 @@ fn should_compact_verwendet_nach_compaction_nicht_altes_usage() {
     );
 
     // Kompaktierung (via Session): Turn 1 wird archiviert, Turn 2 überlebt.
-    s.apply_compaction("zusammenfassung".into(), 1_000, 0, None);
+    s.apply_compaction("zusammenfassung".into(), 1_000, 0);
 
     // UNMITTELBAR danach: Der echte aktuelle Kontext ist klein (Summary + Survivor-Shift)
     // → KEINE weitere Kompaktierung nötig, auch wenn das rohe `reported_usage`
@@ -980,7 +978,7 @@ fn last_usage_current_verwirft_usage_vor_der_compaction() {
     );
     // Compaction: Archive NACH dem alten Turn einfügen – dessen Usage ist
     // jetzt veraltet (stammt aus der größeren Historie).
-    s.chat.compact(2, "zusammenfassung".into(), 5, None);
+    s.chat.compact(2, "zusammenfassung".into(), 5);
     assert!(
         s.last_usage_current().is_none(),
         "Usage vor dem Archive wird verworfen"
@@ -1040,15 +1038,10 @@ fn done_startet_auto_kompaktierung_nach_finaler_antwort() {
         // die Projektion überhaupt einen Schnitt zulässt (≥ 3 user).
         for i in 0..5 {
             s.push_user_message(format!("frage {i}"), Some(Permission::Read), "m".into());
-            let aid = s.open_assistant(format!("g{i}"), format!("a{i}"));
-            s.chat.finalize_assistant(
-                aid,
-                std::time::Instant::now(),
-                usage(90_000 + 15_000 * i, 10_000),
-                0,
-                0,
-                false,
-            );
+            s.open_assistant(format!("g{i}"), format!("a{i}"));
+            // Über die Session-API abschließen (setzt den Turn-Status korrekt
+            // zurück, statt ein offenes Ziel stehen zu lassen).
+            s.finish_assistant(false, Some(usage(90_000 + 15_000 * i, 10_000)));
         }
         assert!(
             should_compact(s, &cfg, &ep),
@@ -1100,15 +1093,6 @@ fn done_unter_schwelle_startet_keine_auto_kompaktierung() {
         !s.compacting,
         "unter der Schwelle startet Done keine Auto-Kompaktierung"
     );
-}
-
-fn zero_usage() -> llm::Usage {
-    llm::Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cached_tokens: None,
-    }
 }
 
 /// Nach einem Abbruch (letzte Runde mit Null-Usage geschlossen) darf der
@@ -1259,6 +1243,59 @@ fn alt_h_oeffnet_http_header_dialog_und_esc_schliesst_ihn() {
     );
     a.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(!a.http_headers_dialog, "Esc schließt den Header-Dialog");
+}
+
+// ── Backspace-Kodierung: DEL (0x7F) und BS (^H = 0x08) ──────────────────────
+
+#[test]
+fn backspace_als_ctrl_h_loescht_statt_h_einzufuegen() {
+    // Terminals wie MobaXterm senden für Backspace BS (`0x08` = `^H`).
+    // crossterm bildet das auf `Char('h')` + CONTROL ab (C0-Bereich); ohne
+    // Umdrehung in `normalize_key` landet ein „h“ im Eingabefeld.
+    let mut a = app();
+    a.sessions[0].editor.set_text("abc");
+    a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    assert_eq!(
+        a.sessions[0].editor.text_string(),
+        "ab",
+        "kein „h“ eingefügt"
+    );
+
+    // DEL (`0x7F`) – die Standardkodierung – wirkt unverändert.
+    a.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(a.sessions[0].editor.text_string(), "a");
+}
+
+#[test]
+fn alt_h_wird_nicht_als_backspace_umgedeutet() {
+    // Nur `Ctrl+H` ist BS – `Alt+H` bleibt der HTTP-Header-Dialog.
+    let mut a = app();
+    a.sessions[0].editor.set_text("abc");
+    a.handle_key(alt_h());
+    assert!(
+        a.http_headers_dialog,
+        "Alt+H öffnet weiter den Header-Dialog"
+    );
+    assert_eq!(a.sessions[0].editor.text_string(), "abc", "nichts gelöscht");
+}
+
+#[test]
+fn ctrl_h_loescht_auch_in_der_builder_pfadeingabe() {
+    // Die Umsetzung greift zentral in `handle_key`, also auch in den
+    // Eingabefeldern der Dialoge (hier: Pfad-Eingabe des Channel Builders).
+    let mut a = app();
+    a.channel_builder = Some(builder_state());
+    a.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)); // Pfad-Eingabe
+    if let Some(BuilderEdit::HostPath(ed)) = &mut a.channel_builder.as_mut().unwrap().edit {
+        ed.set_text("abc");
+    }
+    a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+    match &a.channel_builder.as_ref().unwrap().edit {
+        Some(BuilderEdit::HostPath(ed)) => {
+            assert_eq!(ed.text_string(), "ab", "BS löscht im Pfadfeld");
+        }
+        _ => panic!("erwarte Pfad-Eingabefeld"),
+    }
 }
 
 // ── Options-Dialog (Ctrl+O) auf Basis der ListNav-Abstraktion ───────────────
@@ -1785,7 +1822,7 @@ fn builder_state_with_repo() -> ChannelBuilderState {
                 has_worktree: true,
             },
             crate::channel::builder::WorktreeEntry {
-                label: "feat (Kein Worktree)".into(),
+                label: "feat (No worktree)".into(),
                 path: "".into(),
                 branch: "feat".into(),
                 is_main: false,
@@ -2052,7 +2089,7 @@ fn reload_liefert_neue_config_und_baut_registries_um() {
     assert_eq!(a.channels.default_channel_name(), Some("testchannel"));
     assert_eq!(
         a.sessions[0].error.as_deref(),
-        Some("Config neu geladen."),
+        Some("Config reloaded."),
         "Statusmeldung gesetzt"
     );
 }
@@ -2071,7 +2108,7 @@ fn model_probe_event_aktualisiert_registry_status_gelb_dann_rot() {
     // Erste Fehlermeldung (Chat Completions) → gelb.
     a.tx.send(llm::WorkerEvent::ModelProbe {
         model: key.into(),
-        protocol: llm::ApiProtocol::ChatCompletions,
+        shape: llm::ApiShape::ChatCompletions,
         ok: false,
     })
     .unwrap();
@@ -2085,7 +2122,7 @@ fn model_probe_event_aktualisiert_registry_status_gelb_dann_rot() {
     // Fehler, war bereits gelb → rot.
     a.tx.send(llm::WorkerEvent::ModelProbe {
         model: key.into(),
-        protocol: llm::ApiProtocol::Responses,
+        shape: llm::ApiShape::Responses,
         ok: false,
     })
     .unwrap();
@@ -2104,7 +2141,7 @@ fn model_probe_event_korrekte_antwort_gibt_gruen() {
 
     a.tx.send(llm::WorkerEvent::ModelProbe {
         model: key.into(),
-        protocol: llm::ApiProtocol::ChatCompletions,
+        shape: llm::ApiShape::ChatCompletions,
         ok: true,
     })
     .unwrap();
@@ -2120,7 +2157,7 @@ fn model_probe_event_korrekte_antwort_gibt_gruen() {
 
 #[test]
 fn builder_probe_path_fragt_nur_bei_vorhandenem_worktree_ab() {
-    // Repo, Cursor auf „feat (Kein Worktree)“: Es gibt noch gar keinen Pfad,
+    // Repo, Cursor auf „feat (No worktree)“: Es gibt noch gar keinen Pfad,
     // auf dem ein Container mounten könnte. Der frühere Fallback auf den
     // Host-Pfad lieferte den Container des Haupt-Checkouts – und damit beim
     // Bestätigen den Kanal des falschen Branchs.

@@ -476,7 +476,7 @@ pub fn git_list_worktrees_and_branches(repo: &Path) -> Vec<WorktreeEntry> {
                 continue;
             }
             entries.push(WorktreeEntry {
-                label: format!("{} (Kein Worktree)", branch),
+                label: format!("{} (No worktree)", branch),
                 path: PathBuf::new(),
                 branch: branch.clone(),
                 is_main: false,

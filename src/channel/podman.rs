@@ -139,7 +139,7 @@ pub(super) fn podman_from_config(
             shell: Mutex::new(None),
         }
     } else {
-        return Err("Podman-Kanal braucht image (run) oder container (attach)".into());
+        return Err("Podman channel needs image (run) or container (attach)".into());
     };
     if let Some(wt) = worktree {
         // Ein übergebener Worktree wurde von aidev angelegt (Picker-Branch ohne
@@ -184,7 +184,7 @@ fn image_default_uid_gid(image: &str) -> Result<(u32, u32), String> {
     }
     parse_uid_gid_fields(&st.stdout).ok_or_else(|| {
         format!(
-            "keine uid=/gid= in der Ausgabe von \"{image} id\": {}",
+            "no uid=/gid= in the output of \"{image} id\": {}",
             st.stdout.trim()
         )
     })
@@ -626,7 +626,7 @@ impl Channel for PodmanChannel {
     fn dup(&self) -> Result<Arc<dyn Channel>, String> {
         match self.mode {
             PodmanMode::Attach => {
-                Err("Dieser Kanal ist geteilt und kann nicht dupliziert werden.".to_string())
+                Err("This channel is shared and cannot be duplicated.".to_string())
             }
             PodmanMode::Run => {
                 let host = self
@@ -683,6 +683,9 @@ impl Channel for PodmanChannel {
                         name: branch.clone(),
                         branch: branch.clone(),
                         path: worktree,
+                        // Bereits vorhandener Worktree (Alt+D) – kein
+                        // frisches Anlegen, also kein Hinweis.
+                        notice: None,
                     }),
                     seq: AtomicUsize::new(1),
                     status: Arc::new(Mutex::new(ChannelStatus::Unknown)),

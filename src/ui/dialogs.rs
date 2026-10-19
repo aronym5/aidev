@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, BuilderEdit, ChannelPick, ListNav, ModelPick, Phase, Session};
 use crate::channel::{ChannelRegistry, ChannelStatus};
@@ -130,6 +131,166 @@ pub(crate) fn draw_list_overlay<T>(
 /// Anzeige-Breite einer (bereits gebauten) Zeile in Zeichen.
 fn line_width(line: &Line<'_>) -> usize {
     line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Unterhalb dieser Breite wird das Channel-Builder-Overlay auf die volle
+/// Fensterbreite verbreitert: Fielen 90 % der Fensterbreite darunter, wären die
+/// drei Spalten zu schmal.
+pub(crate) const BUILDER_MIN_WIDTH: u16 = 80;
+
+/// Breite des Channel-Builder-Overlays in Spalten: 90 % der verfügbaren
+/// Fensterbreite – bzw. die volle Fensterbreite, wenn 90 % darunter unter
+/// [`BUILDER_MIN_WIDTH`] fielen (schmale Terminals; der Dialog bleibt damit
+/// innerhalb des Fensters).
+///
+/// Reine Funktion, damit sie ohne Terminal testbar bleibt.
+pub(crate) fn builder_dialog_width(area_width: u16) -> u16 {
+    let ninety_percent = u32::from(area_width) * 9 / 10;
+    if ninety_percent < u32::from(BUILDER_MIN_WIDTH) {
+        area_width
+    } else {
+        ninety_percent as u16
+    }
+}
+
+/// Zellenbreite eines Zeichens im Builder-Umbruch. Steuerzeichen zählen als 1
+/// statt 0, damit eine Zeile im Zweifel eher eine Zelle schmaler gerechnet wird
+/// als sie ist – nie breiter als die Spalte (sonst könnte `Paragraph` sie
+/// erneut umbrechen).
+fn builder_char_cells(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(1)
+}
+
+/// Bricht `chars` in Zeichenbereiche von je höchstens `col_w` Zellen um.
+///
+/// Bevorzugt wird an Leerzeichen getrennt (die an der Umbruchstelle entfallen),
+/// sonst nach `-`, `/` oder `.` (bleibt am Zeilenende stehen), sonst hart an
+/// der Spaltengrenze – dieselbe Regel wie `editor::wrap_ranges`, hier aber
+/// zellengenau, weil die Spalte hart begrenzt ist.
+pub(crate) fn wrap_builder_cells(chars: &[char], col_w: usize) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        // Fenster bis an die Spaltengrenze füllen.
+        let mut used = 0usize;
+        let mut end = start;
+        while end < chars.len() {
+            let w = builder_char_cells(chars[end]);
+            if used + w > col_w {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
+        if end == start {
+            // Ein einzelnes Zeichen ist breiter als die Spalte: trotzdem
+            // aufnehmen – ratatui schneidet es beim Zeichnen ab.
+            end = start + 1;
+        }
+        if end < chars.len() {
+            // Letztes Leerzeichen im Fenster → dort trennen (das Leerzeichen
+            // gehört keiner Zeile an).
+            if let Some(k) = (start..end).rev().find(|&i| chars[i].is_whitespace()) {
+                let mut next = k;
+                while next < end && chars[next].is_whitespace() {
+                    next += 1;
+                }
+                if k > start {
+                    ranges.push(start..k);
+                }
+                start = next;
+                continue;
+            }
+            // Sonst: letztes Trennerzeichen (`-`, `/`, `.`) bleibt stehen und
+            // die Zeile endet dahinter.
+            if let Some(p) = (start..end)
+                .rev()
+                .find(|&i| matches!(chars[i], '-' | '/' | '.'))
+            {
+                ranges.push(start..p + 1);
+                start = p + 1;
+                continue;
+            }
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+/// Zerlegt einen Spalteneintrag in seine Anzeigezeilen (je höchstens `col_w`
+/// Zellen breit).
+///
+/// Die **erste** Zeile trägt den Marker **und** den Beginn des Inhalts: Reicht
+/// die Spalte nicht, wird der Inhalt direkt hinter dem Marker getrennt – dort
+/// darf mitten im Wort geschnitten werden. So entsteht nie eine Zeile, die nur
+/// den Marker zeigt (ratatui würde das tun, weil zwischen Marker und Inhalt ein
+/// Leerzeichen steht und ein zu langes erstes Wort auf die Folgezeile rutscht).
+/// Die Fortsetzungszeilen brechen an geeigneter Stelle ([`wrap_builder_cells`]).
+///
+/// Passt neben dem Marker kein einziges Zeichen mehr in die Spalte, entfällt
+/// der Marker ganz – lieber Inhalt ohne Marker als Marker ohne Inhalt.
+pub(crate) fn split_column_entry(
+    marker: &str,
+    text: &str,
+    style: Style,
+    col_w: u16,
+) -> Vec<Line<'static>> {
+    let col_w = col_w as usize;
+    if col_w == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        // Kein Inhalt – der Marker steht dann allein (es gibt nichts zu zeigen).
+        return vec![Line::from(Span::styled(marker.to_string(), style))];
+    }
+    let marker_cells: usize = marker.chars().map(builder_char_cells).sum();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if col_w <= marker_cells {
+        // Kein Platz für Inhalt neben dem Marker → Inhalt ohne Marker.
+        for r in wrap_builder_cells(&chars, col_w) {
+            lines.push(Line::from(Span::styled(
+                chars[r].iter().collect::<String>(),
+                style,
+            )));
+        }
+        return lines;
+    }
+
+    // Kopf: Marker + die erste Umbruchzeile des Inhalts in der Spaltenbreite
+    // stehen lassen; `wrap_builder_cells` nimmt dafür höchstens `col_w -
+    // marker_cells` Zellen (und bricht im Bedarfsfall schon mitten im Text).
+    let face = wrap_builder_cells(&chars, col_w - marker_cells)
+        .into_iter()
+        .next()
+        .map_or(0..0, |r| r);
+    let head_range = face.start..face.end;
+    lines.push(Line::from(Span::styled(
+        format!("{marker}{}", chars[head_range].iter().collect::<String>()),
+        style,
+    )));
+
+    // Rest an geeigneter Stelle auf die volle Spaltenbreite umbrechen.
+    let rest = &chars[face.end..];
+    for r in wrap_builder_cells(rest, col_w) {
+        lines.push(Line::from(Span::styled(
+            rest[r].iter().collect::<String>(),
+            style,
+        )));
+    }
+    lines
+}
+
+/// Anzeigezeilen eines Spalten-Headers: führendes Leerzeichen + Text, auf die
+/// Spaltenbreite umgebrochen (statt rechts abgeschnitten zu werden).
+fn column_header(text: &str, style: Style, col_w: u16) -> Vec<Line<'static>> {
+    let mut chars: Vec<char> = vec![' '];
+    chars.extend(text.chars());
+    wrap_builder_cells(&chars, col_w as usize)
+        .into_iter()
+        .map(|r| Line::from(Span::styled(chars[r].iter().collect::<String>(), style)))
+        .collect()
 }
 
 /// „▴ N–M/K ▾“-Vermerk für scrollende Listen: `▴` wenn oberhalb noch Einträge
@@ -325,12 +486,15 @@ fn model_picker_row(display: &str, cursor: bool, status_color: Option<Color>) ->
 /// Host-Pfad entfällt die rechte Spalte (nur zwei Spalten). Jede Spalte hat
 /// ihre eigene `ListNav`-Navigation (Umlauf, `with_wrap`); lange Spalten
 /// scrollen über `follow`, damit der Cursor immer sichtbar bleibt.
+///
+/// Breite: immer 90 % der Fensterbreite, bei schmalen Terminals die volle
+/// Breite (siehe [`builder_dialog_width`]).
 pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     let Some(builder) = app.channel_builder.as_mut() else {
         return;
     };
     let area = f.area();
-    let width = (area.width * 9 / 10).clamp(60, 120);
+    let width = builder_dialog_width(area.width);
 
     // Innenbreite – hängt nur von `width` ab (nicht von der Höhe) und wird
     // schon hier gebraucht, um die Spaltenbreiten und damit die
@@ -351,31 +515,14 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
         (col_w, inner_width.saturating_sub(col_w), 0)
     };
 
-    // Spalten-Header
+    // Spalten-Header: auf die Spaltenbreite umgebrochen (nie abgeschnitten).
     let header_style = Style::default()
         .fg(theme().muted)
         .add_modifier(Modifier::BOLD);
-    let tunnel_header = Line::from(Span::styled(
-        format!(" {:<width$}", "Tunnel", width = tunnel_w as usize - 1),
-        header_style,
-    ));
-    let host_header = Line::from(Span::styled(
-        format!(
-            " {:<width$}",
-            "Directory / Repo on host",
-            width = host_w as usize - 1
-        ),
-        header_style,
-    ));
+    let tunnel_header = column_header("Tunnel", header_style, tunnel_w);
+    let host_header = column_header("Directory / Repo on host", header_style, host_w);
     let worktree_header = if show_worktrees {
-        Some(Line::from(Span::styled(
-            format!(
-                " {:<width$}",
-                "Worktree / Branch",
-                width = worktree_w as usize - 1
-            ),
-            header_style,
-        )))
+        Some(column_header("Worktree / Branch", header_style, worktree_w))
     } else {
         None
     };
@@ -392,9 +539,11 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     // Branches ohne Worktree: noch gedämpfter
     let dim_style = Style::default().fg(theme().muted);
 
-    // Tunnel-Spalte
+    // Tunnel-Spalte. Je Eintrag die Anzeigezeilen: Marker und Inhalt stehen
+    // zusammen in der ersten Zeile (`split_column_entry`), lange Namen brechen
+    // an geeigneter Stelle in weitere Zeilen um.
     let tunnel_cursor = builder.tunnels.nav.cursor();
-    let mut tunnel_rows: Vec<Line<'static>> = Vec::new();
+    let mut tunnel_entries: Vec<Vec<Line<'static>>> = Vec::new();
     for (i, tunnel) in builder.tunnels.items.iter().enumerate() {
         let is_active_col = builder.col == 0;
         let is_selected = i == tunnel_cursor;
@@ -412,24 +561,23 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
         } else {
             "  "
         };
-        tunnel_rows.push(Line::from(Span::styled(
-            format!("{}{}", marker, tunnel.label()),
-            style,
-        )));
+        tunnel_entries.push(split_column_entry(marker, &tunnel.label(), style, tunnel_w));
     }
     // Lade-Indikator solange Podman-Images noch nicht geladen sind
     let tunnel_extra = if !builder.images_loaded {
-        Some(Line::from(Span::styled(
-            "  …",
+        Some(split_column_entry(
+            "  ",
+            "…",
             Style::default().fg(theme().muted),
-        )))
+            tunnel_w,
+        ))
     } else {
         None
     };
 
     // Host-Spalte
     let host_cursor = builder.host_paths.nav.cursor();
-    let mut host_rows: Vec<Line<'static>> = Vec::new();
+    let mut host_entries: Vec<Vec<Line<'static>>> = Vec::new();
     for (i, hp) in builder.host_paths.items.iter().enumerate() {
         let is_active_col = builder.col == 1;
         let is_selected = i == host_cursor;
@@ -447,16 +595,13 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
         } else {
             "  "
         };
-        host_rows.push(Line::from(Span::styled(
-            format!("{}{}", marker, hp.label()),
-            style,
-        )));
+        host_entries.push(split_column_entry(marker, &hp.label(), style, host_w));
     }
 
     // Worktree-Spalte entfällt komplett, wenn der Host-Pfad keine
     // Repo-Wurzel ist.
     let worktree_cursor = builder.worktrees.nav.cursor();
-    let worktree_rows: Vec<Line<'static>> = if show_worktrees {
+    let worktree_entries: Vec<Vec<Line<'static>>> = if show_worktrees {
         let mut rows = Vec::new();
         for (i, wt) in builder.worktrees.items.iter().enumerate() {
             let is_active_col = builder.col == 2;
@@ -482,48 +627,42 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
             } else {
                 "○ "
             };
-            rows.push(Line::from(Span::styled(
-                format!("{}{}", marker, wt.label),
-                style,
-            )));
+            rows.push(split_column_entry(marker, &wt.label, style, worktree_w));
         }
         rows
     } else {
         Vec::new()
     };
 
-    // Wie viele Zeilen braucht jede Spalte nach dem Umbruch langer Pfade?
-    // Jede Zeile wird mit `wrapped_row_count` auf die Spaltenbreite
-    // umgebrochen; dadurch rücken nachfolgende Einträge in der Spalte nach
-    // unten (statt rechts abgeschnitten zu werden).
-    let col_rows = |lines: &[Line<'_>], col_w: u16| -> u16 {
-        lines.iter().map(|l| wrapped_row_count(l, col_w)).sum()
-    };
-    let mut tunnel_full = vec![tunnel_header.clone()];
-    tunnel_full.extend(tunnel_rows.iter().cloned());
-    if let Some(e) = &tunnel_extra {
-        tunnel_full.push(e.clone());
-    }
-    let mut host_full = vec![host_header.clone()];
-    host_full.extend(host_rows.iter().cloned());
-    let mut max_rows = col_rows(&tunnel_full, tunnel_w).max(col_rows(&host_full, host_w));
-    // Worktree-Spalte (inkl. Platzhalter „(no worktrees)" falls leer).
+    // Platzhalter, wenn ein Repo (noch) keine Worktrees/Branches liefert –
+    // zählt wie eine Inhaltszeile zur Höhe.
     let worktree_placeholder = if show_worktrees {
-        Some(Line::from(Span::styled(
-            "  (no worktrees)",
+        Some(split_column_entry(
+            "  ",
+            "(no worktrees)",
             Style::default().fg(theme().muted),
-        )))
+            worktree_w,
+        ))
     } else {
         None
     };
+    let worktree_extra = if worktree_entries.is_empty() {
+        worktree_placeholder.as_ref()
+    } else {
+        None
+    };
+
+    // Zeilen je Spalte: Inhalt und Header sind hier schon umgebrochen, die
+    // Zeilenzahl ist damit exakt (kein Schätzer nötig).
+    let col_rows =
+        |entries: &[Vec<Line<'_>>]| -> u16 { entries.iter().map(|l| l.len() as u16).sum() };
+    let extra_rows = |extra: Option<&Vec<Line<'_>>>| -> u16 { extra.map_or(0, |e| e.len() as u16) };
+    let mut max_rows =
+        tunnel_header.len() as u16 + col_rows(&tunnel_entries) + extra_rows(tunnel_extra.as_ref());
+    max_rows = max_rows.max(host_header.len() as u16 + col_rows(&host_entries));
     if let Some(hdr) = &worktree_header {
-        let mut wt_full = vec![hdr.clone()];
-        if worktree_rows.is_empty() {
-            wt_full.push(worktree_placeholder.clone().expect("Placeholder bei Repo"));
-        } else {
-            wt_full.extend(worktree_rows.iter().cloned());
-        }
-        max_rows = max_rows.max(col_rows(&wt_full, worktree_w));
+        max_rows = max_rows
+            .max(hdr.len() as u16 + col_rows(&worktree_entries) + extra_rows(worktree_extra));
     }
     let max_rows = max_rows as usize;
 
@@ -580,29 +719,29 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
     ));
 
     // Spalte rendern: Header + sichtbarer (gescrollter) Ausschnitt. `follow`
-    // hält den Cursor sichtbar, `visible_rows` schneidet an Umbruchzeilen.
+    // hält den Cursor sichtbar, `visible_rows` schneidet an Umbruchzeilen. Die
+    // Zeilen sind bereits umgebrochen und auf die Spaltenbreite begrenzt – kein
+    // `Wrap` nötig (das würde den Marker samt Inhalt wieder auseinanderreißen).
     let render_col = |f: &mut Frame,
                       area: Rect,
-                      header: &Line<'static>,
+                      header: &[Line<'static>],
                       nav: &mut ListNav,
-                      rows: &[Line<'static>],
-                      extra: Option<&Line<'static>>,
-                      col_w: u16| {
-        let extra_rows = if extra.is_some() { 1 } else { 0 };
-        let viewport = area.height.saturating_sub(1 + extra_rows).max(1);
-        let row_of = |i: usize| wrapped_row_count(&rows[i], col_w).max(1);
+                      entries: &[Vec<Line<'static>>],
+                      extra: Option<&Vec<Line<'static>>>| {
+        let head_rows = header.len() as u16;
+        let extra_rows = extra.map_or(0, |e| e.len() as u16);
+        let viewport = area.height.saturating_sub(head_rows + extra_rows).max(1);
+        let row_of = |i: usize| entries[i].len().max(1) as u16;
         nav.follow(viewport, row_of);
         let range = nav.visible_rows(viewport, row_of);
-        let mut display = vec![header.clone()];
+        let mut display: Vec<Line<'static>> = header.to_vec();
         for i in range {
-            display.push(rows[i].clone());
+            display.extend(entries[i].iter().cloned());
         }
         if let Some(e) = extra {
-            display.push(e.clone());
+            display.extend(e.iter().cloned());
         }
-        let para = Paragraph::new(display)
-            .style(Style::default().bg(theme().status_bg))
-            .wrap(Wrap { trim: false });
+        let para = Paragraph::new(display).style(Style::default().bg(theme().status_bg));
         f.render_widget(para, area);
     };
     render_col(
@@ -610,33 +749,25 @@ pub(crate) fn draw_channel_builder(f: &mut Frame, app: &mut App) {
         cols[0],
         &tunnel_header,
         &mut builder.tunnels.nav,
-        &tunnel_rows,
+        &tunnel_entries,
         tunnel_extra.as_ref(),
-        tunnel_w,
     );
     render_col(
         f,
         cols[1],
         &host_header,
         &mut builder.host_paths.nav,
-        &host_rows,
+        &host_entries,
         None,
-        host_w,
     );
     if show_worktrees {
-        let wt_extra = if worktree_rows.is_empty() {
-            worktree_placeholder.as_ref()
-        } else {
-            None
-        };
         render_col(
             f,
             cols[2],
-            worktree_header.as_ref().expect("Header bei Repo"),
+            worktree_header.as_ref().expect("header for repo"),
             &mut builder.worktrees.nav,
-            &worktree_rows,
-            wt_extra,
-            worktree_w,
+            &worktree_entries,
+            worktree_extra,
         );
     }
 
@@ -852,7 +983,7 @@ pub(crate) fn channel_picker_row(
         if status.is_some() { "⬢" } else { " " },
         Style::default().fg(status.map(channel_status_color).unwrap_or(theme().muted)),
     );
-    let base_fg = if name == "(kein Kanal)" {
+    let base_fg = if name == "(no channel)" {
         theme().muted
     } else {
         theme().highlight
@@ -896,7 +1027,7 @@ fn channel_usage(sessions: &[Session], channels: &ChannelRegistry, name: &str) -
             nums.push(i + 1);
             if s.phase == Phase::WaitingForLLM
                 || s.phase == Phase::WaitingForTool
-                || !s.open_tool_ids.is_empty()
+                || s.live_tool.is_some()
             {
                 active = true;
             }
@@ -911,7 +1042,7 @@ fn channel_usage(sessions: &[Session], channels: &ChannelRegistry, name: &str) -
         .collect::<Vec<_>>()
         .join(", ");
     if active {
-        format!("· Session {list} (aktiv)")
+        format!("· Session {list} (active)")
     } else {
         format!("· Session {list}")
     }

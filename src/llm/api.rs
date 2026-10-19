@@ -424,12 +424,6 @@ pub(crate) fn content_from_nonstream(shape: ApiShape, v: &Value) -> Option<Strin
     }
 }
 
-/// Extrahiert eine Fehlermeldung aus einer Antwort beider Shapes (falls
-/// vorhanden) – für `{"error": …}` (Chat) bzw. `{"error": …}`/failed (Responses).
-pub(crate) fn _error_from_nonstream(_v: &Value) -> Option<String> {
-    None
-}
-
 fn chat_content(v: &Value) -> Option<String> {
     let content = v.get("choices")?.get(0)?.get("message")?.get("content")?;
     match content {

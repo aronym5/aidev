@@ -76,12 +76,9 @@ pub fn spawn_worker(
                 &msgs,
                 &cancel,
                 CompactTrigger::Proactive,
-                None,
             ) {
-                Ok((repl, content, tokens, keep, log_path)) => {
-                    let _ = tx.send(WorkerEvent::Compacted(
-                        session, content, tokens, keep, log_path,
-                    ));
+                Ok((repl, content, tokens, keep)) => {
+                    let _ = tx.send(WorkerEvent::Compacted(session, content, tokens, keep));
                     msgs = repl;
                 }
                 Err(_) => {
@@ -154,11 +151,10 @@ pub fn spawn_worker(
                             &msgs,
                             &cancel,
                             CompactTrigger::Reactive,
-                            None,
                         ) {
-                            Ok((repl, content, tokens, keep, log_path)) => {
+                            Ok((repl, content, tokens, keep)) => {
                                 let _ = tx.send(WorkerEvent::Compacted(
-                                    session, content, tokens, keep, log_path,
+                                    session, content, tokens, keep,
                                 ));
                                 msgs = repl;
                                 reactive_compacted = true;

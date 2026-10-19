@@ -13,23 +13,19 @@ impl App {
         let active = self.active;
         let channel = self.sessions[active].channel.clone();
         let Some(ch) = channel else {
-            self.sessions[active].error = Some("/run needs a bound channel (Alt+O).".into());
-            self.sessions[active].error_debug = None;
+            self.sessions[active].set_error("/run needs a bound channel (Alt+O).");
             return;
         };
         if expr.is_empty() {
-            self.sessions[active].error =
-                Some("Usage: /run <shell-command> (e.g. /run cargo build && git status)".into());
-            self.sessions[active].error_debug = None;
+            self.sessions[active]
+                .set_error("Usage: /run <shell-command> (e.g. /run cargo build && git status)");
             return;
         }
         {
             let s = &mut self.sessions[active];
             // `/run …`-Eingabe auch für den ↑/↓-Durchlauf merken.
             s.push_history(&format!("/run {expr}"));
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
             s.chat_follow = true;
             s.chat_anchor = ChatAnchor::default();
             s.chat_scroll_delta = None;
@@ -58,9 +54,7 @@ impl App {
             }
         };
         let s = &mut self.sessions[active];
-        s.editor.clear();
-        s.error = None;
-        s.error_debug = None;
+        s.clear_input_and_errors();
         s.retrying = None;
         s.compacting = false;
         s.cancel = Arc::new(AtomicBool::new(false));
@@ -75,7 +69,6 @@ impl App {
             messages,
             cancel,
             llm::CompactTrigger::Manual,
-            None,
         );
     }
 
@@ -86,9 +79,7 @@ impl App {
             if !arg.is_empty() {
                 s.push_history(&format!("/model {arg}"));
             }
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
         }
         if arg.is_empty() {
             self.open_model_picker();
@@ -128,7 +119,7 @@ impl App {
                 }
                 let names = self.config.model_names();
                 let verfuegbar = if names.is_empty() {
-                    "keine konfiguriert ([models.<alias>] in config.toml)".to_string()
+                    "none configured ([models.<alias>] in config.toml)".to_string()
                 } else {
                     names.join(", ")
                 };
@@ -145,9 +136,7 @@ impl App {
     fn user_theme(&mut self, arg: &str) {
         let active = self.active;
         let s = &mut self.sessions[active];
-        s.editor.clear();
-        s.error = None;
-        s.error_debug = None;
+        s.clear_input_and_errors();
         if arg.is_empty() {
             s.error = Some(
                 "theme = auto | dark | light  (config: theme = \"…\" in config.toml)".to_string(),
@@ -185,10 +174,7 @@ impl App {
         let list = self.model_pick_list();
         if list.is_empty() {
             let s = self.active_mut();
-            s.error = Some(
-                "No models configured – add a `[models.<alias>]` block in config.toml.".into(),
-            );
-            s.error_debug = None;
+            s.set_error("No models configured – add a `[models.<alias>]` block in config.toml.");
             return;
         }
 
@@ -396,9 +382,7 @@ impl App {
         {
             let s = &mut self.sessions[active];
             s.push_history(&format!("/commit {msg}"));
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
         }
         // Commit ausführen
         match crate::repo::git_commit_all(&host, &msg) {
@@ -625,24 +609,18 @@ impl App {
             }
         }
 
-        // Worktree anlegen
-        let wt = if skip_stash_and_copy {
-            // Kein Stash – Worktree auf dem (evtl. verschobenen) Branch anlegen
-            match repo.create_worktree(branch_name, Some(&channel_root)) {
-                Ok(wt) => wt,
-                Err(e) => {
-                    self.sessions[active].error = Some(format!("Worktree failed: {e}"));
-                    return;
-                }
-            }
+        // Worktree anlegen – mit Stash der uncommitted Änderungen oder (wenn
+        // übersprungen) direkt auf dem evtl. zuvor verschobenen Branch.
+        let created = if skip_stash_and_copy {
+            repo.create_worktree(branch_name, Some(&channel_root))
         } else {
-            // Mit Stash für uncommitted Änderungen
-            match repo.create_worktree_with_stash(branch_name, Some(&channel_root)) {
-                Ok(wt) => wt,
-                Err(e) => {
-                    self.sessions[active].error = Some(format!("Worktree failed: {e}"));
-                    return;
-                }
+            repo.create_worktree_with_stash(branch_name, Some(&channel_root))
+        };
+        let wt = match created {
+            Ok(wt) => wt,
+            Err(e) => {
+                self.sessions[active].error = Some(format!("Worktree failed: {e}"));
+                return;
             }
         };
 
@@ -672,14 +650,26 @@ impl App {
             }
         };
 
+        // Hinweise zum Anlegen sammeln (Submodule, Build-Kopie) – beides nicht
+        // fatal, aber sichtbar. Wichtig beim Submodule-Hinweis: Ohne ihn bliebe
+        // ein leerer Submodule-Ordner unbemerkt, weil `git status` dort
+        // trotzdem „clean“ meldet.
+        let notice = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(n) = &wt.notice {
+                parts.push(n.clone());
+            }
+            if let Some(info) = copy_info {
+                parts.push(info);
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
+        };
+
         // Neuen Channel erzeugen und Session abschließen (gemeinsame Helfer
         // für proceed/reuse: Worktree-Bindung, Registrierung, neue Session
         // und Eintrag in der alten Session).
         let effective_root = &wt.path;
-        let base_folder = crate::repo::git_toplevel(effective_root)
-            .ok()
-            .and_then(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "app".to_string());
+        let base_folder = branch_base_folder(effective_root);
         match self.make_branch_channel(
             channel_kind,
             effective_root,
@@ -688,7 +678,7 @@ impl App {
             podman_spec,
             wt.clone(),
         ) {
-            Ok((name, ch)) => self.branch_finish(ch, name, branch_name, history, copy_info),
+            Ok((name, ch)) => self.branch_finish(ch, name, branch_name, history, notice),
             Err(e) => {
                 self.sessions[active].error = Some(e);
                 let _ = repo.remove_worktree(branch_name, true);
@@ -709,16 +699,15 @@ impl App {
         // Namensschema wie im ChannelBuilder: Kanal = "image workdir",
         // Container = "aidev-reponame-branchname-image".
         let effective_root = wt_path;
-        let base_folder = crate::repo::git_toplevel(effective_root)
-            .ok()
-            .and_then(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "app".to_string());
+        let base_folder = branch_base_folder(effective_root);
         // Worktree-Info aus dem bestehenden Pfad ableiten, dann gemeinsame
         // Helfer nutzen (kein erneuter Worktree-Aufbau, keine Build-Kopie).
         let wt = crate::repo::WorktreeInfo {
             name: branch_name.to_string(),
             branch: branch_name.to_string(),
             path: wt_path.to_path_buf(),
+            // Bestehender Worktree – hier wurde nichts neu angelegt.
+            notice: None,
         };
         match self.make_branch_channel(
             channel_kind,
@@ -1030,9 +1019,7 @@ impl App {
         // `/channel` → ChannelPicker öffnen (wie Alt+C).
         if content == "/channel" || content.starts_with("/channel ") {
             let s = self.active_mut();
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
             self.open_channel_picker();
             return;
         }
@@ -1046,18 +1033,14 @@ impl App {
         // `/options` → Options-Dialog öffnen (wie Ctrl+O).
         if content == "/options" || content.starts_with("/options ") {
             let s = self.active_mut();
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
             self.open_options_dialog();
             return;
         }
         // `/header` → HTTP-Response-Header der letzten Antwort anzeigen (wie Alt+H).
         if content == "/header" || content.starts_with("/header ") {
             let s = self.active_mut();
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
             self.http_headers_dialog = true;
             return;
         }
@@ -1197,9 +1180,7 @@ impl App {
             // Eingabe für den ↑/↓-Durchlauf merken.
             s.push_history(&content);
             s.push_user_message(content, Some(permission), ep.model.clone());
-            s.editor.clear();
-            s.error = None;
-            s.error_debug = None;
+            s.clear_input_and_errors();
             s.retrying = None;
             s.aborted = false;
             s.prompt_base = base_prompt;
@@ -1247,9 +1228,7 @@ impl App {
         let active = self.active;
         let s = &mut self.sessions[active];
         s.push_history("/reload");
-        s.editor.clear();
-        s.error = None;
-        s.error_debug = None;
+        s.clear_input_and_errors();
         // Ohne stderr-Logging laden (im Alt-Screen würde das ins UI schreiben
         // und das Layout zerschießen); auftretende Warnungen erscheinen
         // stattdessen in der Statuszeile (überschreiben die Erfolgsmeldung).
@@ -1295,7 +1274,7 @@ impl App {
         let active = self.active;
         let s = &mut self.sessions[active];
         s.error = Some(if warnings.is_empty() {
-            "Config neu geladen.".to_string()
+            "Config reloaded.".to_string()
         } else {
             warnings.join(" · ")
         });
@@ -1324,4 +1303,14 @@ pub(crate) fn path_tail(p: &std::path::Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.display().to_string())
+}
+
+/// Basisname des Top-Level-Repos eines Worktree-Pfads (Container-Name im
+/// ChannelBuilder-Schema `aidev-<repo>-<branch>-<image>`). Fällt auf `"app"`
+/// zurück, wenn kein Repo-Name ermittelbar ist.
+fn branch_base_folder(root: &std::path::Path) -> String {
+    crate::repo::git_toplevel(root)
+        .ok()
+        .and_then(|r| r.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "app".to_string())
 }

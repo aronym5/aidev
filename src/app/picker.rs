@@ -82,8 +82,7 @@ impl App {
                     }
                     None => {
                         let s = self.active_mut();
-                        s.error = Some(format!("Channel \"{name}\" is not available."));
-                        s.error_debug = None;
+                        s.set_error(format!("Channel \"{name}\" is not available."));
                     }
                 }
             }
@@ -102,8 +101,7 @@ impl App {
     ) {
         let s = self.active_mut();
         s.set_channel(Some(ch));
-        s.error = None;
-        s.error_debug = None;
+        s.clear_errors();
         apply_channel_permission_default(s);
     }
 }

@@ -109,12 +109,15 @@ pub struct Session {
     /// Laufendes (noch offenes) Assistant-Event des aktuellen Turns – der
     /// Mutations-Target für Reasoning/Text-Chunks des LLM. `None` im Idle.
     pub open_assistant_id: Option<EventId>,
-    /// Parallel laufende (offene) Tool-Events – Mutations-Targets für die
-    /// Live-Ausgabe. Sie stehen bereits in `chat` (offen), nicht in einer
-    /// eigenen Zone.
-    pub open_tool_ids: Vec<EventId>,
+    /// Die Assistant-Runde, deren Werkzeuge gerade laufen. Sie ist bereits
+    /// Geschlossen (Streaming-Ende), bleibt aber der Bezugspunkt für neue
+    /// Tool-Kinder und wird bei `RoundEnd` finalisiert. Zusammen mit
+    /// `open_assistant_id` ergibt sie „die aktuelle Runde" – genau eines von
+    /// beiden ist gesetzt, solange ein Turn läuft.
+    pub(crate) tool_round: Option<EventId>,
     /// Das Tool-Event, das gerade Live-Ausgabe (`ToolOutput`) empfängt – i. d. R.
-    /// das zuletzt geöffnete laufende `run`-Werkzeug.
+    /// das zuletzt geöffnete laufende `run`-Werkzeug. `None`, wenn gerade kein
+    /// Werkzeug läuft (zugleich der "irgendein Tool offen"-Indikator).
     pub(crate) live_tool: Option<EventId>,
     /// Anzeige-Label des aktuell laufenden Werkzeugs (Statuszeile) – analog zum
     /// alten `active_tool`, nur ohne parallele Puffer-Zone.
@@ -243,7 +246,7 @@ impl Session {
             hist_draft: String::new(),
             phase: Phase::Idle,
             open_assistant_id: None,
-            open_tool_ids: Vec::new(),
+            tool_round: None,
             live_tool: None,
             active_tool_label: None,
             pending_usage: None,
@@ -324,45 +327,43 @@ impl Session {
         id
     }
 
-    /// Öffnet – falls noch keine Assistant-Sub-Runde offen ist – eine neue Runde
-    /// mit leerem Vorspann. Damit haben ankommende Text-/Reasoning-Chunks und
-    /// Tool-Starts stets ein gültiges Mutations-Ziel (sonst gingen Antworten
-    /// verloren). Wird vom Worker-Drain vor `append_text`/`append_reasoning`
-    /// und `open_tool` aufgerufen.
+    /// Öffnet – falls noch kein Assistant-Ziel offen ist – eine neue Runde mit
+    /// leerem Vorspann. Damit haben ankommende Text-/Reasoning-Chunks und
+    /// Werkzeuge stets ein gültiges Mutations-Ziel (sonst gingen Antworten
+    /// verloren). Eine noch nicht abgeschlossene Tool-Runde wird dabei zuerst
+    /// finalisiert – primär macht das der Worker via `RoundEnd`; dieser Weg ist
+    /// der Fallback, wenn Chunks ohne vorheriges `RoundEnd` eintreffen.
     pub(crate) fn ensure_open_assistant(&mut self) {
+        if self.tool_round.is_some() {
+            self.finish_assistant(false, None);
+        }
         if self.open_assistant_id.is_none() {
             self.open_assistant(String::new(), String::new());
         }
     }
 
-    /// Liefert `true`, wenn die offene Assistant-Runde eine Tool-Runde ist,
-    /// deren Werkzeuge ALLE abgeschlossen sind (offene Tool-Liste leer, aber
-    /// mindestens ein Tool-Kind registriert). Dann beginnt mit dem nächsten
-    /// `Chunk`/`Reasoning`/`Usage` eine NEUE Runde – die alte muss vorher
-    /// geschlossen werden (deren `pending_usage`/`pending_parts` gehören noch
-    /// zu ihr). Primär schließt der Worker sie explizit per `RoundEnd` sofort
-    /// nach dem letzten `ToolEnd`; die Lazy-Abschlüsse bleiben nur Fallback.
-    ///
-    /// Hintergrund: Der Worker sendet ToolStart/ToolEnd einer Runde
-    /// VERSCHACHTELT (`Start→End→Start→End`). Ein Abschluss direkt am ersten
-    /// `ToolEnd` würde die Runde vorschnell schließen; die restlichen Tools
-    /// hingen dann an einer frischen, falschen Sub-Runde und verlören ihre
-    /// gemessenen Tokens. Stattdessen wird die Runde genau dann geschlossen,
-    /// wenn die nächste Runde beginnt.
-    pub(crate) fn is_open_tool_round_done(&self) -> bool {
-        let Some(aid) = self.open_assistant_id else {
-            return false;
-        };
-        if !self.open_tool_ids.is_empty() {
-            return false;
+    /// Liefert die Assistant-Runde, an die ein LLM-Tool gehängt wird, und
+    /// schließt dabei die Streaming-Runde ab (ihr Streaming ist beendet, die
+    /// Tool-Phase beginnt). Der Aufruf ist idempotent: ab dem zweiten Tool
+    /// derselben Runde kommt dieselbe Runde zurück. Das Schließen setzt nur
+    /// `time_end` – die Runde wandert dadurch sofort in die Historie und ihre
+    /// Werkzeuge werden als offene Live-Events gerendert (höchstens eines
+    /// gleichzeitig). Finalisiert (Usage/Tokens) wird sie erst bei `RoundEnd`.
+    pub(crate) fn tool_parent(&mut self) -> Option<EventId> {
+        if self.tool_round.is_none() {
+            self.ensure_open_assistant();
+            let aid = self.open_assistant_id.take()?;
+            self.chat.close_event(aid, Instant::now());
+            self.history_version += 1;
+            self.tool_round = Some(aid);
         }
-        self.chat
-            .event(aid)
-            .is_some_and(|ev| matches!(&ev.kind, EventKind::Assistant { tool_event_ids, .. } if !tool_event_ids.is_empty()))
+        self.tool_round
     }
 
-    /// Öffnet ein Tool-Event als Kind der offenen Assistant-Runde (parallel:
-    /// mehrere können gleichzeitig offen sein).
+    /// Öffnet ein Tool-Event als Kind seiner Assistant-Runde (`parent_id`).
+    /// Die Runde ist zu diesem Zeitpunkt bereits geschlossen (`tool_parent`);
+    /// die Kindregistrierung in `tool_event_ids` hält die Wire-Reihenfolge
+    /// (assistant{tool_calls} → tool{…}) fest.
     pub(crate) fn open_tool(
         &mut self,
         parent_id: Option<EventId>,
@@ -380,7 +381,6 @@ impl Session {
             kind,
             Instant::now(),
         );
-        self.open_tool_ids.push(id);
         self.history_version += 1;
         id
     }
@@ -389,13 +389,15 @@ impl Session {
     /// die abgeleiteten Token-Werte bzw. die Server-bestätigte Usage. Bei
     /// `aborted` wird automatisch ein `Abort`-Event direkt danach eingefügt.
     pub(crate) fn finish_assistant(&mut self, aborted: bool, usage: Option<llm::Usage>) {
-        let Some(aid) = self.open_assistant_id.take() else {
+        // Ziel ist die laufende Runde: entweder die noch streamende oder die
+        // bereits geschlossene, deren Werkzeuge gerade liefen.
+        let Some(aid) = self.open_assistant_id.take().or_else(|| self.tool_round.take()) else {
             return;
         };
         // Noch offene Tool-Kinder vorher schließen (Notfall/Teillauf) – sie
         // bleiben mit "Execution aborted" erhalten.
-        for tid in self.open_tool_ids.drain(..) {
-            self.chat.finish_tool(tid, Instant::now());
+        if let Some(tid) = self.live_tool.take() {
+            self.chat.close_event(tid, Instant::now());
         }
         // `pending_usage` (aus dem `Usage`-Event des Turns) hat Vorrang; der
         // `usage`-Parameter deckt den direkt übergebenen Wert ab.
@@ -403,7 +405,7 @@ impl Session {
             .pending_usage
             .take()
             .or(usage)
-            .unwrap_or_else(zero_usage);
+            .unwrap_or_default();
         // `num_tokens` werden nicht hier, sondern in `derive_last_turn_tokens`
         // über den ganzen Turn verteilt (§4.3). `0` bis dahin.
         self.chat
@@ -498,7 +500,6 @@ impl Session {
             answer_tokens,
             Instant::now(),
         );
-        self.open_tool_ids.retain(|&t| t != id);
         self.live_tool = None;
         self.active_tool_label = None;
         self.history_version += 1;
@@ -574,9 +575,37 @@ impl Session {
     /// Aufräumen nach Turn-Ende: keine offenen Mutations-Targets mehr.
     fn active_tool_clear(&mut self) {
         self.open_assistant_id = None;
-        self.open_tool_ids.clear();
+        self.tool_round = None;
         self.live_tool = None;
         self.active_tool_label = None;
+    }
+
+    /// Schaltet Auto-Follow ab und verschiebt die manuelle Scroll-Position um
+    /// `delta` Zeilen (negativ = nach oben). Der Versatz wird im nächsten
+    /// `draw_chat`-Frame auf den Block-Anker angewendet und dann verbraucht.
+    pub(crate) fn scroll_chat(&mut self, delta: i64) {
+        self.chat_follow = false;
+        *self.chat_scroll_delta.get_or_insert(0) += delta;
+    }
+
+    /// Setzt die Fehlermeldung der Session und verwirft den Debug-Pfad der
+    /// vorherigen Antwort (er gehörte zu einem anderen Fehler).
+    pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
+        self.error_debug = None;
+    }
+
+    /// Löscht Fehlermeldung und Debug-Pfad.
+    pub(crate) fn clear_errors(&mut self) {
+        self.error = None;
+        self.error_debug = None;
+    }
+
+    /// Eingabe leeren und die Fehleranzeige zurücksetzen (Meldung + Debug-Pfad)
+    /// – gemeinsamer Auftakt aller Slash-Befehle.
+    pub(crate) fn clear_input_and_errors(&mut self) {
+        self.editor.clear();
+        self.clear_errors();
     }
 
     /// Merkt eine gesendete Eingabe für den ↑/↓-Durchlauf. Leere Eingaben und
@@ -643,14 +672,12 @@ impl Session {
     /// alle Events bis zur `boundary` werden durch ein `Archive`-Event ersetzt,
     /// die letzten `keep` Turns bleiben erhalten. Alle IDs dahinter bleiben
     /// stabil (Render-Cache teilt sich entsprechend auf). `tokens` ist die
-    /// Token-Zahl der Summary (aus dem Kompaktierungs-Aufruf abgeleitet),
-    /// `log_path` der Pfad zum Kompaktierungs-Protokoll (falls geschrieben).
+    /// Token-Zahl der Summary (aus dem Kompaktierungs-Aufruf abgeleitet).
     pub(crate) fn apply_compaction(
         &mut self,
         content: String,
         tokens: u64,
         keep: usize,
-        log_path: Option<String>,
     ) {
         self.compacting = false;
         self.prompt_base = 0;
@@ -665,7 +692,7 @@ impl Session {
         if boundary == 0 {
             return;
         }
-        self.chat.compact(boundary, content, tokens, log_path);
+        self.chat.compact(boundary, content, tokens);
         // Einmaliger Shift auf die überlebenden Events (alles NACH der Summary):
         // alte Kontextlänge des letzten Events vor der Summary minus Summary-
         // Länge. Dadurch zeigen die Survivors ihre alte (ggf. bestätigte)
@@ -690,15 +717,6 @@ impl Session {
             }
         }
         self.history_version += 1;
-    }
-}
-
-fn zero_usage() -> llm::Usage {
-    llm::Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cached_tokens: None,
     }
 }
 

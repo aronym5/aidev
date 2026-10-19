@@ -23,7 +23,7 @@ pub(super) fn find_glob(
 ) -> Result<Vec<String>, String> {
     let pattern = pattern.trim();
     if pattern.is_empty() {
-        return Err("Muster ist leer.".to_string());
+        return Err("Pattern is empty.".to_string());
     }
     // Doppelstern-Normalisierung für fnmatch-Semantik (finds „*“ überschreitet
     // bereits „/“): „a/**/b“ muss auch „a/b“ treffen – „/**/“ wird deshalb zu

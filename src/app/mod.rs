@@ -246,7 +246,7 @@ impl App {
             .config
             .provider
             .get(&entry.provider)
-            .ok_or_else(|| format!("Unbekannter Provider '{}'", entry.provider))?;
+            .ok_or_else(|| format!("Unknown provider '{}'", entry.provider))?;
         // Kontextfenster: Registry-Eintrag (aus Config) oder globaler Default.
         let cw = entry
             .context_window
@@ -436,7 +436,7 @@ impl App {
     pub(crate) fn session_busy(s: &Session) -> bool {
         s.phase == Phase::WaitingForLLM
             || s.phase == Phase::WaitingForTool
-            || !s.open_tool_ids.is_empty()
+            || s.live_tool.is_some()
             || s.retrying.is_some()
             || s.compacting
     }
@@ -526,7 +526,8 @@ impl App {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
-    pub(crate) fn handle_key(&mut self, key: event::KeyEvent) {
+    pub(crate) fn handle_key(&mut self, mut key: event::KeyEvent) {
+        normalize_key(&mut key);
         // Offener HTTP-Header-Dialog: reine Anzeige – nur Esc/Enter schließen
         // wieder auf, alle anderen Tasten werden verschluckt.
         if self.http_headers_dialog {
@@ -643,17 +644,15 @@ impl App {
             }
             KeyCode::PageUp => {
                 let s = self.active_mut();
-                s.chat_follow = false;
                 // Seitenbewegung (halbe Viewport-Höhe) auf den Anker; das
                 // Layout (Block-Tops) kennt nur `draw_chat`, daher als Delta.
                 let page = (s.chat_viewport.max(1) / 2).max(1) as i64;
-                *s.chat_scroll_delta.get_or_insert(0) -= page;
+                s.scroll_chat(-page);
             }
             KeyCode::PageDown => {
                 let s = self.active_mut();
-                s.chat_follow = false;
                 let page = (s.chat_viewport.max(1) / 2).max(1) as i64;
-                *s.chat_scroll_delta.get_or_insert(0) += page;
+                s.scroll_chat(page);
             }
             KeyCode::Tab => {
                 let s = self.active_mut();
@@ -936,6 +935,29 @@ impl App {
     }
 }
 
+/// Bringt Terminal-Eigenheiten auf einen gemeinsamen Nenner, die crossterm
+/// nicht kennt – zentral für alle Eingabeflächen (Haupteingabe, Dialoge,
+/// Picker, Builder), weil `handle_key` der einzige Einstieg ist.
+///
+/// Betrifft **Backspace**: Standard ist DEL (`0x7F`), das crossterm als
+/// `KeyCode::Backspace` meldet. Manche Terminals senden stattdessen BS
+/// (`0x08` = `^H`) – z. B. MobaXterm („Backspace sends ^H“), oder wenn die
+/// Session `erase = ^H` setzt. crossterm bildet alle C0-Bytes `0x01`–`0x1A`
+/// generisch auf `Ctrl+Buchstabe` ab, aus `0x08` wird damit `Char('h')` +
+/// `CONTROL` – ohne diese Umsetzung landet ein „h“ als Text im Eingabefeld
+/// (siehe `normalize_key`-Test). `Ctrl+H` ist in aidev nirgends belegt, die
+/// Umdeutung ist also gefahrlos; im Terminal ist `^H` ohnehin die
+/// historische Kodierung von Backspace.
+fn normalize_key(key: &mut event::KeyEvent) {
+    if key.code == KeyCode::Char('h')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+    {
+        key.code = KeyCode::Backspace;
+        key.modifiers = KeyModifiers::NONE;
+    }
+}
+
 pub fn run(config: Config) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let (channels, startup_warnings) = ChannelRegistry::new_with_warnings(&config);
@@ -991,17 +1013,11 @@ pub fn run(config: Config) -> io::Result<()> {
                     // weiterhin, da Motion-Events nicht abgefangen werden.)
                     CrosstermEvent::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => {
-                            let s = app.active_mut();
-                            s.chat_follow = false;
-                            let step = 3_i64;
-                            *s.chat_scroll_delta.get_or_insert(0) -= step;
+                            app.active_mut().scroll_chat(-3);
                             redraw = true;
                         }
                         MouseEventKind::ScrollDown => {
-                            let s = app.active_mut();
-                            s.chat_follow = false;
-                            let step = 3_i64;
-                            *s.chat_scroll_delta.get_or_insert(0) += step;
+                            app.active_mut().scroll_chat(3);
                             redraw = true;
                         }
                         _ => {}

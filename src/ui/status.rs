@@ -47,31 +47,19 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
         return muted_line(hint, Color::Rgb(245, 158, 11));
     }
     if let Some(tool) = &s.active_tool_label {
-        let ch = SPINNER[app.spinner % SPINNER.len()];
-        return muted_line(
-            format!(" {ch} {} {tool} …", tool_icon(tool_name(tool))),
-            Color::Rgb(245, 158, 11),
-        );
+        return busy_line(app, &format!("{} {tool} …", tool_icon(tool_name(tool))));
     }
     if let Some((summary, retry_at)) = &s.retrying {
-        let ch = SPINNER[app.spinner % SPINNER.len()];
         // Countdown in Millisekunden, aufgerundet auf die nächste volle Sekunde –
         // so zeigt `fmt_duration` ganze Sekunden und nie „0 s“/Bruchteile.
         let left_ms = retry_at
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
         let next_sec = (left_ms / 1000 + 1) * 1000;
-        return muted_line(
-            format!(" {ch} {summary} – Retry in {}", fmt_duration(next_sec)),
-            Color::Rgb(245, 158, 11),
-        );
+        return busy_line(app, &format!("{summary} – Retry in {}", fmt_duration(next_sec)));
     }
     if s.compacting {
-        let ch = SPINNER[app.spinner % SPINNER.len()];
-        return muted_line(
-            format!(" {ch} Compacting context…"),
-            Color::Rgb(245, 158, 11),
-        );
+        return busy_line(app, "Compacting context…");
     }
     if s.phase == Phase::WaitingForLLM {
         let ch = SPINNER[app.spinner % SPINNER.len()];
@@ -90,6 +78,15 @@ pub(crate) fn status_left(app: &App, max_width: usize) -> Line<'static> {
     } else {
         key_help(&STATUS_KEYS, max_width)
     }
+}
+
+/// Warte-/Hinweiszeile in Amber mit dem rotierenden Spinner davor.
+fn busy_line(app: &App, text: &str) -> Line<'static> {
+    let ch = SPINNER[app.spinner % SPINNER.len()];
+    Line::from(Span::styled(
+        format!(" {ch} {text}"),
+        Style::default().fg(Color::Rgb(245, 158, 11)),
+    ))
 }
 
 /// Linke Hälfte während `WaitingForLLM`: Solange kein erstes Inhalt-Byte da
@@ -498,7 +495,7 @@ mod tests {
         // Reaktive Kompaktierung: Turn 1 wird durch die Summary (1_000 Token)
         // ersetzt, Turn 2 überlebt. Dessen `context_len` wandert um den
         // abgeschnittenen Teil (100_000 - 1_000) nach unten.
-        s.apply_compaction("zusammenfassung".into(), 1_000, 0, None);
+        s.apply_compaction("zusammenfassung".into(), 1_000, 0);
         let erwartet = prompt_tokens(&s);
         let (t, green) = context_tokens(&s).expect("Kontext vorhanden");
         assert!(!green, "nach Kompaktierung → Schätzung (grau)");

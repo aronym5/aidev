@@ -3,16 +3,6 @@
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-/// Ein API-Protokoll, auf dem ein Modell getestet werden kann (für den
-/// Statusindikator im Modell-Picker: grün/gelb/rot je nach Trefferquote).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApiProtocol {
-    /// `POST /chat/completions` (`messages`).
-    ChatCompletions,
-    /// `POST /responses` (`input`).
-    Responses,
-}
-
 /// Eine ausgeführte Werkzeug-Option – für den Abschluss im Event-Log.
 ///
 /// Trägt nur noch das, was das Event-Log beim Abschluss braucht: den vollen
@@ -158,10 +148,10 @@ pub enum WorkerEvent {
     /// grenze eingefügt wird: die älteren Nachrichten bleiben im Speicher/der
     /// UI erhalten, werden aber von `api_messages` nicht mehr mitgesendet.
     /// `tokens` ist die Token-Zahl der Summary (`completion_tokens` des
-    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung), `keep` die dabei
-    /// verwendete Zahl überlebender Turns (über die Kandidaten entschieden)
-    /// und `log_path` der Protokollordner der Kompaktierung (falls geschrieben).
-    Compacted(usize, String, u64, usize, Option<String>),
+    /// Kompaktierungs-Aufrufs, Fallback: Zeichen-Schätzung) und `keep` die
+    /// dabei verwendete Zahl überlebender Turns (über die Kandidaten
+    /// entschieden).
+    Compacted(usize, String, u64, usize),
     /// Hintergrund-Laden des Channel Builders abgeschlossen: (images_with_wd, container_info, worktrees)
     BuilderLoaded(
         Vec<(String, Option<String>)>,
@@ -170,14 +160,14 @@ pub enum WorkerEvent {
     ),
     /// Modell-Liste von einem Provider abgerufen: `(modell_id, demand)`.
     ModelsRefreshed(Vec<(String, Option<u64>)>),
-    /// Ein Modell-Probe-Ergebnis auf einem API-Protokoll – für den
+    /// Ein Modell-Probe-Ergebnis auf einem API-Format – für den
     /// Statusindikator im Modell-Picker. `model` ist der Registry-Key
-    /// (`provider/alias`), `ok` gibt an, ob das Modell auf diesem Protokoll
+    /// (`provider/alias`), `ok` gibt an, ob das Modell auf diesem Format
     /// korrekt geantwortet hat. Der Client aktualisiert damit den grün/gelb/rot-
     /// Status des Modells (siehe `ModelRegistry::record_probe`).
     ModelProbe {
         model: String,
-        protocol: ApiProtocol,
+        shape: ApiShape,
         ok: bool,
     },
     /// Eine neue HTTP-Runde der laufenden Antwort wird abgesendet
@@ -201,7 +191,9 @@ pub enum WorkerEvent {
 }
 
 /// Token-Verbrauch der letzten Antwort (via `stream_options.include_usage`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// `Default` = „nichts gemessen“ (alle Zähler 0) – der Ausgangswert, bevor der
+/// Server ein `usage`-Event liefert.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -265,8 +257,9 @@ mod wire;
 mod worker;
 
 // Externe API: von app.rs / ui.rs genutzt
+pub(crate) use api::ApiShape;
 pub(crate) use compact::{can_compact, spawn_compact, CompactTrigger};
-pub(crate) use http::shared_client;
+pub(crate) use http::{distribute_weights, shared_client};
 pub(crate) use wire::{WireFunction, WireMessage, WireTokens, WireToolCall};
 pub(crate) use worker::{spawn_user_run, spawn_worker};
 
@@ -274,14 +267,14 @@ pub(crate) use worker::{spawn_user_run, spawn_worker};
 #[cfg(test)]
 pub(crate) use compact::{
     compact_chat_messages, decide_keep, looks_like_context_error, plan_candidates,
-    render_compaction_log, wire_compact_boundary, CompactionLog,
+    wire_compact_boundary,
 };
 #[cfg(test)]
 pub(crate) use helpers::{
     civil_from_days, reasoning_contract_hint, server_error_summary, truncate, with_debug,
 };
 #[cfg(test)]
-pub(crate) use http::{distribute_weights, parse_usage, retry_delay, RoundPartsAccumulator};
+pub(crate) use http::{parse_usage, retry_delay, RoundPartsAccumulator};
 #[cfg(test)]
 pub(crate) use tools_def::dummy_tool;
 #[cfg(test)]

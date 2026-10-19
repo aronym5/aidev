@@ -181,13 +181,13 @@ pub enum ModelConfig {
 fn validate_model_id(id: &str) -> Result<&str, String> {
     if id.matches('/').count() != 1 {
         return Err(format!(
-            "Modell-ID '{id}' muss genau ein '/' enthalten (Format provider/name)"
+            "Model id '{id}' must contain exactly one '/' (format provider/name)"
         ));
     }
-    let (provider, name) = id.split_once('/').expect("genau ein '/' geprüft");
+    let (provider, name) = id.split_once('/').expect("exactly one '/' checked above");
     if provider.is_empty() || name.is_empty() {
         return Err(format!(
-            "Modell-ID '{id}' braucht einen Provider und einen Namen"
+            "Model id '{id}' needs a provider and a name"
         ));
     }
     Ok(id)
@@ -517,7 +517,7 @@ impl Config {
                 )),
             }
         }
-        warnings.push("Keine Config gefunden, nutze Defaults.".to_string());
+        warnings.push("No config found, using defaults.".to_string());
         (Config::default(), warnings)
     }
 
@@ -556,7 +556,7 @@ impl Config {
                 let model_id = self
                     .models
                     .get(a)
-                    .ok_or_else(|| format!("Unbekannter Modell-Alias: {a}"))?
+                    .ok_or_else(|| format!("Unknown model alias: {a}"))?
                     .id();
                 self.resolve_id(model_id)
             }
@@ -596,7 +596,7 @@ impl Config {
     ) -> Result<ResolvedEndpoint, String> {
         let provider_cfg = self.provider.get(m.provider).ok_or_else(|| {
             format!(
-                "Unbekannter Provider '{}' in Modell '{}/{}'",
+                "Unknown provider '{}' in model '{}/{}'",
                 m.provider, m.provider, m.alias
             )
         })?;
@@ -620,10 +620,10 @@ impl Config {
     pub fn resolve_id(&self, model_id: &str) -> Result<ResolvedEndpoint, String> {
         let (provider_name, model_name) = model_id
             .split_once('/')
-            .ok_or_else(|| format!("Modell-ID muss Format 'provider/name' haben: {model_id}"))?;
+            .ok_or_else(|| format!("Model id must have the format 'provider/name': {model_id}"))?;
 
         let provider = self.provider.get(provider_name).ok_or_else(|| {
-            format!("Unbekannter Provider '{provider_name}' in Modell '{model_id}'")
+            format!("Unknown provider '{provider_name}' in model '{model_id}'")
         })?;
 
         let model_cfg = self.models.values().find(|m| m.id() == model_id);
@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn default_model_ist_provider_name斜线() {
+    fn default_model_ist_provider_name_slash() {
         let cfg: Config = toml::from_str("").expect("leere TOML nutzt Defaults");
         assert!(
             cfg.model.contains('/'),
@@ -1469,7 +1469,7 @@ mod tests {
             warnings[0]
         );
         assert!(
-            warnings[1].contains("Keine Config gefunden"),
+            warnings[1].contains("No config found"),
             "{}",
             warnings[1]
         );
@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(cfg.model, "zen/big-pickle");
         assert_eq!(
             warnings,
-            vec!["Keine Config gefunden, nutze Defaults.".to_string()]
+            vec!["No config found, using defaults.".to_string()]
         );
 
         // Aufräumen.

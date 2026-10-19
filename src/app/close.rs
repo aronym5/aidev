@@ -46,7 +46,7 @@ impl App {
             matches
                 && (s.phase == Phase::WaitingForLLM
                     || s.phase == Phase::WaitingForTool
-                    || !s.open_tool_ids.is_empty())
+                    || s.live_tool.is_some())
         });
         if active {
             self.channel_close = Some(ChannelClose {
@@ -64,9 +64,8 @@ impl App {
 
     fn close_channel_worktree_phase(&mut self, name: &str, kind: CloseKind) {
         // Laufende Worker auf diesem Kanal abbrechen, bevor wir aufräumen
-        // (analog zum ursprünglichen `close_session`).
-        // Laufende Worker auf diesem Kanal abbrechen (Arc klonen, damit wir
-        // self.channels nicht parallel halten müssen).
+        // (analog zum ursprünglichen `close_session`; Arc klonen, damit wir
+        // `self.channels` nicht parallel halten müssen).
         let channel_arc = self.channels.get(name);
         for s in &self.sessions {
             if let (Some(arc_ch), Some(target)) = (&s.channel, &channel_arc) {
@@ -247,12 +246,39 @@ impl App {
                                 // Committen & löschen, dann Container-Phase.
                                 if let Some(wt) = wt {
                                     if let Ok(repo) = crate::repo::RepoManager::discover(&wt.path) {
-                                        let _ = crate::repo::git_commit_all(
+                                        // Der Snapshot ist die Zusicherung dieser Option
+                                        // („create snapshot, then delete"): Nur löschen,
+                                        // wenn er gelungen ist – sonst wäre der Worktree
+                                        // samt Änderungen weg, obwohl der User gerade
+                                        // Sicherung gewählt hat.
+                                        match crate::repo::git_commit_all(
                                             &wt.path,
                                             "Last Aidev Worktree Snapshot",
-                                        );
-                                        // Nicht fatal – Kanal schließt trotzdem.
-                                        let _ = repo.remove_worktree(&wt.name, true);
+                                        ) {
+                                            Ok(_) => {
+                                                // Nicht fatal – Kanal schließt trotzdem.
+                                                let _ = repo.remove_worktree(&wt.name, true);
+                                            }
+                                            Err(e) => {
+                                                // Nichts gelöscht. Der Dialog bleibt offen
+                                                // und nennt den Grund; der Default liegt
+                                                // jetzt auf „Behalten".
+                                                self.channel_close = Some(ChannelClose {
+                                                    name: d.name.clone(),
+                                                    kind,
+                                                    phase: ChannelClosePhase::Worktree {
+                                                        summary: format!(
+                                                            "{summary}\n\nSnapshot failed – \
+                                                             nothing was deleted:\n{e}"
+                                                        ),
+                                                        nav: ListNav::new_at(4, 2),
+                                                        options: CHANNEL_CLOSE_WORKTREE_OPTIONS
+                                                            .to_vec(),
+                                                    },
+                                                });
+                                                return;
+                                            }
+                                        }
                                     }
                                 }
                                 self.close_channel_container_phase(&d.name, kind);

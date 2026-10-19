@@ -351,21 +351,28 @@ impl App {
                         // soll unangetastet bleiben. Das Mitnehmen von
                         // Änderungen ist das explizite `/branch`-Angebot.
                         match repo.create_worktree(branch, Some(&host_root)) {
-                            Ok(info) => Some(info),
+                            Ok(info) => {
+                                // Hinweis (z.B. Submodule nicht ausgecheckt)
+                                // sichtbar machen – nicht fatal, aber relevant:
+                                // ein leerer Submodule-Ordner fiele sonst nicht
+                                // auf, weil `git status` dort „clean“ meldet.
+                                if let Some(n) = info.notice.clone() {
+                                    self.active_mut().set_error(n);
+                                }
+                                Some(info)
+                            }
                             Err(e) => {
                                 let s = self.active_mut();
-                                s.error = Some(format!(
+                                s.set_error(format!(
                                     "Could not create worktree for branch '{branch}': {e}"
                                 ));
-                                s.error_debug = None;
                                 return;
                             }
                         }
                     }
                     Err(e) => {
                         let s = self.active_mut();
-                        s.error = Some(format!("Could not determine Git repo: {e}"));
-                        s.error_debug = None;
+                        s.set_error(format!("Could not determine Git repo: {e}"));
                         return;
                     }
                 }
@@ -473,8 +480,7 @@ impl App {
                 Self::warmup_channel(&ch);
                 let s = self.active_mut();
                 s.set_channel(Some(ch));
-                s.error = None;
-                s.error_debug = None;
+                s.clear_errors();
                 apply_channel_permission_default(s);
                 return;
             }
@@ -533,8 +539,7 @@ impl App {
             }
             Err(err) => {
                 let s = self.active_mut();
-                s.error = Some(format!("Could not create channel: {err}"));
-                s.error_debug = None;
+                s.set_error(format!("Could not create channel: {err}"));
             }
         }
     }
@@ -556,8 +561,7 @@ impl App {
             }
             Err(err) => {
                 let s = self.active_mut();
-                s.error = Some(format!("Cannot duplicate: {err}"));
-                s.error_debug = None;
+                s.set_error(format!("Cannot duplicate: {err}"));
             }
         }
     }

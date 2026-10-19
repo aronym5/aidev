@@ -140,7 +140,7 @@ mod tests {
         (0..height)
             .map(|y| {
                 (0..width)
-                    .map(|x| buf.get(x, y).symbol().to_string())
+                    .map(|x| buf[(x, y)].symbol().to_string())
                     .collect::<String>()
             })
             .collect()

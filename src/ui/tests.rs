@@ -1,6 +1,5 @@
-//! UI-Tests: nur ein schlanker Smoke-Test der neuen Event-basierten Render-
-//! Pipeline (`build_history_cache`, `build_live_blocks`, Layout). Die UI wird
-//! bewusst nicht mehr eingehend getestet – sie ändert sich noch (siehe Plan).
+//! UI-Tests der Event-basierten Render-Pipeline (`build_history_cache`,
+//! `build_live_blocks`, Layout, Block-Aufbereitung).
 
 use super::*;
 use crate::app::{Session, ViewLevel};
@@ -8,19 +7,11 @@ use crate::chat::EventKind;
 use crate::llm::Usage;
 use crate::perm::Permission;
 
-fn usage_zero() -> Usage {
-    Usage {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cached_tokens: None,
-    }
-}
-
 /// Überlebende Events zwischen Summary und neuem Turn: Ihre gespeicherte
 /// Kontextlänge (`context_len`) wird beim Einschieben der Summary um den Shift
 /// reduziert (grau); vor der Summary bleibt alles unverändert (grün), neue Turns
 /// danach sind wieder grün.
+
 #[test]
 fn ueberlebende_events_nach_summary_werden_verschoben() {
     let mut s = Session::new(0);
@@ -64,7 +55,6 @@ fn ueberlebende_events_nach_summary_werden_verschoben() {
         "[Compressed history - 1 earlier messages]\n\nzusammen".into(),
         10,
         0,
-        None,
     );
 
     // Turn 3 – NEUER Turn NACH der Kompaktierung.
@@ -160,7 +150,7 @@ fn session_with_history() -> Session {
     );
     let aid = s.open_assistant("Gedanken".into(), "Hallo!".into());
     s.chat
-        .finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 1, 1, false);
+        .finalize_assistant(aid, std::time::Instant::now(), Usage::default(), 1, 1, false);
     s
 }
 
@@ -248,14 +238,14 @@ fn live_blocks_zeigen_offene_assistant_rune() {
 }
 
 #[test]
-fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
+fn waehrend_der_tool_phase_liegen_runde_und_fertige_tools_in_der_historie() {
     use crate::chat::ToolKind;
     let mut s = Session::new(0);
     s.push_user_message("frage".into(), Some(Permission::Read), "m".into());
-    let aid = s.open_assistant(String::new(), String::new());
-    // Mittel-Zustand einer Mehr-Tool-Runde (verzögerte Runden-Schließung):
-    // Tool 1 ist schon beendet (`ToolEnd` verarbeitet), Tool 2 läuft noch –
-    // die Assistant-Runde selbst ist aber noch OFFEN.
+    s.open_assistant(String::new(), "Antwort.".into());
+    // Der erste Tool-Start beendet das Streaming: die Runde wird geschlossen
+    // (Tool-Phase), ihre Werkzeuge sind danach die einzigen offenen Events.
+    let aid = s.tool_parent().expect("Runde für die Tool-Phase");
     let t1 = s.open_tool(
         Some(aid),
         "c1".into(),
@@ -267,9 +257,8 @@ fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
             num_results_reported: 2,
         },
     );
-    s.chat.finish_tool(t1, std::time::Instant::now());
-    s.open_tool_ids.retain(|&t| t != t1); // wie `finalize_tool_event`
-    s.open_tool(
+    s.chat.close_event(t1, std::time::Instant::now()); // Tool 1 fertig (`ToolEnd`)
+    let t2 = s.open_tool(
         Some(aid),
         "c2".into(),
         "read".into(),
@@ -280,44 +269,43 @@ fn beendete_tools_bleiben_unter_offener_runde_sichtbar() {
         },
     );
 
+    let collect = |blocks: Vec<ChatBlock>| -> Vec<String> {
+        blocks
+            .into_iter()
+            .flat_map(|b| b.lines.into_iter().map(|l| l.to_string()))
+            .collect()
+    };
     let (hist, ctx) = build_history_cache(&s, 100, "m", 8192);
     let (live, _live_used) = build_live_blocks(&s, 100, 8192, &ctx);
-    let hist_text: Vec<String> = hist
-        .iter()
-        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
-        .collect();
-    let live_text: Vec<String> = live
-        .iter()
-        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
-        .collect();
-    // Das beendete Tool 1 gehört zur noch OFFENEN Runde → noch NICHT in der
-    // Historie, aber der Live-Tail muss es weiterhin zeigen (statisch), sonst
-    // verschwände es zwischen `ToolEnd` und Runden-Schluss aus der UI.
+    let hist_text = collect(hist);
+    let live_text = collect(live);
+    // Runde und fertiges Tool 1 sind abgeschlossen → Historie (in Reihenfolge,
+    // also auch in der richtigen Zeilenfolge über dem laufenden Tool 2).
     assert!(
-        !hist_text.iter().any(|l| l.contains("glob")),
-        "Runde offen → Tool 1 noch nicht in Historie: {hist_text:?}"
+        hist_text.iter().any(|l| l.contains("Antwort.")),
+        "geschlossene Runde in der Historie: {hist_text:?}"
     );
     assert!(
-        live_text.iter().any(|l| l.contains("glob")),
-        "beendetes Tool bleibt unter offener Runde sichtbar: {live_text:?}"
+        hist_text.iter().any(|l| l.contains("glob")),
+        "fertiges Tool 1 in der Historie: {hist_text:?}"
     );
+    // Nur das laufende Tool 2 ist offen → Live-Tail, ohne Tool 1 zu wiederholen.
     assert!(
         live_text
             .iter()
             .any(|l| l.contains("read") || l.contains("a.rs")),
-        "laufendes Tool sichtbar: {live_text:?}"
+        "laufendes Tool 2 im Live-Tail: {live_text:?}"
+    );
+    assert!(
+        !live_text.iter().any(|l| l.contains("glob")),
+        "fertiges Tool 1 nicht mehr im Live-Tail: {live_text:?}"
     );
 
-    // Sobald die Runde geschlossen wird (nächstes Chunk/Reasoning/Usage/Done),
-    // wandert das Paar (Runde + Tool-Kinder) in die Historie; der Live-Tail
-    // enthält danach nichts mehr davon.
-    s.finish_assistant(false, None);
+    // Tool 2 fertig → auch es wandert in die Historie; kein offenes Event mehr.
+    s.chat.close_event(t2, std::time::Instant::now());
     let (hist2, ctx2) = build_history_cache(&s, 100, "m", 8192);
     let (live2, _live_used) = build_live_blocks(&s, 100, 8192, &ctx2);
-    let hist2_text: Vec<String> = hist2
-        .iter()
-        .flat_map(|b| b.lines.iter().map(|l| l.to_string()))
-        .collect();
+    let hist2_text = collect(hist2);
     assert!(
         hist2_text.iter().any(|l| l.contains("glob")),
         "geschlossen → Tool 1 in Historie: {hist2_text:?}"
@@ -484,7 +472,7 @@ fn contentlose_runde_ohne_usage_behaelt_reasoning_schaetzung() {
     s.push_user_message("kurz".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant("nur Gedanken".into(), String::new());
     s.chat
-        .finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 0, 0, false);
+        .finalize_assistant(aid, std::time::Instant::now(), Usage::default(), 0, 0, false);
 
     let (_, ctx) = build_history_cache(&s, 100, "m", 8192);
     let est_user = crate::llm::estimate_tokens("kurz");
@@ -519,7 +507,7 @@ fn assistant_zeile_annotiert_reasoning_und_text_getrennt() {
     s.push_user_message("kurz".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant("Gedanken".into(), "Antwort".into());
     s.chat
-        .finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 5, 7, false);
+        .finalize_assistant(aid, std::time::Instant::now(), Usage::default(), 5, 7, false);
     let line = assistant_line(&s);
     assert!(
         line.contains("5+7"),
@@ -532,7 +520,7 @@ fn assistant_zeile_annotiert_reasoning_und_text_getrennt() {
     s.push_user_message("kurz".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant("".into(), "Antwort".into());
     s.chat
-        .finalize_assistant(aid, std::time::Instant::now(), usage_zero(), 0, 7, false);
+        .finalize_assistant(aid, std::time::Instant::now(), Usage::default(), 0, 7, false);
     let line = assistant_line(&s);
     assert!(
         line.contains("7") && !line.contains('+'),
@@ -570,7 +558,7 @@ fn assistant_runden_verifizieren_das_event_davor() {
             num_results_reported: 2,
         },
     );
-    s.chat.finish_tool(t1, t0);
+    s.chat.close_event(t1, t0);
     let a2 = s.open_assistant("fertig".into(), "Antwort".into());
     s.chat.finalize_assistant(a2, t0, usage(910), 0, 0, false);
 
@@ -720,7 +708,7 @@ fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
     s.push_user_message("alte frage".into(), Some(Permission::Read), "m".into());
     let a1 = s.open_assistant("gedanken alt".into(), "antwort alt".into());
     s.chat
-        .finalize_assistant(a1, std::time::Instant::now(), usage_zero(), 0, 0, false);
+        .finalize_assistant(a1, std::time::Instant::now(), Usage::default(), 0, 0, false);
     // Kontextlänge des letzten Events VOR der Summary (Overview-Schätzung des
     // alten Turns: User-Prompt + Reasoning, Text ohne Usage trägt 0).
     let old_before_summary =
@@ -733,7 +721,6 @@ fn kompaktierung_verankert_summary_zeile_und_schiebt_folgeverifikationen() {
         2,
         "[Compressed history - 1 earlier messages]\n\nzusammenfassung".into(),
         summary_tokens,
-        None,
     );
     // Neuer Turn NACH der Summary (Tail) mit serverbestätigter Usage.
     s.push_user_message("neue frage".into(), Some(Permission::Read), "m".into());
@@ -921,12 +908,7 @@ fn layout_blocks_reihen_logo_historie_live_auf() {
     let s = session_with_history();
     let (blocks, ctx) = build_history_cache(&s, 100, "m", 8192);
     let (live, _live_used) = build_live_blocks(&s, 100, 8192, &ctx);
-    let logo = ChatBlock {
-        lines: vec![Line::from("logo")],
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    };
+    let logo = ChatBlock::plain(vec![Line::from("logo")], false);
     let (placed, total) = layout_blocks(&logo, &blocks, &live);
     assert_eq!(placed.len(), blocks.len() + 1, "Logo + Historie");
     assert!(total > 0);
@@ -977,13 +959,13 @@ fn fusszeile_erscheint_nur_bei_antworten_ohne_tool_aufrufe() {
             );
         }
         s.chat
-            .finalize_assistant(aid, t0, usage_zero(), 0, 0, false);
+            .finalize_assistant(aid, t0, Usage::default(), 0, 0, false);
     }
     // Neuer Turn (Assistent übergibt wieder an den User).
     s.push_user_message("frage2".into(), Some(Permission::Read), "m".into());
     let aid = s.open_assistant(String::new(), "Antwort zwei".into());
     s.chat
-        .finalize_assistant(aid, t0, usage_zero(), 0, 0, false);
+        .finalize_assistant(aid, t0, Usage::default(), 0, 0, false);
 
     let (blocks, _ctx) = build_history_cache(&s, 200, "m", 8192);
     let footers: Vec<String> = blocks
@@ -1125,6 +1107,7 @@ fn tool_kind_detail_baut_kompakte_kurzform_aus_strukturierten_feldern() {
 /// Zellen breit sein – inkl. des Vorspanns (`num_w` Leerraum + `│` + Marker).
 /// Vorher war das Umbruchlimit für Folgezeilen `cell_w` statt `cell_w - (num_w+3)`,
 /// wodurch umgebrochene Zeilen um `num_w + 3` Zellen überliefen.
+
 #[test]
 fn diff_cell_folgezeilen_bleiben_unter_zellbreite() {
     use crate::ui::blocks::{diff_cell, disp_width, CellStyle};
@@ -1173,6 +1156,7 @@ fn diff_cell_folgezeilen_bleiben_unter_zellbreite() {
 /// muss dieselbe Gutter-Struktur wie eine Folgezeile tragen: `num_w` Leerraum +
 /// `│` + Marker – also den `│`-Trenner auch dort, wo keine Zeilennummer und kein
 /// Inhalt steht.
+
 #[test]
 fn empty_cell_zeigt_trenner_und_gutter_struktur() {
     use crate::ui::blocks::{disp_width, empty_cell, CellStyle};
@@ -1203,9 +1187,10 @@ fn empty_cell_zeigt_trenner_und_gutter_struktur() {
 /// Zoom 2+3 (Compact/Dialog): das Gedanken-Element ist eine EINZIGE Zeile mit
 /// dem Icon `U+1F5ED` in Spalte 2 und dem tatsächlichen Reasoning-Inhalt ab
 /// Spalte 4; Zeilenumbrüche werden zu Leerzeichen (wie Overview-Texte).
+
 #[test]
 fn gedanken_kompakt_ikon_spalte2_inhalt_ab_spalte4() {
-    let blk = thoughts_block("Zeile eins\nZeile zwei", false, None, 40, None);
+    let blk = thoughts_block("Zeile eins\nZeile zwei", false, 40);
     assert_eq!(
         blk.lines.len(),
         1,
@@ -1234,11 +1219,12 @@ fn gedanken_kompakt_ikon_spalte2_inhalt_ab_spalte4() {
 
 /// Zoom 2+3: läuft der Inhalt über den verfügbaren Platz, wird er mit „…“
 /// abgeschnitten (analog zur Overview) statt umgebrochen.
+
 #[test]
 fn gedanken_kompakt_kuerzt_ueberlauf_mit_auslassung() {
     // budget = width(10) − THOUGHT_INDENT(4) − PAD_R(2) = 4 Zellen
     // (davon 1 für „…“) → „ABC…“.
-    let blk = thoughts_block("ABCDEFGHIJ", false, None, 10, None);
+    let blk = thoughts_block("ABCDEFGHIJ", false, 10);
     assert_eq!(blk.lines.len(), 1, "bleibt eine Zeile, kein Umbruch");
     let s = blk.lines[0].to_string();
     assert!(s.ends_with("ABC…"), "Überlauf gekürzt + „…“: {s:?}");
@@ -1246,11 +1232,12 @@ fn gedanken_kompakt_kuerzt_ueberlauf_mit_auslassung() {
 
 /// Detail (Zoom 4): der ganze Text bleibt mehrzeilig ab Spalte 4 eingerückt;
 /// nur in der ersten Zeile steht zusätzlich das Icon in Spalte 2.
+
 #[test]
 fn gedanken_detail_voller_text_mit_ikon_nur_in_erster_zeile() {
     let reason = "Ein sehr langer Gedankentext, der über die verfügbare Breite \
                   hinaus läuft und daher in der Detailansicht umbrochen werden muss.";
-    let blk = thoughts_block(reason, true, None, 40, None);
+    let blk = thoughts_block(reason, true, 40);
     let repr: Vec<String> = blk.lines.iter().map(|l| l.to_string()).collect();
     assert!(
         repr.len() >= 2,
@@ -1281,6 +1268,7 @@ fn gedanken_detail_voller_text_mit_ikon_nur_in_erster_zeile() {
 
 /// Detail-Modus für grep: Vorkommen werden in kompakter Spaltenansicht
 /// statt nur als "N results" angezeigt.
+
 #[test]
 fn grep_detail_zeigt_vorkommen_in_spalten() {
     use crate::chat::ToolKind;
@@ -1316,7 +1304,6 @@ fn grep_detail_zeigt_vorkommen_in_spalten() {
         0,
         std::time::Instant::now(),
     );
-    s.open_tool_ids.retain(|&id| id != t);
     s.finish_assistant(false, None);
 
     let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
@@ -1346,6 +1333,7 @@ fn grep_detail_zeigt_vorkommen_in_spalten() {
 }
 
 /// Detail-Modus für glob: Dateipfade werden in Spalten angezeigt.
+
 #[test]
 fn glob_detail_zeigt_dateien_in_spalten() {
     use crate::chat::ToolKind;
@@ -1376,7 +1364,6 @@ fn glob_detail_zeigt_dateien_in_spalten() {
         0,
         std::time::Instant::now(),
     );
-    s.open_tool_ids.retain(|&id| id != t);
     s.finish_assistant(false, None);
 
     let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
@@ -1394,6 +1381,7 @@ fn glob_detail_zeigt_dateien_in_spalten() {
 }
 
 /// Ohne Detail-Modus (Compact/Dialog) bleibt grep/glob ein Einzeiler.
+
 #[test]
 fn grep_compact_bleibt_einzeiler() {
     use crate::chat::ToolKind;
@@ -1428,7 +1416,6 @@ fn grep_compact_bleibt_einzeiler() {
         0,
         std::time::Instant::now(),
     );
-    s.open_tool_ids.retain(|&id| id != t);
     s.finish_assistant(false, None);
 
     let (blocks, _) = build_history_cache(&s, 120, "m", 8192);
@@ -1449,6 +1436,7 @@ fn grep_compact_bleibt_einzeiler() {
 }
 
 /// Detail-Ansicht mit vielen Treffern: Spaltenanzahl passt sich dem Platz an.
+
 #[test]
 fn grep_detail_spaltenanzahl_passt_sich_an() {
     use crate::chat::ToolKind;
@@ -1484,7 +1472,6 @@ fn grep_detail_spaltenanzahl_passt_sich_an() {
         0,
         std::time::Instant::now(),
     );
-    s.open_tool_ids.retain(|&id| id != t);
     s.finish_assistant(false, None);
 
     let (blocks, _) = build_history_cache(&s, 200, "m", 8192);
@@ -1588,4 +1575,230 @@ fn preserve_breaks_blockzitate_bleiben_zeilengetreu() {
         show("> eins\n> zwei\nnormal text"),
         ["> eins", "> zwei", "> normal text"]
     );
+}
+
+// ── Channel-Builder-Overlay: Breite ─────────────────────────────────────────
+
+/// 90 % der Fensterbreite – bzw. die volle Fensterbreite, wenn 90 % darunter
+/// unter `BUILDER_MIN_WIDTH` (80 Spalten) fielen.
+
+#[test]
+fn builder_dialog_width_nimmt_90_prozent_oder_die_volle_breite() {
+    // Breite Fenster: 90 %.
+    assert_eq!(builder_dialog_width(200), 180);
+    assert_eq!(builder_dialog_width(120), 108);
+    assert_eq!(builder_dialog_width(100), 90);
+    assert_eq!(builder_dialog_width(89), 80); // genau 80 ist nicht "unter 80"
+                                              // Schmale Fenster: 90 % wären < 80 → volle Fensterbreite.
+    assert_eq!(builder_dialog_width(88), 88); // vorher: 79
+    assert_eq!(builder_dialog_width(80), 80); // vorher: 72
+    assert_eq!(builder_dialog_width(40), 40); // vorher: 36
+                                              // Der Dialog bleibt in jedem Fall innerhalb des Fensters.
+    for w in (1..=200).step_by(7) {
+        assert!(builder_dialog_width(w) <= w, "Breite {w} passt ins Fenster");
+    }
+}
+
+/// Smoke-Test für die schmalen Fenster, in denen jetzt die volle Breite genutzt
+/// wird: Das Rendern (inkl. Spalten-Layout, umbrechender Header, Inline-Felder)
+/// läuft ohne Panik durch.
+
+#[test]
+fn builder_rendert_auch_auf_schmalem_fenster() {
+    for (w, h) in [(40u16, 20u16), (80, 24), (24, 18)] {
+        let mut app = builder_app();
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).expect("TestBackend");
+        term.draw(|f| draw_channel_builder(f, &mut app))
+            .expect("render");
+    }
+}
+
+/// Minimaler App-Zustand mit geöffnetem Channel Builder: zwei Tunnel,
+/// ein längerer Host-Pfad, ein Branch.
+fn builder_app() -> App {
+    use crate::app::{ChannelBuilderState, Selection};
+    use crate::channel::builder::{HostPath, Tunnel, WorktreeEntry};
+    use crate::channel::ChannelRegistry;
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    let cfg = Config {
+        model: "test/m".into(),
+        mouse: false,
+        ..Config::default()
+    };
+    let channels = ChannelRegistry::new_with_warnings(&cfg).0;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = App::new(cfg, channels, tx, rx);
+    app.channel_builder = Some(ChannelBuilderState {
+        tunnels: Selection::wrap_at(
+            vec![
+                Tunnel::Local,
+                Tunnel::Image {
+                    name: "rust-2024-builder".into(),
+                    working_dir: None,
+                },
+            ],
+            0,
+        ),
+        host_paths: Selection::wrap_at(
+            vec![HostPath {
+                path: PathBuf::from("/home/work/git/ein-laengerer-projektname"),
+            }],
+            0,
+        ),
+        worktrees: Selection::wrap_at(
+            vec![WorktreeEntry {
+                label: "main (worktree)".into(),
+                path: PathBuf::from("/home/work/git/ein-laengerer-projektname"),
+                branch: "main".into(),
+                is_main: true,
+                has_worktree: true,
+            }],
+            0,
+        ),
+        col: 1,
+        container_info: None,
+        images_loaded: true,
+        current_is_git: true,
+        argv_path: None,
+        edit: None,
+        edit_error: None,
+    });
+    app
+}
+
+// ── Channel Builder: Zeilenumbruch (Marker bleibt am Inhalt) ───────────────
+
+/// `wrap_builder_cells`: bricht an Leerzeichen (das entfällt), nach
+/// Trennerzeichen (bleiben stehen) bzw. hart an der Spaltengrenze um – wie die
+/// Eingabe (`editor::wrap_ranges`), nur zellengenau.
+
+#[test]
+fn wrap_builder_cells_bricht_an_leerzeichen_und_trenner() {
+    let lines = |s: &str, w: usize| {
+        let chars: Vec<char> = s.chars().collect();
+        wrap_builder_cells(&chars, w)
+            .into_iter()
+            .map(|r| chars[r.clone()].iter().collect::<String>())
+            .collect::<Vec<_>>()
+    };
+    // Leerzeichen entfällt, Rest beginnt in der nächsten Zeile (Wortgrenze).
+    assert_eq!(lines("main task", 8), ["main", "task"]);
+    // Trenner bleiben am Zeilenende stehen, dahinter wird getrennt.
+    assert_eq!(lines("ho/me/a", 3), ["ho/", "me/", "a"]);
+    // Führendes Leerzeichen entfällt beim Umbruch (keine leere Zeile); der
+    // Text füllt die Zeile trotzdem bis zur Spaltengrenze.
+    assert_eq!(lines(" Tunnel", 5), ["Tunne", "l"]);
+    // Lange Wörter: hart an der Spaltengrenze.
+    assert_eq!(lines("abcdefgh", 3), ["abc", "def", "gh"]);
+}
+
+/// `split_column_entry`: Der Marker steht immer mit dem Inhalt in einer Zeile –
+/// nie allein. Über alle Spaltenbreiten hinweg keine Zeile, die nur den Marker
+/// zeigt; die erste Zeile beginnt mit dem Inhalt (mit oder ohne Marker).
+
+#[test]
+fn split_column_entry_haelt_marker_und_inhalt_zusammen() {
+    for col_w in 1..=40u16 {
+        let lines = split_column_entry(
+            "▶ ",
+            "/home/work/git/ein-laengerer-name",
+            Style::default(),
+            col_w,
+        );
+        assert!(
+            !lines.is_empty(),
+            "col_w {col_w}: Eintrag darf nie leer sein"
+        );
+        for l in &lines {
+            let text = l.to_string();
+            // Niemals eine Zeile, die nur den Marker enthält.
+            assert_ne!(text.trim(), "▶", "col_w {col_w}: '{text}' = nur Marker");
+            // Zeilen überschreiten die Spaltenbreite nicht.
+            let cells = text
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                .sum::<usize>();
+            assert!(
+                cells <= col_w as usize,
+                "col_w {col_w}: '{text}' = {cells} Zellen"
+            );
+        }
+        // Sieht die erste Zeile den Marker, dann auch den Inhalt dazu; ist die
+        // Spalte zu schmal für den Marker, beginnt die erste Zeile mit Inhalt.
+        let first = lines[0].to_string();
+        assert!(
+            first.starts_with("▶ ") && first.trim().len() > 2 || !first.starts_with("▶ "),
+            "col_w {col_w}: '{first}'"
+        );
+    }
+}
+
+/// Wohlgeformter Fall: Kurzer Text neben dem Marker, Rest an der Wortgrenze
+/// in der Folgezeile – wie vorher vom `Paragraph`-Umbruch („● main“ /
+/// „(worktree)“); die Folgezeile braucht dafür genug Breite (10 Zellen).
+
+#[test]
+fn split_column_entry_behaelt_komfortablen_umbruch() {
+    let lines = split_column_entry("● ", "main (worktree)", Style::default(), 10);
+    let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    assert_eq!(text, ["● main", "(worktree)"]);
+}
+
+/// End-to-End über die gerenderte Fläche: Auf schmalen Terminals darf keine
+/// Zeile existieren, die nur einen Marker (`▶`, `●`, `○`) enthält.
+
+#[test]
+fn builder_rendert_keinen_marker_ohne_inhalt() {
+    for (w, h) in [(24u16, 18u16), (30, 20), (40, 20), (60, 24)] {
+        let mut app = builder_app();
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).expect("TestBackend");
+        term.draw(|f| draw_channel_builder(f, &mut app))
+            .expect("render");
+        let buf = term.backend().buffer().clone();
+        for y in 0..h {
+            let row: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            let t = row.trim();
+            assert!(
+                t != "▶" && t != "●" && t != "○",
+                "{w}x{h} Zeile {y} zeigt nur den Marker: {row:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tabelle_verliert_beim_umbruch_keine_zeichen() {
+    use crate::ui::markdown::{logical_lines, wrap_markdown};
+    // Drei breite Spalten: die Tabelle passt nicht in die Breite, also werden
+    // mehrere Spalten gleichzeitig verkleinert und ihre Zellen mehrzeilig
+    // umgebrochen.
+    let src = "\
+| Sp1 | Sp2 | Sp3 |
+|---|---|---|
+| aaaaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbbbbbb | cccccccccccccccccccc |
+| x | y | z |";
+    let logical = logical_lines(src);
+    let width = 40usize;
+    let out = wrap_markdown(&logical, width, PAD);
+
+    // Keine physische Zeile darf die verfügbare Textbreite überschreiten.
+    for l in &out {
+        assert!(
+            l.width() <= width - PAD_R,
+            "Zeile zu breit ({} > {}): {:?}",
+            l.width(),
+            width - PAD_R,
+            l.to_string()
+        );
+    }
+    // Beim Zellumbruch darf kein Zeichen verloren gehen: die Kleinbuchstaben
+    // a/b/c kommen ausschließlich im jeweiligen Zellinhalt vor.
+    let text: String = out.iter().map(|l| l.to_string()).collect();
+    for (c, n) in [('a', 20), ('b', 20), ('c', 20)] {
+        assert_eq!(text.matches(c).count(), n, "Zeichen '{c}' verloren: {text}");
+    }
 }

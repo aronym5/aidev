@@ -8,7 +8,7 @@
 use indexmap::IndexMap;
 use std::collections::HashMap;
 
-use crate::llm::ApiProtocol;
+use crate::llm::ApiShape;
 
 /// Ausgang eines einzelnen Modell-Probe-Tests auf EINEM API-Protokoll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,10 +105,10 @@ impl ModelEntry {
     /// erfolgreicher Test auf einem Protokoll → grün bleibt grün); ein `Err`
     /// wird nur gesetzt, solange das jeweilige Protokoll nicht bereits
     /// erfolgreich war.
-    pub(crate) fn record_probe(&mut self, protocol: ApiProtocol, ok: bool) {
-        let slot = match protocol {
-            ApiProtocol::ChatCompletions => &mut self.probe_chat,
-            ApiProtocol::Responses => &mut self.probe_responses,
+    pub(crate) fn record_probe(&mut self, shape: ApiShape, ok: bool) {
+        let slot = match shape {
+            ApiShape::ChatCompletions => &mut self.probe_chat,
+            ApiShape::Responses => &mut self.probe_responses,
         };
         if *slot != Some(ProtocolResult::Ok) {
             *slot = Some(if ok {
@@ -155,46 +155,22 @@ pub struct ModelRegistry {
     /// Beim Refresh wird geprüft, ob ein serverseitiger Name schon unter einem
     /// (ggf. anderen) Alias existiert.
     dedup_idx: HashMap<(String, String), String>,
-    /// Hat至少ein Refresh stattgefunden? Erst dann werden Farben angezeigt.
+    /// Hat mindestens ein Refresh stattgefunden? Erst dann werden Farben angezeigt.
     refreshed: bool,
 }
 
 impl ModelRegistry {
     /// Erzeugt die Registry aus den konfigurierten Modellen.
     pub fn new(config_models: &IndexMap<String, crate::config::ModelConfig>) -> Self {
-        let mut entries = IndexMap::new();
-        let mut dedup_idx = HashMap::new();
-
-        for (alias, mc) in config_models {
-            let id = mc.id();
-            let (provider, server_model) = match id.split_once('/') {
-                Some((p, m)) => (p.to_string(), m.to_string()),
-                None => (String::new(), id.to_string()),
-            };
-            let key = format!("{}/{}", provider, alias);
-            let entry = ModelEntry {
-                provider,
-                alias: alias.clone(),
-                server_model,
-                context_window: mc.context_window(),
-                demand: None,
-                in_config: true,
-                fetched: false,
-                probe_chat: None,
-                probe_responses: None,
-            };
-            dedup_idx.insert(
-                (entry.provider.clone(), entry.server_model.clone()),
-                key.clone(),
-            );
-            entries.insert(key, entry);
-        }
-
-        ModelRegistry {
-            entries,
-            dedup_idx,
+        let mut registry = ModelRegistry {
+            entries: IndexMap::new(),
+            dedup_idx: HashMap::new(),
             refreshed: false,
-        }
+        };
+        // Auf einer leeren Registry ist `sync_from_config` genau die
+        // Erstbefüllung – kein eigener Code nötig.
+        registry.sync_from_config(config_models);
+        registry
     }
 
     /// Aktualisiert den Fetch-Status aller Modelle nach einem Refresh.
@@ -272,9 +248,9 @@ impl ModelRegistry {
     /// Verbucht ein Modell-Probe-Ergebnis (Ereignis vom Worker) auf einem
     /// API-Protokoll. Unbekannte/neue Keys (nicht in der Registry) werden
     /// ignoriert.
-    pub fn record_probe(&mut self, key: &str, protocol: ApiProtocol, ok: bool) {
+    pub fn record_probe(&mut self, key: &str, shape: ApiShape, ok: bool) {
         if let Some(entry) = self.entries.get_mut(key) {
-            entry.record_probe(protocol, ok);
+            entry.record_probe(shape, ok);
         }
     }
 
@@ -350,7 +326,7 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ApiProtocol;
+    use crate::llm::ApiShape;
     use indexmap::IndexMap;
 
     fn config_models() -> IndexMap<String, crate::config::ModelConfig> {
@@ -373,7 +349,7 @@ mod tests {
         assert_eq!(r.health(key), ModelHealth::None, "vor Test kein Zustand");
 
         // Erste Fehlermeldung auf EINEM Protokoll → gelb.
-        r.record_probe(key, ApiProtocol::ChatCompletions, false);
+        r.record_probe(key, ApiShape::ChatCompletions, false);
         assert_eq!(
             r.health(key),
             ModelHealth::Yellow,
@@ -381,7 +357,7 @@ mod tests {
         );
 
         // Auf allen Protokollen getestet, war gelb, nur Fehlermeldungen → rot.
-        r.record_probe(key, ApiProtocol::Responses, false);
+        r.record_probe(key, ApiShape::Responses, false);
         assert_eq!(
             r.health(key),
             ModelHealth::Red,
@@ -395,12 +371,12 @@ mod tests {
         let key = "test/fast";
 
         // Erst Fehler, dann Erfolg auf einem Protokoll → grün.
-        r.record_probe(key, ApiProtocol::ChatCompletions, false);
-        r.record_probe(key, ApiProtocol::ChatCompletions, true);
+        r.record_probe(key, ApiShape::ChatCompletions, false);
+        r.record_probe(key, ApiShape::ChatCompletions, true);
         assert_eq!(r.health(key), ModelHealth::Green);
 
         // Ein einmal bestätigtes grün wird durch spätere Fehler NICHT rot.
-        r.record_probe(key, ApiProtocol::Responses, false);
+        r.record_probe(key, ApiShape::Responses, false);
         assert_eq!(
             r.health(key),
             ModelHealth::Green,
@@ -411,7 +387,7 @@ mod tests {
     #[test]
     fn probe_unbekannter_key_wird_ignoriert() {
         let mut r = registry();
-        r.record_probe("unbekannt/modell", ApiProtocol::ChatCompletions, true);
+        r.record_probe("unbekannt/modell", ApiShape::ChatCompletions, true);
         assert_eq!(r.health("unbekannt/modell"), ModelHealth::None);
     }
 }

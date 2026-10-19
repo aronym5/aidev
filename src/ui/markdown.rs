@@ -441,7 +441,12 @@ pub(super) fn render_table_row(
     let mut col_lines: Vec<Vec<Vec<(char, Style)>>> = Vec::with_capacity(cells.len());
     let mut height = 1usize;
     for (cell, (&w, &align)) in cells.iter().zip(widths.iter().zip(aligns.iter())) {
-        let chunks = wrap_words(&cell.chars, w);
+        // Der sichtbare Zellinnenraum ist um die beiden Randspalten schmaler
+        // (`pad_cell` schneidet auf `w - 2`): Auch der Umbruch muss auf diese
+        // Innenbreite rechnen, sonst wäre jede Zellenzeile um 2 Zellen zu breit
+        // und die letzten beiden Zeichen würden am Zellrand abgeschnitten.
+        let inner = w.saturating_sub(2);
+        let chunks = wrap_words(&cell.chars, inner);
         let lines: Vec<Vec<(char, Style)>> = if chunks.is_empty() {
             vec![pad_cell(&[], w, align, cell.pad_style)]
         } else {
@@ -491,11 +496,10 @@ pub(super) fn table_widths(natural: &[usize], budget: usize) -> Vec<usize> {
     let mut excess = sum - avail;
     while excess > 0 {
         let mut idx = 0;
-        for (i, w) in widths.iter().enumerate() {
+        for i in 0..widths.len() {
             if widths[i] > widths[idx] {
                 idx = i;
             }
-            let _ = w;
         }
         if widths[idx] <= 1 {
             break; // alles bei Mindestbreite – Rest akzeptieren
@@ -952,7 +956,7 @@ pub(super) fn wrap_words(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char
             }
             let content: Vec<(char, Style)> = w[leading_ws..].to_vec();
             let mut chunks = split_long_word(&content, width).into_iter();
-            let last = chunks.next_back().expect("split_long_word liefert Chunks");
+            let last = chunks.next_back().expect("split_long_word yields chunks");
             out.extend(chunks);
             cur = last;
             cur_w = total_width(&cur);
@@ -975,10 +979,10 @@ pub(super) fn flatten<'a>(line: &Line<'a>) -> Vec<(char, Style)> {
     out
 }
 
-/// Bricht logische Markdown-Zeilen wortweise auf `width` Zellen um und
-/// versieht jede physische Zeile mit `indent` Leerzellen (hängender Einzug,
-/// der bei allen Fortsetzungszeilen berücksichtigt wird). Umbruch erfolgt nur
-/// an Whitespaces; zu lange Wörter werden hart getrennt.
+/// Bricht logische Klartext-Zeilen wortweise auf `width` Zellen um und versieht
+/// jede physische Zeile mit `indent` Leerzellen (hängender Einzug, der bei allen
+/// Fortsetzungszeilen berücksichtigt wird). Nutzt dieselbe Engine wie der
+/// Markdown-Umbruch ([`wrap_words`]) – es gibt nur eine Umbruch-Semantik.
 pub(super) fn wrap_block<'a>(logical: &[Line<'a>], width: usize, indent: usize) -> Vec<Line<'a>> {
     // Symmetrischer Rand: rechts endet der Inhalt `PAD_R` Zellen vor dem Rand.
     let budget = width.saturating_sub(indent + PAD_R).max(1);
@@ -989,78 +993,12 @@ pub(super) fn wrap_block<'a>(logical: &[Line<'a>], width: usize, indent: usize) 
             out.push(Line::from(""));
             continue;
         }
-        for wl in wrap_line(line, budget) {
-            let mut spans = Vec::with_capacity(wl.spans.len() + 1);
+        for chunk in wrap_words(&flatten(line), budget) {
+            let mut spans = Vec::with_capacity(2);
             spans.push(Span::raw(pad.clone()));
-            spans.extend(wl.spans);
+            spans.extend(spans_of(&chunk).spans);
             out.push(Line::from(spans));
         }
-    }
-    out
-}
-
-/// Bricht eine logische Zeile an Whitespace-Grenzen zu physischen Zeilen der
-/// Breite `width` um (Wort-Umbruch, Styled-Zeichen bleiben erhalten).
-pub(super) fn wrap_line<'a>(line: &Line<'a>, width: usize) -> Vec<Line<'a>> {
-    // Wörter: Läufe nicht-Whitespace-Zeichen mit ihrem Style.
-    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
-    for span in &line.spans {
-        let style = span.style;
-        let mut word: Vec<(char, Style)> = Vec::new();
-        for c in span.content.chars() {
-            if c.is_whitespace() {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            } else {
-                word.push((c, style));
-            }
-        }
-        if !word.is_empty() {
-            words.push(word);
-        }
-    }
-    if words.is_empty() {
-        return Vec::new();
-    }
-
-    let mut out: Vec<Line> = Vec::new();
-    let mut cur: Vec<(char, Style)> = Vec::new();
-    let mut cur_w = 0usize;
-    for word in words {
-        let ww = total_width(&word);
-        let space = usize::from(cur_w > 0);
-        if cur_w + space + ww <= width {
-            if space > 0 {
-                cur.push((' ', Style::default()));
-                cur_w += 1;
-            }
-            cur.extend(word);
-            cur_w += ww;
-        } else if ww <= width {
-            if !cur.is_empty() {
-                out.push(spans_of(&cur));
-                cur.clear();
-            }
-            cur = word;
-            cur_w = ww;
-        } else {
-            // Wort breiter als die Zeile: Rest beenden, dann mit
-            // Trennzeichen-/Blind-Bruch aufteilen. Das letzte Stück bleibt
-            // als `cur`, damit ein folgendes Wort die Zeile auffüllen kann.
-            if !cur.is_empty() {
-                out.push(spans_of(&cur));
-                cur.clear();
-            }
-            let mut chunks = split_long_word(&word, width).into_iter();
-            let last = chunks.next_back().expect("split_long_word liefert Chunks");
-            out.extend(chunks.map(|c| spans_of(&c)));
-            cur = last;
-            cur_w = total_width(&cur);
-        }
-    }
-    if !cur.is_empty() || out.is_empty() {
-        out.push(spans_of(&cur));
     }
     out
 }

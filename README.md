@@ -143,7 +143,7 @@ or build a new one via the "new channel" entry.
 | `Esc`                        | Cancel running response / abort / close dialog                                        |
 | `Ctrl+N`                     | New session / tab                                                                     |
 | `Ctrl+D` / `Ctrl+W`          | Close session / tab                                                                   |
-| `Alt+←` / `Alt+→`            | Switch session / tab (or `Ctrl+1`…`Ctrl+9`)                                           |
+| `Alt+←` / `Alt+→`            | Switch session / tab (or `Shift+Alt+←` / `Shift+Alt+→`, `Ctrl+1`…`Ctrl+9`)            |
 | `Alt+C`                      | Open channel picker (choose / manage / build new)                                     |
 | `Alt+M`                      | Open model picker (same as `/model` without argument)                                 |
 | `Alt+D`                      | Duplicate channel (own worktree)                                                      |

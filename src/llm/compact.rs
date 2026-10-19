@@ -1,7 +1,5 @@
-//! Kontext-Kompaktierung: Planung, Entscheidung,
-//! Ausführung und Protokoll (Debug-Ablage wie bei Fehlerantworten).
+//! Kontext-Kompaktierung: Planung, Entscheidung und Ausführung.
 
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -11,8 +9,7 @@ use serde_json::Value;
 
 use super::api::ApiShape;
 use super::helpers::{
-    debug_dir, dump_debug, error_chain, error_message, server_error_summary, timestamp, with_debug,
-    ERROR_SUMMARY_MAX,
+    dump_debug, error_chain, error_message, server_error_summary, with_debug, ERROR_SUMMARY_MAX,
 };
 use super::http::{accumulate_sse_event, shared_client};
 use super::wire::{WireMessage, WireTokens};
@@ -39,8 +36,7 @@ Summarize the chat history above. Reply only with the precise summary - \
 no introduction, no comment, and no continuation of the dialogue. Write the \
 summary in the language of the conversation / the user.";
 
-/// Auslöser der Kompaktierung – bestimmt die Entscheidung über den Schnitt
-/// und wird im Protokoll festgehalten.
+/// Auslöser der Kompaktierung – bestimmt die Entscheidung über den Schnitt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactTrigger {
     /// Automatisch direkt nach Abschluss der finalen Antwort – läuft parallel
@@ -53,28 +49,6 @@ pub(crate) enum CompactTrigger {
     Reactive,
     /// Manuell per Slash-Befehl `/compact`.
     Manual,
-}
-
-impl CompactTrigger {
-    /// Menschenlesbares Label für Protokoll/Status.
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            CompactTrigger::AutoTurn => "auto (nach Turn)",
-            CompactTrigger::Proactive => "proaktiv (vor Turn)",
-            CompactTrigger::Reactive => "reaktiv (context_length-Fehler)",
-            CompactTrigger::Manual => "manuell (/compact)",
-        }
-    }
-
-    /// Kurzes, dateinamen-taugliches Kürzel für den Protokoll-Ordner.
-    fn dir_tag(self) -> &'static str {
-        match self {
-            CompactTrigger::AutoTurn => "auto-nach-turn",
-            CompactTrigger::Proactive => "proaktiv",
-            CompactTrigger::Reactive => "reaktiv",
-            CompactTrigger::Manual => "manuell",
-        }
-    }
 }
 
 /// Ermittelt den Index, ab dem die letzten `keep_turns` Turns bei der
@@ -186,21 +160,6 @@ pub(crate) fn can_compact(msgs: &[WireMessage]) -> bool {
     cut_limit(msgs) > 0
 }
 
-/// Tokenzahl einer einzelnen Wire-Nachricht – die Summe der Bestandteile, die
-/// `api_messages` je Nachricht bereits bewertet hat: pro Bestandteil die
-/// bestätigte Zahl aus dem Event-Log, sonst die Zeichenschätzung über genau
-/// diesen Text (also auch Reasoning und Tool-Aufrufe; siehe `WireTokens`).
-/// reine Summenfunktion – die Entscheidung „bestätigt oder geschätzt“ fällt in
-/// der Projektion, damit Protokoll und Planung exakt dieselbe Zahl sehen.
-fn wire_tokens_of(m: &WireMessage) -> u64 {
-    m.tokens.total()
-}
-
-/// Tokens einer Wire-Nachrichtenliste (bestätigt, wo gemessen – sonst geschätzt).
-fn wire_tokens(msgs: &[WireMessage]) -> u64 {
-    msgs.iter().map(wire_tokens_of).sum()
-}
-
 /// Ein möglicher Schnitt: wo der Schnitt läge (`boundary`), wie viel wegfällt
 /// (`dropped_tokens`) und was übrig bliebe (`kept_tokens`). Die Größen kommen
 /// je Bestandteil aus dem Event-Log (bestätigte Usage), sonst aus der
@@ -233,12 +192,15 @@ pub(crate) fn plan_candidates(msgs: &[WireMessage], max_keep: usize) -> Vec<CutC
         if boundary == 0 {
             continue;
         }
+        // Tokens je Seite = Summe der pro Nachricht bereits bewerteten
+        // Bestandteile (`WireTokens::total`); die Entscheidung „bestätigt oder
+        // geschätzt“ ist in der Projektion (`api_messages`) schon gefallen.
         out.push(CutCandidate {
             keep_turns: k,
             boundary,
             archived_msgs: boundary,
-            dropped_tokens: msgs[..boundary].iter().map(wire_tokens_of).sum(),
-            kept_tokens: msgs[boundary..].iter().map(wire_tokens_of).sum(),
+            dropped_tokens: msgs[..boundary].iter().map(|m| m.tokens.total()).sum(),
+            kept_tokens: msgs[boundary..].iter().map(|m| m.tokens.total()).sum(),
             previous_cut: k > limit,
         });
     }
@@ -259,8 +221,7 @@ fn target_kept_tokens(config: &Config, context_window: u64) -> u64 {
 /// Entscheidet über die konkrete Schnittstelle (`keep_turns`) aus den
 /// Kandidaten. Liefert `None`, wenn es nichts zu kompaktieren gibt (kein
 /// echter Schnitt möglich, oder nur die Stelle der letzten Kompaktierung
-/// infrage käme); sonst die gewählte `keep_turns`-Zahl und die vollständige
-/// Kandidaten-Tabelle (für das Protokoll).
+/// infrage käme); sonst die gewählte `keep_turns`-Zahl.
 ///
 /// Der Spielraum ist `1..=cut_limit(msgs)`: `keep_turns` zählt die GENAU
 /// überlebenden Turns (so bleibt bei `keep_turns = 1` nur der letzte Turn –
@@ -291,13 +252,11 @@ pub(crate) fn decide_keep(
     config: &Config,
     trigger: CompactTrigger,
     context_window: u64,
-) -> Option<(usize, Vec<CutCandidate>)> {
-    // Vollständige Tabelle für das Protokoll – inklusive des ggf.
-    // ausgeschlossenen Schnitts an der letzten Kompaktierungsstelle.
+) -> Option<usize> {
     let candidates = plan_candidates(msgs, possible_max_keep(msgs));
     let selectable: Vec<&CutCandidate> = candidates.iter().filter(|c| !c.previous_cut).collect();
     let budget = config.compact_summary_tokens;
-    let chosen = match trigger {
+    match trigger {
         // Reaktiv: stärkster Schnitt, der das volle Fenster sicher einhält.
         CompactTrigger::Reactive => selectable
             .iter()
@@ -324,18 +283,13 @@ pub(crate) fn decide_keep(
                 .min()
                 .map(|(_, std::cmp::Reverse(k))| k)
         }
-    };
-    chosen.map(|keep| (keep, candidates))
+    }
 }
 
-/// Ergebnis-Objekt des Zusammenfassungs-Aufrufs: Inhalt, Tokenlänge und die
-/// HTTP-Daten fürs Protokoll (Request-Body + Roh-Antwort).
+/// Ergebnis des Zusammenfassungs-Aufrufs: Inhalt und Tokenlänge.
 pub(crate) struct SummaryResult {
     pub content: String,
     pub tokens: u64,
-    pub url: String,
-    pub request: Value,
-    pub response: String,
 }
 
 /// Ein separater Zusammenfassungs-Aufruf – in der API-Shape des Endpunkts
@@ -359,7 +313,7 @@ pub(crate) fn request_summary(
     cancel: &AtomicBool,
 ) -> Result<SummaryResult, String> {
     if cancel.load(Ordering::Relaxed) {
-        return Err("abgebrochen".into());
+        return Err("aborted".into());
     }
     if msgs.is_empty() {
         return Err("nothing to compact".into());
@@ -427,7 +381,7 @@ pub(crate) fn request_summary(
         }
         let resp = match req.json(&body).send() {
             Ok(r) => r,
-            Err(err) => return Err(format!("Netzwerkfehler: {}", error_chain(&err))),
+            Err(err) => return Err(format!("Network error: {}", error_chain(&err))),
         };
         if resp.status().is_success() {
             // Diese Shape hat funktioniert → als „bestätigt“ merken (geteilter
@@ -448,13 +402,7 @@ pub(crate) fn request_summary(
             let tokens = usage
                 .map(|u| u.completion_tokens)
                 .unwrap_or_else(|| super::estimate_tokens(&content));
-            return Ok(SummaryResult {
-                content,
-                tokens,
-                url,
-                request: body,
-                response: raw,
-            });
+            return Ok(SummaryResult { content, tokens });
         }
         let status = resp.status();
         let raw = resp.text().unwrap_or_default();
@@ -469,7 +417,7 @@ pub(crate) fn request_summary(
         }
         let summary = server_error_summary(&raw, ERROR_SUMMARY_MAX);
         let debug = dump_debug(
-            &format!("zusammenfassung-{status}"),
+            &format!("summary-{status}"),
             &ep.model,
             &url,
             &body,
@@ -497,7 +445,7 @@ pub(crate) fn request_summary(
 /// *kein* `eprintln!`: Der Kompaktierungs-Aufruf läuft im TUI, stderr-Ausgaben
 /// würden das Layout zerschießen.)
 fn summary_from_response(shape: ApiShape, raw: &str) -> Result<(String, Option<Usage>), String> {
-    let kein_text = || "Zusammenfassung: kein Antworttext in der Antwort.".to_string();
+    let kein_text = || "Summary: no answer text in the response.".to_string();
     let is_sse = raw.lines().any(|l| l.trim_start().starts_with("data:"));
     if !is_sse {
         let v: Value =
@@ -551,221 +499,15 @@ fn summary_from_response(shape: ApiShape, raw: &str) -> Result<(String, Option<U
     Ok((out, usage))
 }
 
-/// Kurzübersicht der für die Kompaktierung relevanten Historie (eine Zeile je
-/// Wire-Nachricht: Index, Rolle, Tokens – bestätigt, wo der Server gemessen
-/// hat, sonst geschätzt –, gekürzter Inhalt) – für das Protokoll.
-fn message_overview(msgs: &[WireMessage]) -> String {
-    let mut out = String::new();
-    for (i, m) in msgs.iter().enumerate() {
-        let t = wire_tokens_of(m);
-        let raw = m.content.as_deref().unwrap_or_default();
-        let one_line: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let shown: String = one_line.chars().take(120).collect();
-        let truncated = shown.chars().count() < one_line.chars().count();
-        let _ = writeln!(
-            out,
-            "[{:3}] {:<10} {:>6} T  {}{}",
-            i,
-            m.role,
-            t,
-            shown,
-            if truncated { "…" } else { "" }
-        );
-    }
-    out
-}
-
-/// Sammelt alle Informationen eines Kompaktierungs-Vorgangs für das Protokoll.
-pub(crate) struct CompactionLog {
-    pub trigger: CompactTrigger,
-    pub model: String,
-    pub base_url: String,
-    /// Konkrete Request-URL des Zusammenfassungs-Aufrufs.
-    pub url: String,
-    pub context_window: u64,
-    pub compact_at: f64,
-    /// `compact_keep_ratio` – Zielanteil des Fensters für den erhaltenen Tail.
-    pub keep_ratio: f64,
-    /// Zielgröße des erhaltenen Historienteils in Tokens (`context_window ×
-    /// min(keep_ratio, compact_at)`) – die Größe, der der Tail am nächsten
-    /// kommen soll.
-    pub target_tokens: u64,
-    /// `compact_summary_tokens` – konservativer Ansatz für die Summary-Länge.
-    pub summary_budget: u64,
-    pub threshold: u64,
-    pub current_tokens: u64,
-    pub decided_keep: usize,
-    pub candidates: Vec<CutCandidate>,
-    pub chosen: CutCandidate,
-    pub archived_msgs: usize,
-    pub summary: String,
-    pub summary_tokens: u64,
-    pub overview: String,
-    pub request: Value,
-    pub response: String,
-}
-
-/// Baut den vollständigen Inhalt des Kompaktierungs-Protokolls (Dateiname →
-/// Inhalt) – rein, ohne Datei-I/O, damit testbar:
-///
-/// - `meta.txt`      – Auslöser, Randbedingungen (Kontextgröße, Konfiguration)
-///   und getroffene Entscheidung samt erreichten Summary-Tokens.
-/// - `overview.txt`  – Kurzübersicht der relevanten Historie.
-/// - `plan.txt`      – Kandidaten-Tabelle.
-/// - `summary.txt`   – die erreichte Zusammenfassung mit ihrer Tokenlänge.
-/// - `request.json` / `response.txt` – der Zusammenfassungs-Aufruf.
-pub(crate) fn render_compaction_log(log: &CompactionLog) -> Vec<(String, String)> {
-    let mut files = Vec::new();
-
-    // ── meta.txt: Auslöser + Randbedingungen + Entscheidung ────────────────
-    let mut meta = String::new();
-    let _ = writeln!(meta, "time:            {}", timestamp());
-    let _ = writeln!(meta, "trigger:         {}", log.trigger.label());
-    let _ = writeln!(meta, "model:           {}", log.model);
-    let _ = writeln!(meta, "base_url:        {}", log.base_url);
-    let _ = writeln!(meta, "url:             {}", log.url);
-    let _ = writeln!(meta, "context_window:  {}", log.context_window);
-    let _ = writeln!(meta, "compact_at:      {}", log.compact_at);
-    let _ = writeln!(
-        meta,
-        "threshold:       {} (context_window × compact_at)",
-        log.threshold
-    );
-    let _ = writeln!(meta, "keep_ratio:      {}", log.keep_ratio);
-    let _ = writeln!(
-        meta,
-        "target_tokens:   {} (Ziel für den erhaltenen Tail)",
-        log.target_tokens
-    );
-    let _ = writeln!(
-        meta,
-        "current_tokens:  {} (aktueller Kontext)",
-        log.current_tokens
-    );
-    let _ = writeln!(
-        meta,
-        "decided_keep:    {} (Schnitt an Wire-Index {})",
-        log.decided_keep, log.chosen.boundary
-    );
-    let _ = writeln!(meta, "archived_msgs:   {}", log.archived_msgs);
-    let _ = writeln!(
-        meta,
-        "dropped_tokens:  {} (geschätzt, wegfällender Kontext)",
-        log.chosen.dropped_tokens
-    );
-    let _ = writeln!(
-        meta,
-        "kept_tokens:     {} (geschätzt, bleibender Kontext)",
-        log.chosen.kept_tokens
-    );
-    let _ = writeln!(
-        meta,
-        "summary_tokens:  {} (erreichte Zusammenfassung)",
-        log.summary_tokens
-    );
-    files.push(("meta.txt".into(), meta));
-
-    // ── overview.txt: Kurzübersicht der relevanten Historie ────────────────
-    files.push((
-        "overview.txt".into(),
-        format!("Relevante Historie (Wire-Projektion):\n\n{}", log.overview),
-    ));
-
-    // ── plan.txt: Kandidaten ──────────────────────────────────────────────
-    let mut plan = String::new();
-    match log.trigger {
-        // Normalfall: das Freiziel bestimmt die Wahl, der Summary-Budget ist
-        // nur nachrichtlich (er wird zusätzlich auf die Summary gesetzt).
-        CompactTrigger::Reactive => {
-            let _ = writeln!(
-                plan,
-                "Kandidaten – Ziel: kleinstes keep, dessen \
-                 Folge-Kontext (Tail + Summary-Budget {}) ins volle Fenster ({}) passt:",
-                log.summary_budget, log.context_window,
-            );
-        }
-        _ => {
-            let _ = writeln!(
-                plan,
-                "Kandidaten – Ziel: ~{} T (~{} % des Fensters) \
-                 bleiben; gewählt wird der Schnitt mit dem kleinsten Abstand dazu:",
-                log.target_tokens,
-                log.keep_ratio * 100.0,
-            );
-        }
-    }
-    for c in &log.candidates {
-        let marker = if c.previous_cut {
-            "  <- Stelle der letzten Kompaktierung – ausgeschlossen"
-        } else if c.keep_turns == log.decided_keep {
-            "  <-- gewählt"
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            plan,
-            "  keep={:<3} Schnitt@Wire-{:<5} archiviert: {:<4} Msg | ~{} T weg | ~{} T bleiben \
-             | Abstand zum Ziel: ~{} T{}",
-            c.keep_turns,
-            c.boundary,
-            c.archived_msgs,
-            c.dropped_tokens,
-            c.kept_tokens,
-            c.kept_tokens.abs_diff(log.target_tokens),
-            marker
-        );
-    }
-    files.push(("plan.txt".into(), plan));
-
-    // ── summary.txt: erreichte Zusammenfassung + Tokenlänge ────────────────
-    let summary = format!(
-        "summary_tokens: {}\narchived_msgs:  {}\n\n{}\n",
-        log.summary_tokens, log.archived_msgs, log.summary
-    );
-    files.push(("summary.txt".into(), summary));
-
-    // ── request.json / response.txt ────────────────────────────────────────
-    files.push((
-        "request.json".into(),
-        serde_json::to_string_pretty(&log.request).unwrap_or_default(),
-    ));
-    files.push(("response.txt".into(), log.response.clone()));
-
-    files
-}
-
-/// Schreibt das Kompaktierungs-Protokoll nach
-/// `$XDG_DATA_HOME/aidev/debug/<zeitstempel>_kompaktierung-<auslöser>/`
-/// (bzw. `~/.local/share/aidev/debug/…`) – analog zu den Fehler-Dumps (siehe
-/// `render_compaction_log`). Liefert den Ordnerpfad, sonst `None`. In Tests
-/// wird nichts geschrieben.
-pub(crate) fn write_compaction_log(log: &CompactionLog) -> Option<String> {
-    if cfg!(test) {
-        return None;
-    }
-    let base = debug_dir()?;
-    let dir = base.join(format!(
-        "{}_kompaktierung-{}",
-        timestamp(),
-        log.trigger.dir_tag()
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
-    for (name, content) in render_compaction_log(log) {
-        std::fs::write(dir.join(name), content).ok()?;
-    }
-    Some(dir.display().to_string())
-}
-
 /// Ergebnis einer ausgeführten Kompaktierung:
 /// `(neue Wire-Historie, fertige Summary, Summary-Tokens, verwendetes
-/// `keep_turns`, Protokollpfad)`.
-pub(crate) type CompactionResult = (Vec<WireMessage>, String, u64, usize, Option<String>);
+/// `keep_turns`)`.
+pub(crate) type CompactionResult = (Vec<WireMessage>, String, u64, usize);
 
 /// Führt die Kompaktierung für EINEN Auslöser aus (Plan → Entscheidung →
-/// Zusammenfassung → Protokoll). Liefert die neue Wire-Historie (`repl`:
-/// Summary-User + unveränderter Tail), die fertige Summary (`content`), ihre
-/// Token-Zahl, das verwendete `keep_turns` und – falls geschrieben – den
-/// Protokollordner.
+/// Zusammenfassung). Liefert die neue Wire-Historie (`repl`: Summary-User +
+/// unveränderter Tail), die fertige Summary (`content`), ihre Token-Zahl und
+/// das verwendete `keep_turns`.
 ///
 /// Alle vier Auslöser laufen über diese EINE Quelle:
 ///
@@ -775,9 +517,6 @@ pub(crate) type CompactionResult = (Vec<WireMessage>, String, u64, usize, Option
 /// - **proaktiv** (`spawn_worker` vor dem Turn): `repl` wird als
 ///   Nachrichtenliste des kommenden Turns verwendet;
 /// - **reaktiv** (`spawn_worker` mitten im Tool-Loop): wie proaktiv.
-///
-/// `current_tokens` ist der (genauere) gemessene/gespeicherte Kontextstand aus
-/// der Session; `None` → Schätzung über die Wire-Nachrichten.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compact_chat_messages(
     session: usize,
@@ -787,11 +526,10 @@ pub(crate) fn compact_chat_messages(
     msgs: &[WireMessage],
     cancel: &AtomicBool,
     trigger: CompactTrigger,
-    current_tokens: Option<u64>,
 ) -> Result<CompactionResult, String> {
-    let Some((keep, candidates)) = decide_keep(msgs, config, trigger, ep.context_window) else {
+    let Some(keep) = decide_keep(msgs, config, trigger, ep.context_window) else {
         return Err(
-            "Es gibt nichts zu kompaktieren – dafür braucht es mindestens zwei Turns.".into(),
+            "Nothing to compact – this needs at least two turns.".into(),
         );
     };
     let boundary = wire_compact_boundary(msgs, keep);
@@ -828,53 +566,14 @@ pub(crate) fn compact_chat_messages(
     });
     out.extend_from_slice(tail);
 
-    // Protokoll (Debug-Ablage wie bei Fehlerantworten): Randbedingungen,
-    // Kandidaten, Entscheidung, erreichte Summary + Tokenlänge. Der gewählte
-    // Schnitt wird direkt aus dem tatsächlich ausgeführten Cut gebaut –
-    // identisch zum gleichnamigen Kandidaten (`plan_candidates` berechnet
-    // boundary/archiviert/Tokens über dieselben Werte), ohne erneuten Lookup.
-    let chosen = CutCandidate {
-        keep_turns: keep,
-        boundary,
-        archived_msgs: old.len(),
-        dropped_tokens: wire_tokens(old),
-        kept_tokens: wire_tokens(tail),
-        // `decide_keep` wählt nur zulässige Schnitte – nie ein `previous_cut`.
-        previous_cut: false,
-    };
-    let log = CompactionLog {
-        trigger,
-        model: ep.model.clone(),
-        base_url: ep.base_url.clone(),
-        url: res.url,
-        context_window: ep.context_window,
-        compact_at: config.compact_at,
-        keep_ratio: config.compact_keep_ratio,
-        target_tokens: target_kept_tokens(config, ep.context_window),
-        summary_budget: config.compact_summary_tokens,
-        threshold: (ep.context_window as f64 * config.compact_at) as u64,
-        current_tokens: current_tokens.unwrap_or_else(|| wire_tokens(msgs)),
-        decided_keep: keep,
-        candidates,
-        chosen,
-        archived_msgs: old.len(),
-        summary: res.content,
-        summary_tokens: res.tokens,
-        overview: message_overview(msgs),
-        request: res.request,
-        response: res.response,
-    };
-    let log_path = write_compaction_log(&log);
-
-    Ok((out, content, res.tokens, keep, log_path))
+    Ok((out, content, res.tokens, keep))
 }
 
 /// Startet die Kontext-Kompaktierung in einem eigenen Thread – für die
 /// manuelle (`/compact`) und die automatische (direkt nach der finalen
 /// Antwort, parallel zum Tippen) Kompaktierung. Sendet `Compacting`, dann
-/// `Compacted` (mit Summary, Tokenzahl, gewähltem `keep_turns` und
-/// Protokollpfad) oder bei einem Fehler (z. B. nichts zu kompaktieren)
-/// `Error`.
+/// `Compacted` (mit Summary, Tokenzahl und gewähltem `keep_turns`) oder bei
+/// einem Fehler (z. B. nichts zu kompaktieren) `Error`.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_compact(
     tx: Sender<WorkerEvent>,
@@ -884,25 +583,13 @@ pub fn spawn_compact(
     messages: Vec<WireMessage>,
     cancel: Arc<AtomicBool>,
     trigger: CompactTrigger,
-    current_tokens: Option<u64>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let client = shared_client();
         let _ = tx.send(WorkerEvent::Compacting(session));
-        match compact_chat_messages(
-            session,
-            client,
-            &config,
-            &ep,
-            &messages,
-            &cancel,
-            trigger,
-            current_tokens,
-        ) {
-            Ok((_repl, content, tokens, keep, log_path)) => {
-                let _ = tx.send(WorkerEvent::Compacted(
-                    session, content, tokens, keep, log_path,
-                ));
+        match compact_chat_messages(session, client, &config, &ep, &messages, &cancel, trigger) {
+            Ok((_repl, content, tokens, keep)) => {
+                let _ = tx.send(WorkerEvent::Compacted(session, content, tokens, keep));
             }
             Err(err) => {
                 let _ = tx.send(WorkerEvent::Error(session, err));
@@ -972,7 +659,7 @@ mod tests {
     fn leerer_stream_ist_fehler() {
         let err = summary_from_response(ApiShape::ChatCompletions, "data: [DONE]\n\n")
             .expect_err("Fehler");
-        assert!(err.contains("kein Antworttext"), "{err}");
+        assert!(err.contains("no answer text"), "{err}");
     }
 
     /// Der Aufruf MUSS streamen (zen/opencode: sonst `403 FreeTierError`),

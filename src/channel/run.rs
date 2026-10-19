@@ -97,7 +97,7 @@ pub(super) fn run_with_timeout_live(
 
     let mut child = builder
         .spawn()
-        .map_err(|e| format!("{cmd} nicht startbar: {e}"))?;
+        .map_err(|e| format!("{cmd} could not be started: {e}"))?;
     let pid = child.id();
     // Der Guard deckt auch Fehlerpfade ab, auf denen die Funktion vor dem
     // normalen Ende des Kindes zurückkehrt.
@@ -161,14 +161,14 @@ pub(super) fn run_with_timeout_live(
             // werden. Auf anderen Unixen bleibt `try_wait()` der Fallback.
             #[cfg(target_os = "linux")]
             let status =
-                if child_exited_without_reaping(pid).map_err(|e| format!("wait-Fehler: {e}"))? {
+                if child_exited_without_reaping(pid).map_err(|e| format!("wait error: {e}"))? {
                     process_group.terminate();
-                    Some(child.wait().map_err(|e| format!("wait-Fehler: {e}"))?)
+                    Some(child.wait().map_err(|e| format!("wait error: {e}"))?)
                 } else {
                     None
                 };
             #[cfg(not(target_os = "linux"))]
-            let status = child.try_wait().map_err(|e| format!("wait-Fehler: {e}"))?;
+            let status = child.try_wait().map_err(|e| format!("wait error: {e}"))?;
 
             if let Some(status) = status {
                 // Auch bei erfolgreichem/fehlerhaftem normalem Shell-Ende
@@ -374,7 +374,7 @@ pub(super) fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd} nicht startbar: {e}"))?;
+        .map_err(|e| format!("{cmd} could not be started: {e}"))?;
 
     let stdout_handle = {
         let mut out = child.stdout.take().expect("stdout-Pipe");
@@ -395,7 +395,7 @@ pub(super) fn run_with_timeout(
 
     let deadline = Instant::now() + timeout;
     let exit_code = loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("wait-Fehler: {e}"))? {
+        if let Some(status) = child.try_wait().map_err(|e| format!("wait error: {e}"))? {
             break status.code();
         }
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) || Instant::now() >= deadline {
@@ -444,7 +444,7 @@ pub(super) fn run_with_timeout_live(
 /// dadurch nie verloren. Der Algorithmus liegt geteilt in `crate::text`.
 pub(super) fn truncate_output(s: &str) -> String {
     const CAP: usize = 64 * 1024;
-    crate::text::truncate_tail(s, CAP, "…\n[vorne gekürzt]\n")
+    crate::text::truncate_tail(s, CAP, "…\n[truncated at the front]\n")
 }
 
 /// Ermittelt die numerische Identität des Host-Aufrufers (`id -u` / `id -g`).
@@ -475,7 +475,7 @@ pub(super) fn parse_id(out: &RunOut, what: &str) -> Result<u32, String> {
     out.stdout
         .trim()
         .parse::<u32>()
-        .map_err(|_| format!("{what} lieferte keine numerische ID: {}", out.stdout.trim()))
+        .map_err(|_| format!("{what} returned no numeric id: {}", out.stdout.trim()))
 }
 
 /// Pflegt Namen in Nur-Wort-Namen für Container-/Worktree-Namen um.

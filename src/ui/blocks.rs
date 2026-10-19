@@ -32,6 +32,36 @@ pub(crate) struct ChatBlock {
     pub(crate) is_tool: bool,
 }
 
+impl ChatBlock {
+    /// Fertig umbrochener Block: kein Hintergrundband, kein Abstand davor.
+    /// `is_tool` markiert kompakte Werkzeug-Einzeiler (rücken dicht aneinander).
+    pub(super) fn plain(lines: Vec<Line<'static>>, is_tool: bool) -> Self {
+        Self {
+            lines,
+            bg: None,
+            gap: 0,
+            is_tool,
+        }
+    }
+
+    /// Block aus einer einzigen, bereits fertigen Zeile.
+    pub(super) fn one(line: Line<'static>, is_tool: bool) -> Self {
+        Self::plain(vec![line], is_tool)
+    }
+
+    /// Eingabe-Band der User-Nachricht: färbt den Hintergrund ein.
+    pub(super) fn banded(mut self) -> Self {
+        self.bg = Some(theme().band_bg);
+        self
+    }
+
+    /// Vertikaler Abstand vor dem Block (Zentrierung des Logos).
+    pub(super) fn with_gap(mut self, gap: u16) -> Self {
+        self.gap = gap;
+        self
+    }
+}
+
 /// Gecachte, umgebrochene Blöcke der abgeschlossenen Chat-Historie (ohne Logo
 /// und ohne laufenden Turn). Gültig, solange `width`, die Ansichtsebene
 /// (`view`), die Historie (`version`) und das Theme (`theme_version`) unverändert
@@ -74,9 +104,9 @@ pub(crate) fn ensure_history_cache(s: &mut Session, width: usize, model: &str, w
 }
 
 /// Umbricht alle Blöcke der abgeschlossenen Historie (Messages samt ihrer
-/// chronologischen Ereignisse und Fußzeilen). Ohne Logo, ohne laufenden Turn.
+/// chronologischen Ereignisse und Fußzeilen) – ohne Logo, ohne laufenden Turn.
 /// Liefert außerdem den am Ende erreichten Context-Schätzer (für den Live-Tail
-/// der Übersicht). Ohne Logo, ohne laufenden Turn.
+/// der Übersicht).
 pub(crate) fn build_history_cache(
     s: &Session,
     width: usize,
@@ -184,13 +214,7 @@ pub(crate) fn build_history_cache(
                     turn_stream_ms += m.stream_ms;
                 }
                 if !reasoning.trim().is_empty() && !view.is_overview() {
-                    blocks.push(thoughts_block(
-                        reasoning,
-                        view.thoughts_open(),
-                        None,
-                        width,
-                        None,
-                    ));
+                    blocks.push(thoughts_block(reasoning, view.thoughts_open(), width));
                 }
                 // Reasoning-Anteil mit der genauen Zahl (`num_tokens_reasoning`)
                 // zählen; nur wenn noch kein Usage vorliegt (0) auf die
@@ -220,13 +244,15 @@ pub(crate) fn build_history_cache(
                         ctx.block_sum += est;
                         // Annotation vor dem Balken: ohne Reasoning nur die
                         // Text-Tokenzahl; mit Reasoning+Text beide einzeln als
-                        // „res+txt“ (analog Tool-Call+Antwort).
+                        // „res+txt“ (analog Tool-Call+Antwort). Eine noch nicht
+                        // abgeleitete Zahl (0, Runde gerade geschlossen) bleibt
+                        // ohne Annotation statt „0“ zu zeigen.
                         blocks.push(overview_text_line(
                             text,
                             width,
                             &ctx,
                             window,
-                            Some(est),
+                            (est > 0).then_some(est),
                             reasoning_tokens,
                         ));
                     } else {
@@ -279,7 +305,6 @@ pub(crate) fn build_history_cache(
             EventKind::Archive {
                 summary,
                 num_tokens,
-                log_path,
                 ..
             } => {
                 // Kompaktierung: Die Summary wird zum neuen Kontext-Anker.
@@ -306,15 +331,12 @@ pub(crate) fn build_history_cache(
                     ));
                 } else {
                     blocks.push(summary_block(summary, width));
-                    if let Some(path) = log_path {
-                        blocks.push(summary_log_line(path, width));
-                    }
                 }
             }
             EventKind::Abort => {
                 // Markierung eines abgebrochenen Turns (wird nicht als Inhalt
                 // angezeigt, nur als dezente Fußzeile).
-                blocks.push(muted_footer_line("abgebrochen", width));
+                blocks.push(muted_footer_line("aborted", width));
             }
             EventKind::Tool { .. } => {}
         }
@@ -336,12 +358,7 @@ fn user_input_block_chat(text: &str, p: Permission, width: usize) -> ChatBlock {
         .into_iter()
         .map(|l| l.style(Style::default().fg(color)))
         .collect();
-    ChatBlock {
-        lines,
-        bg: Some(theme().band_bg),
-        gap: 0,
-        is_tool: false,
-    }
+    ChatBlock::plain(lines, false).banded()
 }
 
 /// Dezente Fußzeile (Modell · Dauer · TTFT · TPS) nach einem beendeten Turn.
@@ -383,26 +400,13 @@ fn chat_footer_block(
 
 /// Gedeckte, einzeilige Fuß-/Hinweiszeile.
 fn muted_footer_line(text: &str, width: usize) -> ChatBlock {
-    let line = Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(theme().muted),
-    ));
-    ChatBlock {
-        lines: wrap_block(&[line], width, PAD),
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
+    let line = Line::from(Span::styled(text.to_string(), Style::default().fg(theme().muted)));
+    ChatBlock::plain(wrap_block(&[line], width, PAD), false)
 }
 
 fn def_tool_line(width: usize) -> ChatBlock {
     let line = Line::from(Span::styled("⛭ tool", Style::default().fg(theme().muted)));
-    ChatBlock {
-        lines: wrap_block(&[line], width, PAD),
-        bg: None,
-        gap: 0,
-        is_tool: true,
-    }
+    ChatBlock::plain(wrap_block(&[line], width, PAD), true)
 }
 
 /// Tool-Name eines `ToolKind` (für `tool_icon`/`tool_color`).
@@ -532,16 +536,10 @@ pub(crate) fn tool_kind_detail(kind: &ToolKind) -> String {
 
 /// Einzeiliger, kind-basierter Tool-Block in Kategoriefarbe (Detail-Ansicht).
 fn tool_kind_row(kind: &ToolKind, width: usize) -> ChatBlock {
-    let line = Line::from(Span::styled(
-        tool_kind_detail(kind),
-        Style::default().fg(tool_color(tool_kind_name(kind))),
-    ));
-    ChatBlock {
-        lines: wrap_block(&[line], width, PAD),
-        bg: None,
-        gap: 0,
-        is_tool: true,
-    }
+    let text = tool_kind_detail(kind);
+    let style = Style::default().fg(tool_color(tool_kind_name(kind)));
+    let line = Line::from(Span::styled(text, style));
+    ChatBlock::plain(wrap_block(&[line], width, PAD), true)
 }
 
 /// Kompakte Spaltenansicht der grep/glob-Vorkommen im Detail-Modus.
@@ -562,18 +560,13 @@ fn grep_result_block(kind: &ToolKind, output: &str, width: usize) -> ChatBlock {
     // Ohne Einträge → nur das Label (Einzeiler).
     if entries.is_empty() {
         let line = Line::from(Span::styled(format!("{pad}{label}"), color_style));
-        return ChatBlock {
-            lines: wrap_block(&[line], width, PAD),
-            bg: None,
-            gap: 0,
-            is_tool: true,
-        };
+        return ChatBlock::plain(wrap_block(&[line], width, PAD), true);
     }
 
     // Maximale Display-Breite eines Eintrags (für die Spaltenbreite).
     let max_w = entries
         .iter()
-        .map(|e| e.chars().map(char_w).sum::<usize>())
+        .map(|e| disp_width(e))
         .max()
         .unwrap_or(0);
     // Spaltenbreite: Maximalwert, aber nicht breiter als der verfügbare Platz.
@@ -603,9 +596,9 @@ fn grep_result_block(kind: &ToolKind, output: &str, width: usize) -> ChatBlock {
         for col in 0..cols {
             let idx = row + col * rows;
             if idx < entries.len() {
-                let cell = truncate_to_width(entries[idx], col_w);
+                let cell = fit_label(entries[idx], col_w);
                 // Auf Spaltenbreite auffüllen (außer in der letzten Spalte).
-                let cell_w: usize = cell.chars().map(char_w).sum();
+                let cell_w = disp_width(&cell);
                 if col < cols - 1 && cell_w < col_w {
                     let padded = format!("{cell}{}", " ".repeat(col_w - cell_w));
                     spans.push(Span::styled(padded, Style::default()));
@@ -620,36 +613,7 @@ fn grep_result_block(kind: &ToolKind, output: &str, width: usize) -> ChatBlock {
         lines.push(Line::from(spans));
     }
 
-    ChatBlock {
-        lines,
-        bg: None,
-        gap: 0,
-        is_tool: true,
-    }
-}
-
-/// Kürzt einen String auf `max_w` Display-Zellen; hängt `…` an, wenn
-/// abgeschnitten wird. Für die Spalten-Anzeige der grep/glob-Ergebnisse.
-fn truncate_to_width(s: &str, max_w: usize) -> String {
-    // Prüfe ob der String passt.
-    let total_w: usize = s.chars().map(char_w).sum();
-    if total_w <= max_w {
-        return s.to_string();
-    }
-    // Zu lang: auf max_w − 1 Zeichen kürzen und `…` anhängen.
-    let budget = max_w.saturating_sub(1);
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in s.chars() {
-        let cw = char_w(c);
-        if used + cw > budget {
-            break;
-        }
-        out.push(c);
-        used += cw;
-    }
-    out.push('…');
-    out
+    ChatBlock::plain(lines, true)
 }
 
 /// Zeigt ein abgeschlossenes Tool-Event im Detail-Modus. `run` mit Ausgabe
@@ -753,27 +717,7 @@ pub(crate) fn summary_block(content: &str, width: usize) -> ChatBlock {
             )
         })
         .collect();
-    ChatBlock {
-        lines,
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
-}
-
-/// Zeigt den Pfad des Kompaktierungs-Protokolls unter der Summary-Zusammen-
-/// fassung an (wie der `Debug-Material`-Hinweis bei Fehlern, nur neutral).
-fn summary_log_line(path: &str, width: usize) -> ChatBlock {
-    let lines = vec![Line::from(Span::styled(
-        format!("Kompaktierung-Protokoll: {path}"),
-        Style::default().fg(theme().muted),
-    ))];
-    ChatBlock {
-        lines: wrap_block(&lines, width, PAD),
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
+    ChatBlock::plain(lines, false)
 }
 
 /// Umbricht den laufenden Turn (Streaming-Tail) und ggf. den Fehlerhinweis –
@@ -793,30 +737,22 @@ pub(crate) fn build_live_blocks(
     // Offene (wachsende) Events sind Schätzungen: immer grau (nie grün), auch
     // wenn der letzte Historie-Anker eine bestätigte (grüne) Zahl war.
     live_ctx.green = false;
-    // Offene (wachsende) Events chronologisch rendern: offene Assistant-Runden
-    // (Reasoning + Text) und offene Tool-Events (Live-Ausgabe). Abgeschlossene
-    // Events stehen bereits im Historie-Cache.
+    // Offene (wachsende) Events rendern: die laufende Assistant-Runde
+    // (Reasoning + Text) ODER das laufende Tool. Beide sind nie gleichzeitig
+    // offen – eine Runde wird geschlossen, sobald ihre Werkzeuge laufen
+    // (`Session::tool_parent`), der Live-Tail zeigt also höchstens EIN Event.
+    // Alle abgeschlossenen Events (inkl. der bereits fertigen Werkzeuge einer
+    // laufenden Tool-Phase) stehen im Historie-Cache.
     for ev in s.chat.iter().filter(|e| e.time_end.is_none()) {
         match &ev.kind {
-            EventKind::Assistant {
-                reasoning,
-                text,
-                tool_event_ids,
-                ..
-            } => {
+            EventKind::Assistant { reasoning, text, .. } => {
                 if !reasoning.trim().is_empty() {
                     let r_est = estimate_tokens(reasoning);
                     live_ctx.add_content(ContentKind::Reasoning, r_est);
                     live_ctx.block_sum += r_est;
                     live_ctx.add_used(r_est);
                     if !view.is_overview() {
-                        blocks.push(thoughts_block(
-                            reasoning,
-                            view.thoughts_open(),
-                            None,
-                            width,
-                            None,
-                        ));
+                        blocks.push(thoughts_block(reasoning, view.thoughts_open(), width));
                     }
                 }
                 if !text.trim().is_empty() {
@@ -825,70 +761,21 @@ pub(crate) fn build_live_blocks(
                     live_ctx.block_sum += est;
                     live_ctx.add_used(est);
                     if view.is_overview() {
-                        blocks.push(overview_text_line(
-                            text, width, &live_ctx, window, None, None,
-                        ));
+                        blocks.push(overview_text_line(text, width, &live_ctx, window, None, None));
                     } else {
                         blocks.push(text_block(text, width));
                     }
                 }
-                // Tool-Kinder dieser Runde: offene live (wachsend), beendete
-                // statisch – die Runde selbst ist noch offen, also rendert die
-                // Historie sie (noch) nicht. Ohne diesen Zweig würden fertige
-                // Tools zwischen `ToolEnd` und Runden-Schluss (nächstes
-                // Chunk/Reasoning/Usage bzw. Done) aus der UI verschwinden.
-                for tid in tool_event_ids {
-                    if let Some(tev) = s.chat.event(*tid) {
-                        if tev.time_end.is_none() {
-                            let label = ev_tool_label(tev, s);
-                            let out = ev_tool_output(tev);
-                            if view.is_overview() {
-                                let t = tool_name(&label);
-                                let est = estimate_tokens(&label) + estimate_tokens(out);
-                                live_ctx.add_tool(t, est);
-                                live_ctx.block_sum += est;
-                                live_ctx.add_used(est);
-                                blocks.push(overview_active_tool_line(
-                                    &label, width, &live_ctx, window,
-                                ));
-                            } else if !out.is_empty() {
-                                blocks.push(live_run_block(
-                                    &label,
-                                    out,
-                                    width,
-                                    view.boxes_open(),
-                                    true,
-                                ));
-                            } else {
-                                blocks.push(active_tool_line(&label, width));
-                            }
-                        } else if view.is_overview() {
-                            // Beendetes Tool innerhalb einer noch OFFENEN Runde:
-                            // noch kein Settle-Anker vorhanden → als Schätzung
-                            // weiterlaufen (grau), die Zusammensetzung/Akku wird
-                            // von overview_tool_line_chat gepflegt.
-                            blocks.push(overview_tool_line_chat(tev, width, &mut live_ctx, window));
-                            if let EventKind::Tool {
-                                num_tokens_input,
-                                num_tokens_output,
-                                ..
-                            } = &tev.kind
-                            {
-                                live_ctx.add_used(num_tokens_input + num_tokens_output);
-                            }
-                        } else {
-                            blocks.push(tool_block_chat(tev, width, view));
-                        }
-                    }
-                }
             }
-            EventKind::Tool { .. } if ev.parent_id.is_none() => {
-                // Manuelles `/run`-Tool (live).
+            EventKind::Tool { function_name, .. } => {
+                // Laufendes Werkzeug (LLM-Kind oder manuelles `/run`): wachsende
+                // Live-Ausgabe, ohne Ausgabe die Aktiv-Zeile. Der Overview-Balken
+                // bucht es – wie die Historie – unter dem Werkzeugnamen.
                 let label = ev_tool_label(ev, s);
                 let out = ev_tool_output(ev);
                 if view.is_overview() {
                     let est = estimate_tokens(&label) + estimate_tokens(out);
-                    live_ctx.add_tool("bash", est);
+                    live_ctx.add_tool(tool_name(function_name), est);
                     live_ctx.block_sum += est;
                     live_ctx.add_used(est);
                     blocks.push(overview_active_tool_line(&label, width, &live_ctx, window));
@@ -908,16 +795,11 @@ pub(crate) fn build_live_blocks(
         ))];
         if let Some(path) = &s.error_debug {
             lines.push(Line::from(Span::styled(
-                format!("Debug-Material: {path}"),
+                format!("Debug material: {path}"),
                 Style::default().fg(theme().muted),
             )));
         }
-        blocks.push(ChatBlock {
-            lines: wrap_block(&lines, width, PAD),
-            bg: None,
-            gap: 0,
-            is_tool: false,
-        });
+        blocks.push(ChatBlock::plain(wrap_block(&lines, width, PAD), false));
     }
     (blocks, live_ctx.used)
 }
@@ -1029,20 +911,9 @@ pub(crate) fn line_to_anchor(tops: &[usize], heights: &[usize], line: usize) -> 
 /// Laufendes Werkzeug als Einzeiler („⚙ tool …“) – in der Übersicht statt der
 /// Live-Konsolen-Box, sonst solange noch keine Ausgabe anfällt.
 pub(crate) fn active_tool_line(tool: &str, width: usize) -> ChatBlock {
-    let amber = Color::Rgb(245, 158, 11);
-    ChatBlock {
-        lines: wrap_block(
-            &[Line::from(Span::styled(
-                format!("  {} {tool} …", tool_icon(tool_name(tool))),
-                Style::default().fg(amber).add_modifier(Modifier::ITALIC),
-            ))],
-            width,
-            PAD,
-        ),
-        bg: None,
-        gap: 0,
-        is_tool: true,
-    }
+    let text = format!("  {} {tool} …", tool_icon(tool_name(tool)));
+    let style = Style::default().fg(Color::Rgb(245, 158, 11)).add_modifier(Modifier::ITALIC);
+    ChatBlock::plain(wrap_block(&[Line::from(Span::styled(text, style))], width, PAD), true)
 }
 
 /// Laufendes Werkzeug als Einzeiler in der Übersicht – mit Context-Balken.
@@ -1052,17 +923,9 @@ pub(crate) fn overview_active_tool_line(
     ctx: &ContextEstimate,
     window: u64,
 ) -> ChatBlock {
-    let amber = Color::Rgb(245, 158, 11);
     let label = format!("{} {tool} …", tool_icon(tool_name(tool)));
-    overview_row(
-        label,
-        Style::default().fg(amber).add_modifier(Modifier::ITALIC),
-        width,
-        ctx,
-        window,
-        true,
-        None,
-    )
+    let style = Style::default().fg(Color::Rgb(245, 158, 11)).add_modifier(Modifier::ITALIC);
+    overview_row(label, style, width, ctx, window, true, None)
 }
 
 /// Werkzeug-Name aus dem Label (erster Token, z. B. `run` aus `run cargo test`).
@@ -1167,7 +1030,7 @@ pub(crate) const TAB_WIDTH: usize = 8;
 /// `fit_label` nutzt diese Funktion als gemeinsame, konsistente Basis.
 fn expand_line_tabs(line: &str, mut col: usize) -> (String, usize) {
     if !line.contains('\t') {
-        return (line.to_string(), col + display_units(line));
+        return (line.to_string(), col + disp_width(line));
     }
     let mut out = String::with_capacity(line.len() + 8);
     for c in line.chars() {
@@ -1186,14 +1049,9 @@ fn expand_line_tabs(line: &str, mut col: usize) -> (String, usize) {
     (out, col)
 }
 
-/// Anzeige-Breite eines Strings in Zellen (Messriemen).
-fn display_units(s: &str) -> usize {
-    s.chars().map(char_w).sum()
-}
-
 /// Kürzt einen Einzeiler auf `max` Zellen (Breite) und hängt „…“ an, wenn
-/// abgeschnitten – so bleibt in der Übersicht jeder Werkzeug-Aufruf auf einer
-/// Zeile (nie umbrechen).
+/// abgeschnitten – so bleiben Übersichts-Zeilen und die grep/glob-Spalten je
+/// auf einer Zeile (nie umbrechen).
 pub(crate) fn fit_label(s: &str, max: usize) -> String {
     // Tabs zuerst Tab-Stop-bewusst expandieren (→ Leerzeichen), damit sie
     // sichtbar gerendert und korrekt vermessen werden statt von Ratatui
@@ -1398,7 +1256,7 @@ pub(crate) fn context_bar(ctx: &ContextEstimate, window: u64, cells: usize) -> V
     // beginnt (und die Zeile immer an derselben Spalte endet) – unabhängig
     // davon, wie viele Zeichen `fmt_ctx` liefert („1T“ bis „99.9kT“).
     fn pad_ann(s: String, cells: usize) -> String {
-        let w = s.chars().map(char_w).sum::<usize>();
+        let w = disp_width(&s);
         format!("{s}{}", " ".repeat(cells.saturating_sub(w)))
     }
     // Erste Zahl neben dem Balken: die gespeicherte Kontextlänge dieses Events
@@ -1559,7 +1417,7 @@ fn overview_line(
     let ann_w = annotation.as_ref().map(|a| disp_width(a)).unwrap_or(0);
     let used: usize = content
         .iter()
-        .map(|s| s.content.chars().map(char_w).sum::<usize>())
+        .map(|s| disp_width(&s.content))
         .sum();
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ".repeat(PAD))];
     spans.extend(content);
@@ -1573,12 +1431,7 @@ fn overview_line(
     // derselben Spalte.
     spans.push(Span::raw(" "));
     spans.extend(context_bar(ctx, window, bar_w));
-    ChatBlock {
-        lines: vec![Line::from(spans)],
-        bg: None,
-        gap: 0,
-        is_tool,
-    }
+    ChatBlock::one(Line::from(spans), is_tool)
 }
 
 /// Baut eine Übersichts-Zeile aus Text (links) + Context-Balken (rechts).
@@ -1690,8 +1543,7 @@ pub(crate) fn overview_user_line(
     permission: Option<Permission>,
     tokens: Option<u64>,
 ) -> ChatBlock {
-    let mut blk = overview_text_line(text, width, ctx, window, tokens, None);
-    blk.bg = Some(theme().band_bg);
+    let mut blk = overview_text_line(text, width, ctx, window, tokens, None).banded();
     if let Some(p) = permission {
         let color = permission_color(p);
         for span in &mut blk.lines[0].spans {
@@ -1785,12 +1637,7 @@ pub(crate) fn live_run_block(
     }
     lines.push(box_edge(width, box_width, border, false));
 
-    ChatBlock {
-        lines,
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
+    ChatBlock::plain(lines, false)
 }
 
 /// Obere/untere Umrandungszeile der Konsolen-Box, eingerückt und bis zur
@@ -1927,12 +1774,7 @@ pub(crate) fn wrap_preformatted(text: &str, width: usize) -> Vec<String> {
 /// Modells (Zwischen-Statement vor einem Tool oder die finale Antwort).
 pub(crate) fn text_block(text: &str, width: usize) -> ChatBlock {
     let logical = decorate_emphasis(logical_lines(&preserve_breaks(text)));
-    ChatBlock {
-        lines: wrap_markdown(&logical, width, PAD),
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
+    ChatBlock::plain(wrap_markdown(&logical, width, PAD), false)
 }
 
 /// Gedanken-Element in zartem Grau.
@@ -1945,16 +1787,7 @@ pub(crate) fn text_block(text: &str, width: usize) -> ChatBlock {
 ///   dem Icon `U+1F5ED` in Spalte 2 und dem tatsächlichen Reasoning-Inhalt ab
 ///   Spalte 4 – Zeilenumbrüche werden zu Leerzeichen, Überlauf mit „…“ gekürzt
 ///   (analog zu den komprimierten Overview-Texten).
-///
-/// `duration`/`block_tokens` (Gedanken-Dauer/Token-Annotation) bleiben in den
-/// kompakten Stufen bewusst ungenutzt – dort steht nur Icon + Inhalt.
-pub(crate) fn thoughts_block(
-    reasoning: &str,
-    open: bool,
-    _duration: Option<u64>,
-    width: usize,
-    _block_tokens: Option<u64>,
-) -> ChatBlock {
+pub(crate) fn thoughts_block(reasoning: &str, open: bool, width: usize) -> ChatBlock {
     let gray = Style::default().fg(theme().muted);
     if open {
         // Detailansicht: voller Inhalt, mehrzeilig eingerückt (Spalte 4).
@@ -1970,12 +1803,7 @@ pub(crate) fn thoughts_block(
         if let Some(first) = lines.first_mut() {
             prepend_thought_icon(first);
         }
-        ChatBlock {
-            lines,
-            bg: None,
-            gap: 0,
-            is_tool: false,
-        }
+        ChatBlock::plain(lines, false)
     } else {
         // Komprimierter Einzeiler (Zoom 2+3): Icon U+1F5ED in Spalte 2, Inhalt
         // ab Spalte 4; Überlauf wird mit „…“ gekürzt (wie die Overview-Texte).
@@ -1984,12 +1812,7 @@ pub(crate) fn thoughts_block(
         let mut spans = thought_icon_band(gray);
         spans.extend(truncate_styled_spans(vec![Span::raw(flat)], budget));
         let line = Line::from(spans).style(gray);
-        ChatBlock {
-            lines: vec![line],
-            bg: None,
-            gap: 0,
-            is_tool: false,
-        }
+        ChatBlock::one(line, false)
     }
 }
 
@@ -2129,12 +1952,7 @@ pub(crate) fn diff_block(
     }
     lines.push(box_edge(width, box_width, border, false));
 
-    ChatBlock {
-        lines,
-        bg: None,
-        gap: 0,
-        is_tool: false,
-    }
+    ChatBlock::plain(lines, false)
 }
 
 /// Stil-Kombination für eine Diff-Zelle (eine Seite eines Zeilenpaars).

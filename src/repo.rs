@@ -28,6 +28,10 @@ pub struct WorktreeInfo {
     pub(crate) branch: String,
     /// Absoluter Host-Pfad zum Worktree.
     pub(crate) path: PathBuf,
+    /// Nicht-fatale Rückmeldung zum Anlegen – z.B. ob Submodule ausgecheckt
+    /// wurden. `None` = nichts zu berichten. Wird von der UI als Hinweis
+    /// angezeigt, nie als harter Fehler.
+    pub(crate) notice: Option<String>,
 }
 
 /// Plan für das Kopieren von Verzeichnissen beim Worktree-Erstellen.
@@ -77,11 +81,21 @@ fn err(msg: impl Into<String>) -> String {
 
 /// Führt ein `git`-Kommando im angegebenen Verzeichnis aus und liefert stdout.
 pub(crate) fn git(run_dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(run_dir)
+    git_env(run_dir, args, &[])
+}
+
+/// Wie [`git`], setzt aber zusätzlich die angegebenen Umgebungsvariablen.
+/// Gebraucht für Submodule-Klone: `GIT_TERMINAL_PROMPT=0`, damit eine
+/// fehlende oder zu bestätigende Anmeldung nicht das TUI blockiert.
+fn git_env(run_dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(run_dir);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd
         .output()
-        .map_err(|e| err(format!("run git {}: {e}", args[0])))?;
+        .map_err(|e| err(format!("run git {}: {e}", args.join(" "))))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(err(format!(
@@ -169,18 +183,100 @@ fn stash_top(repo: &Path) -> Option<String> {
 }
 
 /// Committet alle uncommitteten Änderungen (nach .gitignore) mit einer
-/// generischen Nachricht. `.aidev/` wird ausgeschlossen.
-/// Gibt `true` zurück wenn ein Commit erstellt wurde, `false` wenn nichts zu committen war.
+/// generischen Nachricht – **einschließlich der Submodule**, von innen nach
+/// außen. `.aidev/` wird ausgeschlossen.
+///
+/// Die Submodule sind dabei der springende Punkt: `git add -A` im Superprojekt
+/// erfasst nur den Gitlink. Änderungen *innerhalb* eines Submodules ändern den
+/// Gitlink nicht, stünden also ohne diesen Schritt nicht im Commit – und wären
+/// verloren, wenn der Aufrufer den Worktree danach entfernt („Commit &
+/// delete"). Committet wird von der tiefsten Ebene nach außen, damit jeder
+/// Eltern-Commit den aktualisierten Gitlink seines Kindes schon enthält.
+///
+/// Gibt `true` zurück wenn mindestens ein Commit erstellt wurde (im
+/// Superprojekt oder in einem Submodule).
 pub(crate) fn git_commit_all(repo: &Path, message: &str) -> Result<bool, String> {
+    let identity = commit_identity(repo);
+
+    // `git submodule foreach` läuft von außen nach innen; für die Gitlinks
+    // brauchen wir die umgekehrte Reihenfolge.
+    let mut modules = populated_submodule_paths(repo)?;
+    modules.reverse();
+
+    let mut committed = false;
+    for path in modules {
+        if commit_all_in(&repo.join(path), message, &identity)? {
+            committed = true;
+        }
+    }
+    if commit_all_in(repo, message, &identity)? {
+        committed = true;
+    }
+    Ok(committed)
+}
+
+/// Identität (`user.name`, `user.email`) aus der Config von `repo`.
+///
+/// Submodule sind eigenständige Klone **ohne** eigene `user.*`-Config; ein
+/// Commit darin scheiterte sonst mit „Author identity unknown". Leer, wenn im
+/// Repo nichts konfiguriert ist – dann greift wie bisher die globale Config.
+fn commit_identity(repo: &Path) -> Vec<(String, String)> {
+    ["user.name", "user.email"]
+        .iter()
+        .filter_map(|key| {
+            let value = git(repo, &["config", "--get", key]).ok()?;
+            let value = value.trim().to_string();
+            (!value.is_empty()).then(|| ((*key).to_string(), value))
+        })
+        .collect()
+}
+
+/// Pfade der ausgecheckten Submodule von `repo`, rekursiv, in der Reihenfolge
+/// von außen nach innen. Nicht bevölkerte Module werden übersprungen – dort
+/// gibt es nichts zu committen.
+fn populated_submodule_paths(repo: &Path) -> Result<Vec<String>, String> {
+    // `--quiet` unterdrückt die „Entering …"-Zeilen, übrig bleiben die Pfade.
+    let out = git(
+        repo,
+        &[
+            "submodule",
+            "foreach",
+            "--recursive",
+            "--quiet",
+            r#"echo "$displaypath""#,
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Committet die uncommitteten Änderungen in `dir` (`.aidev/` ausgenommen) mit
+/// der übergebenen Identität. Committet nur, wenn es etwas zu committen gibt.
+fn commit_all_in(dir: &Path, message: &str, identity: &[(String, String)]) -> Result<bool, String> {
+    let mut prefix: Vec<String> = Vec::new();
+    for (key, value) in identity {
+        prefix.push("-c".to_string());
+        prefix.push(format!("{key}={value}"));
+    }
+    let run = |extra: &[&str]| -> Result<String, String> {
+        let mut args = prefix.clone();
+        args.extend(extra.iter().map(|s| (*s).to_string()));
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+        git(dir, &args_ref)
+    };
+
     // Alle Änderungen stagen (respektiert .gitignore, schließt .aidev aus)
-    git(repo, &["add", "-A", "--", ":(exclude).aidev"])?;
+    run(&["add", "-A", "--", ":(exclude).aidev"])?;
     // Prüfen ob es tatsächlich was zu committen gibt
-    let diff = git(repo, &["diff", "--cached", "--stat"])?;
-    if diff.trim().is_empty() {
+    if run(&["diff", "--cached", "--stat"])?.trim().is_empty() {
         return Ok(false);
     }
     // Committen
-    git(repo, &["commit", "-m", message])?;
+    run(&["commit", "-m", message])?;
     Ok(true)
 }
 
@@ -308,6 +404,256 @@ fn git_branch_delete(repo: &Path, branch: &str, force: bool) -> Result<(), Strin
 }
 
 // ---------------------------------------------------------------------------
+// Submodule
+// ---------------------------------------------------------------------------
+//
+// `git worktree add` checkt KEINE Submodule aus: Die Verzeichnisse bleiben
+// leer, `git status` meldet trotzdem „clean“ – der Fehler fällt erst beim
+// Bauen auf. aidev holt das deshalb direkt nach dem Anlegen nach.
+//
+// Bevorzugt wird aus den lokalen Gitdaten der Hauptinstanz geklont
+// (`<repo>/.git/modules/<name>`, verschachtelt
+// `<repo>/.git/modules/<parent>/modules/<child>`). Dazu wird die URL jedes
+// Moduls per `-c submodule.<name>.url=<lokaler Gitdir>` ersetzt – die
+// `-c`-Config gilt prozessweit und erreicht deshalb auch verschachtelte
+// Ebenen.
+//
+// Bewusst NICHT `url.<lokal>.insteadOf=<url>`: Das matcht URL-*Text*, den git
+// vorher normalisiert bzw. relativ auflöst – bei absoluten Pfaden und
+// relativen URLs greift die Regel deshalb nicht (gemessen). Der Name-Override
+// ersetzt die URL dagegen vollständig und funktioniert für jede URL-Form.
+// Preis dafür: Er gilt pro Name, die Config kennt keine Ebene – gleichnamige
+// Module auf verschiedenen Ebenen bleiben deshalb ohne Override (siehe
+// [`unambiguous_sources`]).
+//
+// Ist der lokale Gitdir nicht vorhanden (Hauptinstanz selbst nicht
+// bevölkert), läuft der reguläre Weg über die konfigurierte URL – dann
+// braucht es den Server. Fehler sind nie fatal: Der Worktree bleibt nutzbar,
+// die Meldung landet als Hinweis in [`WorktreeInfo::notice`].
+
+/// Maximale Verschachtelungstiefe beim Einsammeln der Submodule.
+const SUBMODULE_MAX_DEPTH: usize = 8;
+
+/// Ein Submodule, dessen Gitdir in der Hauptinstanz bevölkert vorliegt und
+/// damit als lokale Klon-Quelle dienen kann.
+#[derive(Debug, Clone)]
+struct SubmoduleSource {
+    /// Modulname aus `.gitmodules` (Schlüssel des `submodule.<name>.url`-Overrides).
+    name: String,
+    /// Lokaler Gitdir in der Hauptinstanz (Ersatz-URL).
+    local: PathBuf,
+}
+
+/// Submodule-Bestand der Hauptinstanz.
+#[derive(Debug, Default)]
+struct SubmoduleInventory {
+    /// Anzahl gefundener Submodule (rekursiv).
+    total: usize,
+    /// Nur die Module, für die es lokal eine bevölkerte Klon-Quelle gibt.
+    sources: Vec<SubmoduleSource>,
+}
+
+/// Ergebnis des Submodule-Auscheckens nach `git worktree add`.
+#[derive(Debug)]
+enum SubmoduleOutcome {
+    /// Im ausgecheckten Stand gibt es keine Submodule – nichts zu melden.
+    Absent,
+    /// `count` Submodule ausgecheckt, alle aus den lokalen Gitdaten.
+    AllLocal(usize),
+    /// `count` Submodule ausgecheckt, (auch) über die konfigurierten URLs.
+    FromUrls(usize),
+    /// `count` Submodule ausgecheckt – ein Teil lokal, der Rest über die URLs.
+    PartlyLocal(usize),
+    /// Der Aufruf war erfolgreich, aber Module blieben leer.
+    Incomplete { populated: usize, empty: usize },
+    /// Fehlgeschlagen – der Worktree bleibt nutzbar, ist dort aber leer.
+    Failed(String),
+}
+
+impl SubmoduleOutcome {
+    /// Hinweistext für die UI (`None` = nichts zu melden).
+    fn notice(&self) -> Option<String> {
+        match self {
+            SubmoduleOutcome::Absent => Option::None,
+            SubmoduleOutcome::AllLocal(count) => Some(format!(
+                "Submodules checked out: {count} (from the local data of the main worktree)"
+            )),
+            SubmoduleOutcome::FromUrls(count) => Some(format!(
+                "Submodules checked out: {count} (from their configured URLs)"
+            )),
+            SubmoduleOutcome::PartlyLocal(count) => Some(format!(
+                "Submodules checked out: {count} (partly from the local data of the main worktree)"
+            )),
+            SubmoduleOutcome::Incomplete { populated, empty } => Some(format!(
+                "Submodules: {populated} checked out, {empty} stayed empty. Run \
+                 'git submodule update --init --recursive' inside the worktree."
+            )),
+            SubmoduleOutcome::Failed(e) => Some(format!(
+                "Submodules were NOT checked out ({e}). Run \
+                 'git submodule update --init --recursive' inside the worktree."
+            )),
+        }
+    }
+}
+
+/// Liest die Einträge der `.gitmodules` eines Verzeichnisses als
+/// `(name, path)`-Paare. Leer, wenn es keine lesbare `.gitmodules` gibt.
+fn gitmodules_entries(dir: &Path) -> Vec<(String, String)> {
+    let Ok(out) = git(
+        dir,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    out.lines()
+        .filter_map(|line| {
+            // Ausgabeformat ist "<key> <value>" – genau ein Leerzeichen als Trenner.
+            let (key, value) = line.split_once(' ')?;
+            let name = key.strip_prefix("submodule.")?.strip_suffix(".path")?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Entfernt mehrdeutige Module: Der `submodule.<name>.url`-Override gilt pro
+/// Name, die Config kennt keine Verschachtelungsebene. Kommt derselbe Name auf
+/// zwei Ebenen mit unterschiedlichem lokalem Gitdir vor, ließe sich nicht
+/// entscheiden, welche Quelle gemeint ist – dann lieber ohne Override klonen
+/// (Original-URL) als die falsche Quelle zu nehmen.
+fn unambiguous_sources(sources: Vec<SubmoduleSource>) -> Vec<SubmoduleSource> {
+    let mut out: Vec<SubmoduleSource> = Vec::new();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for src in sources {
+        if ambiguous.contains(&src.name) {
+            continue;
+        }
+        match out.iter().find(|s| s.name == src.name) {
+            // Gleicher Name, gleicher Gitdir: ein Override genügt.
+            Some(existing) if existing.local == src.local => {}
+            None => out.push(src),
+            Some(_) => {
+                ambiguous.push(src.name.clone());
+                out.retain(|s| s.name != src.name);
+            }
+        }
+    }
+    out
+}
+
+/// Lokaler Gitdir eines Submodules (`modules/<name>`) relativ zu `dir`, sofern
+/// dort vorhanden.
+///
+/// Bei verschachtelten Submodulen ist `dir` das Arbeitsverzeichnis des
+/// Elternmoduls in der Hauptinstanz; `git rev-parse` löst den Pfad dann gegen
+/// dessen Gitdir auf, sodass automatisch
+/// `.../modules/<parent>/modules/<child>` herauskommt.
+fn local_module_gitdir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let rel = format!("modules/{name}");
+    let resolve = |args: &[&str]| {
+        git(dir, args)
+            .ok()
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    // `--path-format=absolute` gibt es erst ab git 2.31; der zweite Versuch
+    // kommt ohne aus (dann relativ zum Repo-Verzeichnis auflösen).
+    let path = resolve(&["rev-parse", "--path-format=absolute", "--git-path", &rel])
+        .or_else(|| resolve(&["rev-parse", "--git-path", &rel]))?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    };
+    path.is_dir().then_some(path)
+}
+
+/// Zählt die Submodule im tatsächlich ausgecheckten Stand eines Worktrees als
+/// `(bevölkert, leer)`.
+///
+/// Bewusst über den Index (Gitlinks) und das Dateisystem statt über `git
+/// submodule status`: Dessen führendes `-` heißt nur „nicht in der Config
+/// registriert". Ein Modul, dessen URL per `-c` überschrieben wurde, bleibt
+/// ohne Config-Eintrag und gälte dort fälschlich als leer. „Bevölkert" heißt
+/// hier: Das Verzeichnis existiert und ist nicht leer – ein Checkout enthält
+/// immer mindestens die `.git`-Datei, ein von `git worktree add`
+/// liegengelassenes Submodule dagegen gar nichts.
+fn submodule_worktree_state(worktree: &Path) -> (usize, usize) {
+    let mut populated = 0;
+    let mut empty = 0;
+    collect_gitlink_state(worktree, &mut populated, &mut empty);
+    (populated, empty)
+}
+
+fn collect_gitlink_state(dir: &Path, populated: &mut usize, empty: &mut usize) {
+    for path in gitlink_paths(dir) {
+        let child = dir.join(&path);
+        let has_entries = std::fs::read_dir(&child)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if has_entries {
+            *populated += 1;
+            // Nur bevölkerte Module können überhaupt Unter-Submodule haben.
+            collect_gitlink_state(&child, populated, empty);
+        } else {
+            *empty += 1;
+        }
+    }
+}
+
+/// Pfade der Gitlinks (Mode `160000`) im Index von `dir`.
+fn gitlink_paths(dir: &Path) -> Vec<String> {
+    let Ok(out) = git(dir, &["ls-files", "--stage", "-z"]) else {
+        return Vec::new();
+    };
+    out.split('\0')
+        .filter_map(|entry| {
+            // Format je Eintrag: "<mode> <sha> <stage>\t<path>"
+            let (meta, path) = entry.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// Sammelt rekursiv alle Submodule der Hauptinstanz ein und notiert, für
+/// welche davon lokal ein bevölkerter Gitdir als Klon-Quelle bereitsteht.
+fn submodule_inventory(root: &Path) -> SubmoduleInventory {
+    let mut inv = SubmoduleInventory::default();
+    // Schneller Ausstieg: Ohne `.gitmodules` gibt es nichts zu tun (spart den
+    // git-Aufruf für die allermeisten Repos).
+    if !root.join(".gitmodules").is_file() {
+        return inv;
+    }
+    collect_submodules(root, 0, &mut inv);
+    inv
+}
+
+fn collect_submodules(dir: &Path, depth: usize, inv: &mut SubmoduleInventory) {
+    if depth > SUBMODULE_MAX_DEPTH {
+        return;
+    }
+    for (name, path) in gitmodules_entries(dir) {
+        inv.total += 1;
+        if let Some(local) = local_module_gitdir(dir, &name) {
+            inv.sources.push(SubmoduleSource { name, local });
+        }
+
+        // Nur in ausgecheckte Submodule absteigen – nur die haben eine
+        // `.gitmodules` vorliegen, aus der die Kind-Einträge stammen.
+        let child = dir.join(&path);
+        if child.join(".git").exists() {
+            collect_submodules(&child, depth + 1, inv);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RepoManager
 // ---------------------------------------------------------------------------
 
@@ -339,6 +685,12 @@ impl RepoManager {
     /// dort unberührt liegen (der neue Worktree startet vom Branch-Tip).
     /// Sollen die Änderungen zusätzlich in den neuen Worktree übernommen
     /// werden, stattdessen [`RepoManager::create_worktree_with_stash`] nutzen.
+    ///
+    /// Submodule werden direkt mit ausgecheckt (siehe Abschnitt „Submodule“).
+    /// Das Ergebnis steht als [`WorktreeInfo::notice`] bereit und ist nie ein
+    /// Fehler: Schlägt es fehl, bleibt der Worktree nutzbar, aber der Aufrufer
+    /// muss den Hinweis anzeigen – ein leerer Submodule-Ordner fiele sonst
+    /// nicht auf, weil `git status` dort „clean“ meldet.
     pub fn create_worktree(
         &self,
         branch_name: &str,
@@ -364,11 +716,75 @@ impl RepoManager {
         // Worktree + Branch anlegen
         git_worktree_add(source, branch_name, &dest)?;
 
+        // `git worktree add` lässt Submodule leer – direkt nachziehen.
+        let notice = self.checkout_submodules(&dest).notice();
+
         Ok(WorktreeInfo {
             name: branch_name.to_string(),
             branch: branch_name.to_string(),
             path: dest,
+            notice,
         })
+    }
+
+    /// Checkt die Submodule eines frisch angelegten Worktrees aus.
+    ///
+    /// Klont bevorzugt aus den lokalen Gitdaten der Hauptinstanz (siehe
+    /// Abschnitt „Submodule“ oben) und damit ohne Serververbindung; fehlt der
+    /// lokale Gitdir, greift der reguläre Weg über die konfigurierte URL.
+    /// Nie fatal – das Ergebnis wird als Hinweis gemeldet, nicht als Fehler.
+    fn checkout_submodules(&self, worktree: &Path) -> SubmoduleOutcome {
+        let inv = submodule_inventory(&self.repo_root);
+        if inv.total == 0 {
+            return SubmoduleOutcome::Absent;
+        }
+        let total = inv.total;
+        let sources = unambiguous_sources(inv.sources);
+
+        // `protocol.file.allow=always` ist für lokale Klon-Quellen Pflicht,
+        // sonst lehnt git sie mit "transport 'file' not allowed" ab.
+        let mut args: Vec<String> =
+            vec!["-c".to_string(), "protocol.file.allow=always".to_string()];
+        for src in &sources {
+            args.push("-c".to_string());
+            args.push(format!(
+                "submodule.{}.url={}",
+                src.name,
+                src.local.display()
+            ));
+        }
+        for arg in ["submodule", "update", "--init", "--recursive"] {
+            args.push(arg.to_string());
+        }
+        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        // Ohne `GIT_TERMINAL_PROMPT=0` würde ein fehlendes Credential im
+        // Server-Fallback eine Eingabe erwarten und das TUI blockieren.
+        if let Err(e) = git_env(worktree, &args_ref, &[("GIT_TERMINAL_PROMPT", "0")]) {
+            return SubmoduleOutcome::Failed(e);
+        }
+
+        // Verifizieren statt vertrauen: `submodule status` zählt die Module des
+        // tatsächlich ausgecheckten Stands. Damit stimmt die Meldung auch dann,
+        // wenn der neue Branch gar keine Submodule enthält (dann gibt es nichts
+        // zu melden) oder wenn trotz erfolgreichem Aufruf Module leer blieben.
+        let (populated, empty) = submodule_worktree_state(worktree);
+        if empty > 0 {
+            return SubmoduleOutcome::Incomplete { populated, empty };
+        }
+        if populated == 0 {
+            return SubmoduleOutcome::Absent;
+        }
+        // Herkunft nur so genau angeben, wie sie belegbar ist: Nur wenn jedes
+        // gefundene Modul eine lokale Quelle hatte, lief der Klon garantiert
+        // ohne Server.
+        if sources.len() == total {
+            SubmoduleOutcome::AllLocal(populated)
+        } else if sources.is_empty() {
+            SubmoduleOutcome::FromUrls(populated)
+        } else {
+            SubmoduleOutcome::PartlyLocal(populated)
+        }
     }
 
     /// Wendet einen gemerkten Stash-Eintrag erneut im Quell-Worktree an und
@@ -484,6 +900,14 @@ impl RepoManager {
     /// Prüft vorher auf Sauberkeit, es sei denn `force` ist `true`.
     /// Der Worktree-Branch wird nur gelöscht wenn er nicht der aktuelle
     /// HEAD des Original-Worktrees ist.
+    ///
+    /// Hinweis: Enthält der Worktree ausgecheckte Submodule (macht
+    /// [`RepoManager::create_worktree`] inzwischen selbst), verweigert `git
+    /// worktree remove` das Entfernen ohne `--force` – unabhängig davon, wie
+    /// sauber der Worktree ist („working trees containing submodules cannot be
+    /// moved or removed“). Aufräumpfade müssen deshalb mit `force = true`
+    /// arbeiten. `--force` räumt auch die worktree-eigenen Submodule-Gitdirs
+    /// mit ab (`<repo>/.git/worktrees/<name>/modules/…`).
     pub fn remove_worktree(&self, name: &str, force: bool) -> Result<(), String> {
         let wt_path = self.worktrees_base().join(name);
         if !wt_path.exists() {
@@ -645,6 +1069,25 @@ fn copy_dir_recursive(
 mod tests {
     use super::*;
 
+    /// Eindeutiges Temp-Verzeichnis pro Aufruf.
+    ///
+    /// Nötig, weil die Tests parallel im selben Prozess laufen: Die PID allein
+    /// unterscheidet sie nicht, und zwei Tests im selben Verzeichnis löschen
+    /// sich gegenseitig die Repos weg – was still als „git nicht verfügbar"
+    /// durchgeht und die Tests wertlos macht.
+    fn unique_temp(prefix: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "aidev-{prefix}-{}-{seq}-{nanos}",
+            std::process::id()
+        ))
+    }
+
     /// Erzeugt ein temporäres Git-Repo für Tests.
     /// Läuft nur wenn `git` verfügbar ist.
     fn test_repo() -> Option<(PathBuf, PathBuf)> {
@@ -658,7 +1101,7 @@ mod tests {
             return None;
         }
 
-        let dir = std::env::temp_dir().join(format!("aidev-repo-{}", std::process::id()));
+        let dir = unique_temp("repo");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init"]).ok()?;
@@ -672,6 +1115,129 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Legt ein nicht-bare Repo mit Identität an (ohne Commit).
+    fn init_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]).unwrap();
+        git(dir, &["config", "user.email", "test@test.de"]).unwrap();
+        git(dir, &["config", "user.name", "Test"]).unwrap();
+    }
+
+    /// Staged alles und committet (`--allow-empty`, damit auch leere
+    /// Zwischenstände gehen).
+    ///
+    /// Mit expliziter Identität: Submodule-Klone haben keine eigene
+    /// `user.*`-Config, ein Commit darin scheiterte sonst mit „Author identity
+    /// unknown". Genau dafür gibt es in der Produktion [`commit_identity`].
+    fn commit_all(dir: &Path, message: &str) {
+        git(dir, &["add", "-A"]).unwrap();
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.de",
+                "commit",
+                "-q",
+                "-m",
+                message,
+                "--allow-empty",
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Hängt das Repo `origin` als Submodule unter `path` an `super_dir` an.
+    /// `protocol.file.allow=always` ist für lokale URLs nötig.
+    fn add_submodule(super_dir: &Path, origin: &Path, path: &str) {
+        git(
+            super_dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                origin.to_str().unwrap(),
+                path,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Bevölkert ein Submodule inklusive verschachtelter Submodule.
+    fn populate_submodules(dir: &Path) {
+        git(
+            dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Ersetzt eine URL in der `.gitmodules` von `dir`.
+    fn set_gitmodules_url(dir: &Path, old: &str, new: &str) {
+        let file = dir.join(".gitmodules");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains(old),
+            "alte URL nicht in {}",
+            file.display()
+        );
+        std::fs::write(&file, content.replace(old, new)).unwrap();
+    }
+
+    /// Haupt-Repo mit einem lokalen Submodule (`sub`) und einem Bare-Repo als
+    /// „Server". Liefert `(root, base)`: `root` ist das Haupt-Repo, `base` das
+    /// gemeinsame Temp-Verzeichnis (zum Aufräumen, enthält `origin.git`).
+    fn test_repo_with_submodule() -> Option<(PathBuf, PathBuf)> {
+        let (root, _) = test_repo()?;
+        let base = unique_temp("submodule");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // „Server"-Repo mit einem Commit.
+        let src = base.join("src");
+        init_repo(&src);
+        std::fs::write(src.join("lib.txt"), "v1\n").unwrap();
+        commit_all(&src, "v1");
+        let origin = base.join("origin.git");
+        git(&base, &["init", "-q", "--bare", origin.to_str().unwrap()]).unwrap();
+        git(
+            &src,
+            &["push", "-q", origin.to_str().unwrap(), "HEAD:master"],
+        )
+        .unwrap();
+
+        add_submodule(&root, &origin, "sub");
+        commit_all(&root, "add submodule");
+        populate_submodules(&root);
+        Some((root, base))
+    }
+
+    /// Nicht existierender Pfad als „toter Server".
+    fn dead_path(base: &Path, name: &str) -> String {
+        base.join(name).to_str().unwrap().to_string()
+    }
+
+    /// Schaltet den „Server" ab: `.gitmodules` UND die effektive Config-URL
+    /// zeigen auf `dead` – einen nicht existierenden Pfad, eine unerreichbare
+    /// URL oder eine relative URL. Damit kann ein Klon nur noch aus den lokalen
+    /// Gitdaten der Hauptinstanz gelingen.
+    fn break_submodule_url(dir: &Path, name: &str, dead: &str) {
+        let old = git(dir, &["config", "--get", &format!("submodule.{name}.url")]).unwrap();
+        let old = old.trim().to_string();
+        set_gitmodules_url(dir, &old, dead);
+        git(dir, &["config", &format!("submodule.{name}.url"), dead]).unwrap();
+        commit_all(dir, "submodule url -> dead");
     }
 
     macro_rules! skip_if_no_git {
@@ -885,6 +1451,461 @@ mod tests {
         let branches = git(&root, &["branch", "--list", "feat-del"]).unwrap();
         assert!(branches.trim().is_empty());
         cleanup(&dir);
+    }
+
+    #[test]
+    fn create_worktree_ohne_submodule_meldet_keinen_hinweis() {
+        let (dir, root) = skip_if_no_git!(test_repo());
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm.create_worktree("feat-plain", None).unwrap();
+        assert!(
+            wt.notice.is_none(),
+            "Repo ohne Submodule darf nichts melden: {:?}",
+            wt.notice
+        );
+        rm.remove_worktree("feat-plain", true).unwrap();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn create_worktree_checkt_submodule_lokal_aus() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // „Server" abschalten: der Klon kann nur noch aus den lokalen Gitdaten
+        // der Hauptinstanz gelingen.
+        break_submodule_url(&root, "sub", &dead_path(&base, "dead.git"));
+        let rm = RepoManager::discover(&root).unwrap();
+
+        let wt = rm
+            .create_worktree("feat-sub", None)
+            .expect("create_worktree");
+
+        // Kern der Sache: `git worktree add` ließe `sub/` leer, `git status`
+        // meldete trotzdem sauber – hier muss der Inhalt da sein.
+        assert!(
+            wt.path.join("sub/lib.txt").exists(),
+            "Submodule muss im neuen Worktree ausgecheckt sein"
+        );
+        assert_eq!(
+            git(&wt.path.join("sub"), &["rev-parse", "--short", "HEAD"])
+                .unwrap()
+                .trim()
+                .len(),
+            7,
+            "Submodule-Repo im Worktree muss funktionieren"
+        );
+        // Sauber UND bevölkert – genau der Zustand, der vorher still kaputt war.
+        assert!(rm.is_clean(&wt.path).unwrap());
+
+        let notice = wt.notice.clone().unwrap_or_default();
+        assert!(notice.contains("1"), "Anzahl fehlt: {notice}");
+        assert!(
+            notice.contains("local data of the main worktree"),
+            "Hinweis muss den lokalen Klon ausweisen: {notice}"
+        );
+
+        // Der Gitdir liegt pro Worktree (getrennt von dem der Hauptinstanz).
+        assert!(
+            root.join(".git/worktrees/feat-sub/modules/sub").is_dir(),
+            "Submodule-Gitdir muss worktree-eigen sein"
+        );
+
+        rm.remove_worktree("feat-sub", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    /// Wie [`test_repo_with_submodule`], hängt aber in `sub` ein weiteres
+    /// Submodule `nested` an – also eine echte zweite Ebene.
+    fn test_repo_with_nested_submodule() -> Option<(PathBuf, PathBuf)> {
+        let (root, base) = test_repo_with_submodule()?;
+
+        let nested_origin = base.join("nested.git");
+        let nested_src = base.join("nested-src");
+        init_repo(&nested_src);
+        std::fs::write(nested_src.join("deep.txt"), "v1\n").unwrap();
+        commit_all(&nested_src, "deep v1");
+        git(
+            &base,
+            &["init", "-q", "--bare", nested_origin.to_str().unwrap()],
+        )
+        .unwrap();
+        git(
+            &nested_src,
+            &["push", "-q", nested_origin.to_str().unwrap(), "HEAD:master"],
+        )
+        .unwrap();
+
+        let parent_wt = root.join("sub");
+        add_submodule(&parent_wt, &nested_origin, "nested");
+        commit_all(&parent_wt, "add nested");
+        // Neuen Parent-Commit als Submodule-Version im Haupt-Repo übernehmen.
+        commit_all(&root, "bump sub");
+        Some((root, base))
+    }
+
+    /// `git worktree remove` ohne `--force` – genau das, was beim Schließen
+    /// passiert, wenn der Worktree bevölkerte Submodule hat.
+    #[test]
+    fn worktree_remove_ohne_force_scheitert_an_bevoelkerten_submodulen() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm
+            .create_worktree("feat-rm", None)
+            .expect("create_worktree");
+        assert!(wt.path.join("sub/lib.txt").exists());
+
+        // Git verweigert das Entfernen grundsätzlich, sobald Submodule
+        // bevölkert sind – unabhängig davon, ob sie sauber sind.
+        let err = git_worktree_remove(&root, &wt.path, false).unwrap_err();
+        assert!(
+            err.contains("submodules"),
+            "Git muss sich über Submodule beschweren: {err}"
+        );
+        // Mit `--force` (so rufen alle aidev-Aufräumpfade auf) klappt es,
+        // inklusive der worktree-eigenen Submodule-Gitdirs.
+        git_worktree_remove(&root, &wt.path, true).unwrap();
+        assert!(!wt.path.exists());
+        assert!(
+            !root.join(".git/worktrees/feat-rm").exists(),
+            "worktree-eigener Submodule-Gitdir muss mit entfernt werden"
+        );
+
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn git_commit_all_erfasst_aenderungen_im_submodule() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm
+            .create_worktree("feat-snap", None)
+            .expect("create_worktree");
+
+        // Änderung im Superprojekt UND im Submodule. Die Submodule-Änderung
+        // lässt den Gitlink unverändert – ohne den rekursiven Snapshot stünde
+        // sie in keinem Commit und wäre beim Löschen verloren.
+        std::fs::write(wt.path.join("README.md"), "# neu\n").unwrap();
+        std::fs::write(wt.path.join("sub/lib.txt"), "v2\n").unwrap();
+
+        assert!(git_commit_all(&wt.path, "Last Snapshot").unwrap());
+
+        // Nichts bleibt uncommittet …
+        assert_eq!(
+            git(&wt.path, &["status", "--porcelain"]).unwrap().trim(),
+            "",
+            "nach dem Snapshot darf nichts offen sein"
+        );
+        assert!(rm.is_clean(&wt.path).unwrap());
+        // … der Inhalt ist aus dem Submodule-Commit rekonstruierbar …
+        assert_eq!(
+            git(&wt.path.join("sub"), &["show", "HEAD:lib.txt"]).unwrap(),
+            "v2\n"
+        );
+        // … und der Gitlink des Superprojekts zeigt auf den neuen Commit.
+        let sub_head = git(&wt.path.join("sub"), &["rev-parse", "HEAD"]).unwrap();
+        let gitlink = git(&wt.path, &["ls-tree", "HEAD", "sub"]).unwrap();
+        assert!(
+            gitlink.contains(sub_head.trim()),
+            "Gitlink muss den neuen Submodule-Commit nennen: {gitlink}"
+        );
+
+        rm.remove_worktree("feat-snap", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn git_commit_all_erfasst_verschachtelte_submodule() {
+        let Some((root, base)) = test_repo_with_nested_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm
+            .create_worktree("feat-snap-nested", None)
+            .expect("create_worktree");
+
+        // Nur die TIEFSTE Ebene anfassen: Nur wenn von innen nach außen
+        // committet wird, ziehen die Gitlinks der äußeren Ebenen mit.
+        std::fs::write(wt.path.join("sub/nested/deep.txt"), "v2\n").unwrap();
+
+        assert!(git_commit_all(&wt.path, "Last Snapshot").unwrap());
+        assert!(
+            rm.is_clean(&wt.path).unwrap(),
+            "alle Ebenen müssen sauber sein: {}",
+            rm.status_summary(&wt.path).unwrap()
+        );
+
+        // Beide Gitlinks zeigen auf die jeweils neue Commit-Version.
+        let nested_head = git(&wt.path.join("sub/nested"), &["rev-parse", "HEAD"]).unwrap();
+        let inner_gitlink = git(&wt.path.join("sub"), &["ls-tree", "HEAD", "nested"]).unwrap();
+        assert!(
+            inner_gitlink.contains(nested_head.trim()),
+            "innerer Gitlink veraltet: {inner_gitlink}"
+        );
+        let sub_head = git(&wt.path.join("sub"), &["rev-parse", "HEAD"]).unwrap();
+        let outer_gitlink = git(&wt.path, &["ls-tree", "HEAD", "sub"]).unwrap();
+        assert!(
+            outer_gitlink.contains(sub_head.trim()),
+            "äußerer Gitlink veraltet: {outer_gitlink}"
+        );
+
+        rm.remove_worktree("feat-snap-nested", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn git_commit_all_ohne_aenderungen_meldet_nichts_zu_tun() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // Frischer Worktree ist sauber → kein Commit, auch nicht in Submodulen.
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm
+            .create_worktree("feat-clean", None)
+            .expect("create_worktree");
+        assert!(!git_commit_all(&wt.path, "Snapshot").unwrap());
+
+        rm.remove_worktree("feat-clean", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn create_worktree_checkt_submodule_bei_toter_pfad_url_aus() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // Regressionstest: Die Quell-URL ist ein *absoluter Pfad*. Der frühere
+        // `url.<lokal>.insteadOf=<url>`-Mechanismus griff hier NICHT – git
+        // normalisiert pfad-artige URLs vor dem Text-Match, der Klon ging
+        // deshalb auf die tote URL. Der Name-Override ersetzt die URL
+        // vollständig und funktioniert für jede URL-Form.
+        break_submodule_url(&root, "sub", &dead_path(&base, "dead.git"));
+        let rm = RepoManager::discover(&root).unwrap();
+
+        let wt = rm
+            .create_worktree("feat-path", None)
+            .expect("create_worktree");
+
+        assert!(
+            wt.path.join("sub/lib.txt").exists(),
+            "trotz Pfad-URL muss lokal geklont werden"
+        );
+        let notice = wt.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("local data of the main worktree"),
+            "Hinweis muss den lokalen Klon ausweisen: {notice}"
+        );
+
+        rm.remove_worktree("feat-path", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn create_worktree_checkt_submodule_bei_relativer_url_aus() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // Regressionstest: relative URL (`../…`) – in der Praxis der Normalfall.
+        // Git löst sie gegen die Origin-URL des Superprojekts auf, ein Klon
+        // bräuchte also den Server; für den Text-Match von `insteadOf` war sie
+        // ohnehin unbrauchbar.
+        break_submodule_url(&root, "sub", "../dead.git");
+        let rm = RepoManager::discover(&root).unwrap();
+
+        let wt = rm
+            .create_worktree("feat-relative", None)
+            .expect("create_worktree");
+
+        assert!(
+            wt.path.join("sub/lib.txt").exists(),
+            "trotz relativer URL muss lokal geklont werden"
+        );
+        assert!(rm.is_clean(&wt.path).unwrap());
+
+        rm.remove_worktree("feat-relative", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn mehrdeutige_submodulnamen_bekommen_keinen_override() {
+        let src = |name: &str, local: &str| SubmoduleSource {
+            name: name.to_string(),
+            local: PathBuf::from(local),
+        };
+
+        // Eindeutige Namen bleiben unangetastet.
+        let out = unambiguous_sources(vec![src("a", "/a"), src("b", "/b")]);
+        assert_eq!(out.len(), 2);
+
+        // Gleicher Name, gleicher Gitdir: ein Override genügt.
+        let out = unambiguous_sources(vec![src("a", "/a"), src("a", "/a")]);
+        assert_eq!(out.len(), 1);
+
+        // Gleicher Name auf zwei Ebenen mit verschiedenen Gitdirs: Die Config
+        // kennt keine Ebene, also lieber gar kein Override (Original-URL) als
+        // die falsche Quelle.
+        let out = unambiguous_sources(vec![src("a", "/a"), src("a", "/anders")]);
+        assert!(
+            out.is_empty(),
+            "mehrdeutiger Name darf keinen Override bekommen"
+        );
+    }
+
+    #[test]
+    fn create_worktree_checkt_verschachtelte_submodule_aus() {
+        let Some((root, base)) = test_repo_with_nested_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        let parent_wt = root.join("sub");
+
+        // Beide Ebenen auf tote URLs umbiegen (je Ebene eine eigene, sonst
+        // kollidieren die `insteadOf`-Regeln).
+        break_submodule_url(&parent_wt, "nested", &dead_path(&base, "dead-nested.git"));
+        break_submodule_url(&root, "sub", &dead_path(&base, "dead-sub.git"));
+
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm
+            .create_worktree("feat-nested", None)
+            .expect("create_worktree");
+
+        assert!(
+            wt.path.join("sub/lib.txt").exists(),
+            "erste Ebene muss ausgecheckt sein"
+        );
+        assert!(
+            wt.path.join("sub/nested/deep.txt").exists(),
+            "verschachteltes Submodule muss ebenfalls ausgecheckt sein"
+        );
+
+        let notice = wt.notice.clone().unwrap_or_default();
+        assert!(notice.contains('2'), "beide Module erwartet: {notice}");
+        assert!(
+            notice.contains("local data of the main worktree"),
+            "Hinweis muss den lokalen Klon ausweisen: {notice}"
+        );
+
+        rm.remove_worktree("feat-nested", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn create_worktree_ohne_submodule_im_stand_meldet_nichts() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // Branch auf den Stand VOR dem Submodule zeigen lassen: Die
+        // Hauptinstanz hat eine `.gitmodules` und einen bevölkerten Gitdir,
+        // der ausgecheckte Stand aber keine Submodule. Dann darf nichts
+        // gemeldet werden – die Zählung orientiert sich am Stand, nicht am
+        // Bestand der Hauptinstanz.
+        git(&root, &["branch", "nosub", "HEAD~1"]).unwrap();
+        assert!(
+            root.join(".gitmodules").is_file(),
+            "Voraussetzung: Bestand da"
+        );
+
+        let rm = RepoManager::discover(&root).unwrap();
+        let wt = rm.create_worktree("nosub", None).expect("create_worktree");
+
+        assert!(!wt.path.join("sub").exists());
+        assert!(
+            wt.notice.is_none(),
+            "ohne Submodule im Stand darf nichts gemeldet werden: {:?}",
+            wt.notice
+        );
+
+        rm.remove_worktree("nosub", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn create_worktree_holt_submodule_bei_fehlendem_lokalen_bestand_vom_server() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        // Hauptinstanz „nicht bevölkert": kein lokaler Gitdir als Klon-Quelle.
+        // Die URL ist erreichbar → der reguläre Weg über den Server muss
+        // greifen und die Herkunft auch so gemeldet werden.
+        cleanup(&root.join(".git/modules/sub"));
+        cleanup(&root.join("sub"));
+        let rm = RepoManager::discover(&root).unwrap();
+
+        let wt = rm
+            .create_worktree("feat-server", None)
+            .expect("create_worktree");
+
+        assert!(
+            wt.path.join("sub/lib.txt").exists(),
+            "ohne lokalen Bestand muss über die URL geklont werden"
+        );
+        let notice = wt.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("configured URLs"),
+            "Herkunft muss als Server-Klon ausgewiesen werden: {notice}"
+        );
+
+        rm.remove_worktree("feat-server", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn create_worktree_meldet_fehlgeschlagene_submodule_ohne_abbruch() {
+        let Some((root, base)) = test_repo_with_submodule() else {
+            eprintln!("git nicht verfügbar – Test übersprungen");
+            return;
+        };
+        break_submodule_url(&root, "sub", &dead_path(&base, "dead.git"));
+        // Hauptinstanz NICHT bevölkert: kein lokaler Gitdir als Klon-Quelle,
+        // die tote URL macht auch den Server-Weg unmöglich.
+        cleanup(&root.join(".git/modules/sub"));
+        cleanup(&root.join("sub"));
+        let rm = RepoManager::discover(&root).unwrap();
+
+        let wt = rm
+            .create_worktree("feat-broken", None)
+            .expect("Worktree muss trotz fehlender Submodule angelegt werden");
+
+        assert!(
+            !wt.path.join("sub/lib.txt").exists(),
+            "Submodule bleibt in diesem Fall leer"
+        );
+        let notice = wt.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("NOT checked out"),
+            "leerer Submodule-Ordner muss gemeldet werden: {notice}"
+        );
+        assert!(
+            notice.contains("submodule update --init"),
+            "Hinweis muss den Ausweg nennen: {notice}"
+        );
+
+        rm.remove_worktree("feat-broken", true).unwrap();
+        cleanup(&root);
+        cleanup(&base);
     }
 
     #[test]

@@ -18,19 +18,16 @@ use super::helpers::{
 };
 use super::tools_def::{apply_tool_delta, sanitize_arguments, Step, ToolCallAcc, ToolInvocation};
 use super::wire::{WireFunction, WireMessage, WireTokens, WireToolCall};
-use super::{ApiProtocol, CompletionParts, RoundMetrics, Usage, WorkerEvent};
+use super::{ApiShape, CompletionParts, RoundMetrics, Usage, WorkerEvent};
 
 /// Sendet ein Modell-Probe-Ergebnis (für den Statusindikator im Picker) an die
 /// UI. `model` ist der Registry-Key (`ep.model` = `provider/alias`), `shape`
-/// das getestete API-Protokoll, `ok` ob das Modell darauf korrekt geantwortet
+/// das getestete API-Format, `ok` ob das Modell darauf korrekt geantwortet
 /// hat.
-fn send_probe(tx: &Sender<WorkerEvent>, model: &str, shape: api::ApiShape, ok: bool) {
+fn send_probe(tx: &Sender<WorkerEvent>, model: &str, shape: ApiShape, ok: bool) {
     let _ = tx.send(WorkerEvent::ModelProbe {
         model: model.to_string(),
-        protocol: match shape {
-            api::ApiShape::ChatCompletions => ApiProtocol::ChatCompletions,
-            api::ApiShape::Responses => ApiProtocol::Responses,
-        },
+        shape,
         ok,
     });
 }
@@ -52,7 +49,7 @@ pub(crate) fn shared_client() -> &'static reqwest::blocking::Client {
             .pool_idle_timeout(Duration::from_secs(120))
             .pool_max_idle_per_host(1)
             .build()
-            .expect("reqwest-Client bauen (TLS-Backend statisch vorhanden)")
+            .expect("build reqwest client (TLS backend statically present)")
     })
 }
 /// Hängt ein `data:`-Fragment an das offene SSE-Event an und liefert es als
@@ -326,13 +323,13 @@ pub(crate) fn do_request(
             Ok(r) => r,
             Err(err) => {
                 let chain = error_chain(&err);
-                let summary = take_head(&format!("Netzwerkfehler: {chain}"), ERROR_SUMMARY_MAX);
+                let summary = take_head(&format!("Network error: {chain}"), ERROR_SUMMARY_MAX);
                 if attempt + 1 >= RETRY_MAX_ATTEMPTS {
                     // Keine Antwort vorhanden: Request + Fehlerkette ablegen.
                     let debug = dump_debug("netz", &ep.model, &url, &body, None, Some(&summary));
                     // Fehler läuft bereits als Step::Err → WorkerEvent::Error in
                     // die UI (Chat); ein Konsolen-Print würde das TUI zerschießen.
-                    return Step::Err(with_debug(format!("Netzwerkfehler: {chain}"), debug));
+                    return Step::Err(with_debug(format!("Network error: {chain}"), debug));
                 }
                 let wait = jitter(retry_delay(attempt));
                 let retry_at = Instant::now() + wait;
@@ -647,7 +644,7 @@ pub(crate) fn do_request(
     }
 
     if !done {
-        return Step::Err("SSE-Stream ohne [DONE] beendet.".into());
+        return Step::Err("SSE stream ended without [DONE].".into());
     }
 
     // Verbindungs-Pool: Nach [DONE] wird der Rest des Streams noch zu Ende
@@ -1069,7 +1066,7 @@ fn stream_responses(
         if let Some(e) = aborted {
             return Step::Err(e);
         }
-        return Step::Err("SSE-Stream ohne Abschluss-Event beendet.".into());
+        return Step::Err("SSE stream ended without a completion event.".into());
     }
 
     // Verbindungs-Drain (analog zum Chat-Pfad): Rest-Zeilen konsumieren, damit

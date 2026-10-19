@@ -11,7 +11,7 @@ use std::path::Path;
 
 /// Liest eine Datei als UTF-8-String.
 pub(crate) fn read_at(p: &Path) -> Result<String, String> {
-    std::fs::read_to_string(p).map_err(|e| format!("Lese {}: {e}", p.display()))
+    std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))
 }
 
 /// Schreibt eine Datei; fehlende Elternverzeichnisse werden angelegt.
@@ -19,5 +19,5 @@ pub(crate) fn write_at(p: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    std::fs::write(p, content).map_err(|e| format!("Schreibe {}: {e}", p.display()))
+    std::fs::write(p, content).map_err(|e| format!("write {}: {e}", p.display()))
 }

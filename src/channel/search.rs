@@ -270,12 +270,12 @@ pub(super) fn grep_search(
 /// Muster nicht parsen kann (z. B. `\d`, `\w`, `\b`, `(?:...)` – POSIX-ERE
 /// unterstützt sie nicht), statt still 0 Treffer zu liefern.
 fn grep_pattern_error(pattern: &str, stderr: &str) -> String {
-    let hint = " (POSIX-ERE kennt \\d/\\w/\\s/\\b und (?:…) nicht; \
-                ersetze sie z. B. durch [0-9]/[A-Za-z0-9_]/[[:space:]] — \
-                oder installiere ripgrep (rg) für vollen Regex-Dialekt)";
+    let hint = " (POSIX-ERE does not know \\d/\\w/\\s/\\b or (?:…); \
+                replace them e.g. with [0-9]/[A-Za-z0-9_]/[[:space:]] — \
+                or install ripgrep (rg) for the full regex dialect)";
     format!(
-        "grep konnte das Muster nicht parsen — Suchmuster `{}` ist für den \
-         klassischen grep-Fallback evtl. ungeeignet.{}\n{}",
+        "grep could not parse the pattern — `{}` may be unsuitable for the \
+         classic grep fallback.{}\n{}",
         pattern,
         hint,
         stderr.trim()
@@ -463,10 +463,10 @@ mod tests {
         // `(?:a)` ist in POSIX-ERE ungültig (nur Rust-regex/rg unterstützt es).
         match grep_search("(?:a)", &dir, Duration::from_secs(10), None, 0) {
             Err(msg) => assert!(
-                msg.contains("nicht") || msg.contains("Muster"),
-                "Fehlermeldung soll auf das Problem hinweisen: {msg}"
+                msg.contains("could not parse") || msg.contains("pattern"),
+                "error message should point at the problem: {msg}"
             ),
-            Ok(_) => panic!("`(?:a)` ist kein gültiges POSIX-ERE – das soll als Fehler gemeldet werden, nicht als 0 Treffer"),
+            Ok(_) => panic!("`(?:a)` is not a valid POSIX-ERE – this should be reported as an error, not as 0 hits"),
         }
 
         let _ = std::fs::remove_dir_all(&dir);

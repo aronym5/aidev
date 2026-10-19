@@ -5,7 +5,6 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::app::{App, Phase};
-use crate::editor::InputLayout;
 
 pub(crate) use theme::*;
 mod blocks;
@@ -66,9 +65,8 @@ fn logo_lines(width: usize) -> Vec<Line<'static>> {
 }
 
 /// Höhe des Logos (Zeilenanzahl) – für die vertikale Zentrierung.
-const LOGO_ROWS: u16 = 4;
+const LOGO_ROWS: u16 = LOGO.len() as u16;
 
-/// Markdown-Stylesheet passend zum Farbschema: Heading-Marker entfallen,
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
@@ -110,8 +108,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_tabs(f, chunks[0], app);
     // `draw_chat` aktualisiert den Scroll-Zustand (Anker/Delta/Viewport) selbst.
     draw_chat(f, chunks[1], app);
-    draw_input(f, chunks[2], app, &layout);
-    draw_status(f, chunks[3], app);
+    // Ratatui versteckt den Cursor, wenn in einem Frame keine Position gesetzt
+    // wird: solange ein Dialog offen ist (der den Cursor selbst setzen kann),
+    // bleibt die Chat-Eingabezeile ohne Cursor.
+    input::draw_input(f, chunks[2], app, &layout, !app.any_dialog_open());
+    status::draw_status(f, chunks[3], app);
     draw_channel_picker(f, app);
     draw_model_picker(f, app);
     draw_channel_builder(f, app);
@@ -184,16 +185,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // hält; danach wird der Scroll-Zustand der Session aktualisiert.
     let (new_anchor, at_bottom, live_used) = {
         let s = &app.sessions[active];
-        let cache = s.history_cache.as_ref().expect("History-Cache vorhanden");
+        let cache = s.history_cache.as_ref().expect("history cache present");
         let (live, live_used) = build_live_blocks(s, width, window, &cache.end_ctx);
 
         let logo_gap = viewport.saturating_sub(LOGO_ROWS as usize) / 2;
-        let logo = ChatBlock {
-            lines: logo_lines(width),
-            bg: None,
-            gap: logo_gap as u16,
-            is_tool: false,
-        };
+        let logo = ChatBlock::plain(logo_lines(width), false).with_gap(logo_gap as u16);
         let (placed, total) = layout_blocks(&logo, &cache.blocks, &live);
 
         // Content-Tops/-Höhen (ohne Logo) für die Anker-Umrechnung.
@@ -282,29 +278,6 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // Schätzung (nicht mehr die Statusleiste, die nur die gestreamte
     // serverbestätigte `total_tokens` zeigt).
     s.live_context = live_used;
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    status::draw_status(f, area, app);
-}
-
-/// Ist gerade (mindestens) ein modaler Dialog offen? Solange ein Dialog den
-/// Bildschirm überlagert, soll der Cursor NICHT in der Chat-Eingabezeile
-/// stehen bleiben – ratatui versteckt ihn, wenn in einem Frame keine
-/// Position gesetzt wird. (Ausnahme: Ein Dialog mit einem eigenen Textinput –
-/// der Channel Builder beim „add path" – setzt den Cursor selbst.)
-fn dialog_open(app: &App) -> bool {
-    app.any_dialog_open()
-}
-
-fn draw_input(f: &mut Frame, area: Rect, app: &App, layout: &InputLayout) {
-    input::draw_input(
-        f,
-        area,
-        app,
-        layout,
-        /* show_cursor= */ !dialog_open(app),
-    );
 }
 
 // Markdown-Rendering: Deko, Wortumbruch, Tabellen – als eigenes Untermodul.
